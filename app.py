@@ -8,10 +8,30 @@ logout_button()
 
 st.title("📈 MDD 저점매수 분석기")
 
-st.markdown("""
-## 메뉴 안내
+st.markdown("## 메뉴 선택")
 
-왼쪽 사이드바에서 페이지를 선택하세요.
+st.write("아래 버튼을 눌러 원하는 페이지로 이동하세요.")
+
+col1, col2 = st.columns(2)
+
+with col1:
+    st.page_link(
+        "pages/1_MDD_분석기.py",
+        label="📊 MDD 분석기 열기",
+        icon="📊"
+    )
+
+with col2:
+    st.page_link(
+        "pages/2_시장_리포트.py",
+        label="📰 시장 리포트 열기",
+        icon="📰"
+    )
+
+st.markdown("---")
+
+st.markdown("""
+## 페이지 설명
 
 | 페이지 | 내용 |
 |---|---|
