@@ -10,7 +10,7 @@ import yfinance as yf
 st.set_page_config(page_title="MDD & 줍줍 분석기", layout="centered")
 
 # --- [비밀번호 설정] ---
-MY_PASSWORD = "0914"
+MY_PASSWORD = "1234"
 
 st.title("🔒 나만의 주식 분석기")
 entered_password = st.text_input("비밀번호를 입력하세요", type="password")
@@ -144,4 +144,4 @@ if st.button("분석 차트 그리기", use_container_width=True):
                         plt.tight_layout()
                         st.pyplot(fig)
                 except Exception as e:
-                    st.error(f"❌ 데이터 수집
+                    st.error(f"❌ 데이터 수집 중 알 수 없는 오류가 발생했습니다.")
