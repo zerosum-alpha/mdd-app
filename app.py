@@ -4,6 +4,10 @@ import matplotlib.pyplot as plt
 import yfinance as yf
 import FinanceDataReader as fdr
 
+# =========================================================
+# MDD 저점매수 분석기 - Final Version
+# =========================================================
+
 st.set_page_config(page_title="MDD 저점매수 분석기", layout="wide")
 
 # =========================
@@ -19,6 +23,7 @@ if entered_password != MY_PASSWORD:
         st.error("❌ 비밀번호 틀림")
     st.stop()
 
+
 # =========================
 # Stock list
 # =========================
@@ -28,6 +33,7 @@ def get_stock_list():
         return fdr.StockListing("KRX")
     except Exception:
         return pd.DataFrame()
+
 
 stock_list = get_stock_list()
 
@@ -42,11 +48,11 @@ def find_ticker(query):
     if query == "":
         return None, None, None
 
-    # Korean 6-digit code
+    # 한국 6자리 종목코드
     if query.isdigit() and len(query) == 6:
         return "KR", query, query
 
-    # Korean stock name
+    # 한국 종목명 검색
     if not stock_list.empty and "Name" in stock_list.columns:
         match = stock_list[stock_list["Name"] == query]
         if not match.empty:
@@ -54,7 +60,7 @@ def find_ticker(query):
             name = match.iloc[0]["Name"]
             return "KR", code, name
 
-    # US ticker
+    # 미국 티커
     return "US", query.upper(), query.upper()
 
 
@@ -69,12 +75,15 @@ def load_price_data(market, ticker, start_date):
         df = fdr.DataReader(ticker, start)
         if df.empty:
             return pd.DataFrame()
+
+        df.index = pd.to_datetime(df.index)
         return df
 
     if market == "US":
         df = yf.Ticker(ticker).history(start=start, auto_adjust=True)
         if df.empty:
             return pd.DataFrame()
+
         df.index = df.index.tz_localize(None)
         return df
 
@@ -105,25 +114,36 @@ def calculate_rsi(close, period=14):
 def calculate_indicators(df):
     df = df.copy()
 
+    # 핵심 MDD 계산
     df["Peak"] = df["Close"].cummax()
-    df["Drawdown"] = df["Close"] / df["Peak"] - 1
-    df["MDD"] = df["Drawdown"].cummin()
-    df["Recovery_Needed"] = 1 / (1 + df["Drawdown"]) - 1
+    df["Current_Drawdown"] = df["Close"] / df["Peak"] - 1
+    df["Max_Drawdown"] = df["Current_Drawdown"].cummin()
+    df["Recovery_To_Peak"] = 1 / (1 + df["Current_Drawdown"]) - 1
 
+    # 기존 코드 호환용 컬럼
+    df["Drawdown"] = df["Current_Drawdown"]
+    df["MDD"] = df["Max_Drawdown"]
+    df["Recovery_Needed"] = df["Recovery_To_Peak"]
+
+    # 이동평균
     df["MA5"] = df["Close"].rolling(5).mean()
     df["MA20"] = df["Close"].rolling(20).mean()
     df["MA60"] = df["Close"].rolling(60).mean()
     df["MA200"] = df["Close"].rolling(200).mean()
 
+    # RSI
     df["RSI"] = calculate_rsi(df["Close"], 14)
 
+    # 거래량
     df["Volume_MA20"] = df["Volume"].rolling(20).mean()
     df["Volume_Ratio"] = df["Volume"] / df["Volume_MA20"]
 
+    # 단기 고저점
     df["Return"] = df["Close"].pct_change()
     df["Low20"] = df["Close"].rolling(20).min()
     df["High20"] = df["Close"].rolling(20).max()
 
+    # 볼린저밴드
     df["BB_Mid"] = df["Close"].rolling(20).mean()
     df["BB_Std"] = df["Close"].rolling(20).std()
     df["BB_Lower"] = df["BB_Mid"] - 2 * df["BB_Std"]
@@ -141,7 +161,7 @@ def calculate_buy_score(row, prev_row=None):
     danger = False
     danger_reasons = []
 
-    dd = row["Drawdown"]
+    dd = row["Current_Drawdown"]
     rsi = row["RSI"]
     close = row["Close"]
 
@@ -153,24 +173,24 @@ def calculate_buy_score(row, prev_row=None):
     low20 = row["Low20"]
     bb_lower = row["BB_Lower"]
 
-    # 1. MDD score
+    # 1. Current drawdown score
     if dd <= -0.20:
         score += 20
-        reasons.append("MDD -20% 이하: 가격은 깊은 조정권")
+        reasons.append("Current DD -20% 이하: 가격은 깊은 조정권")
         danger = True
-        danger_reasons.append("MDD -20% 이하: 추세 훼손 가능성")
+        danger_reasons.append("Current DD -20% 이하: 추세 훼손 가능성")
     elif dd <= -0.15:
         score += 35
-        reasons.append("MDD -15% 이하: 강한 조정")
+        reasons.append("Current DD -15% 이하: 강한 조정")
     elif dd <= -0.12:
         score += 30
-        reasons.append("MDD -12% 이하: 2차 매수 후보권")
+        reasons.append("Current DD -12% 이하: 2차 매수 후보권")
     elif dd <= -0.08:
         score += 20
-        reasons.append("MDD -8% 이하: 1차 매수 후보권")
+        reasons.append("Current DD -8% 이하: 1차 매수 후보권")
     elif dd <= -0.05:
         score += 10
-        reasons.append("MDD -5% 이하: 관심 구간")
+        reasons.append("Current DD -5% 이하: 관심 구간")
 
     # 2. RSI score
     if pd.notna(rsi):
@@ -316,9 +336,10 @@ if run:
 
         current_price = latest["Close"]
         peak_price = latest["Peak"]
-        current_dd = latest["Drawdown"]
-        max_mdd = df["MDD"].min()
-        recovery_needed = latest["Recovery_Needed"]
+        current_dd = latest["Current_Drawdown"]
+        max_mdd = latest["Max_Drawdown"]
+        period_mdd = df["Max_Drawdown"].min()
+        recovery_needed = latest["Recovery_To_Peak"]
         rsi = latest["RSI"]
         buy_score = latest["Buy_Score"]
         decision = latest["Decision"]
@@ -333,7 +354,7 @@ if run:
         c1.metric("현재가", f"{current_price:,.2f}")
         c2.metric("기간 고점", f"{peak_price:,.2f}")
         c3.metric("현재 낙폭", f"{current_dd * 100:.2f}%")
-        c4.metric("기간 MDD", f"{max_mdd * 100:.2f}%")
+        c4.metric("최대 낙폭", f"{period_mdd * 100:.2f}%")
         c5.metric("회복 필요", f"{recovery_needed * 100:.2f}%")
         c6.metric("매수 점수", f"{buy_score:.0f}점")
 
@@ -369,7 +390,7 @@ if run:
                 st.write(f"- {r}")
 
         # =========================
-        # Charts - English labels only
+        # Charts - English only
         # =========================
         fig, axes = plt.subplots(3, 1, figsize=(14, 13), sharex=True)
 
@@ -398,14 +419,16 @@ if run:
         axes[0].grid(True, alpha=0.3)
 
         # 2. Drawdown chart
-        axes[1].plot(df.index, df["Drawdown"] * 100, color="red", label="Drawdown")
+        axes[1].plot(df.index, df["Current_Drawdown"] * 100, color="red", label="Current DD")
+        axes[1].plot(df.index, df["Max_Drawdown"] * 100, color="darkred", linestyle="--", alpha=0.7, label="Max DD")
+
         axes[1].axhline(y=-8, color="gray", linestyle="--", alpha=0.6, label="-8% Watch")
         axes[1].axhline(y=-12, color="green", linestyle="--", alpha=0.8, label="-12% Buy 1")
         axes[1].axhline(y=-15, color="orange", linestyle="--", alpha=0.8, label="-15% Buy 2")
         axes[1].axhline(y=-20, color="red", linestyle="--", alpha=0.8, label="-20% Risk")
         axes[1].axhline(y=-target_dd, color="blue", linestyle=":", alpha=0.8, label="User Target")
 
-        axes[1].set_title("Drawdown / MDD")
+        axes[1].set_title("Current Drawdown / Max Drawdown")
         axes[1].set_ylabel("Drawdown (%)")
         axes[1].legend()
         axes[1].grid(True, alpha=0.3)
@@ -433,9 +456,9 @@ if run:
         view_cols = [
             "Close",
             "Peak",
-            "Drawdown",
-            "MDD",
-            "Recovery_Needed",
+            "Current_Drawdown",
+            "Max_Drawdown",
+            "Recovery_To_Peak",
             "RSI",
             "Volume_Ratio",
             "Buy_Score",
@@ -443,9 +466,24 @@ if run:
         ]
 
         show_df = df[view_cols].tail(20).copy()
-        show_df["Drawdown"] = show_df["Drawdown"] * 100
-        show_df["MDD"] = show_df["MDD"] * 100
-        show_df["Recovery_Needed"] = show_df["Recovery_Needed"] * 100
+
+        show_df["Current_Drawdown"] = show_df["Current_Drawdown"] * 100
+        show_df["Max_Drawdown"] = show_df["Max_Drawdown"] * 100
+        show_df["Recovery_To_Peak"] = show_df["Recovery_To_Peak"] * 100
+
+        show_df = show_df.rename(columns={
+            "Close": "Close(종가)",
+            "Peak": "Peak(기간고점)",
+            "Current_Drawdown": "Current DD(현재낙폭%)",
+            "Max_Drawdown": "Max DD(최대낙폭%)",
+            "Recovery_To_Peak": "Recovery(회복필요%)",
+            "RSI": "RSI(과매수/과매도)",
+            "Volume_Ratio": "Vol Ratio(거래량비율)",
+            "Buy_Score": "Buy Score(매수점수)",
+            "Decision": "Decision(판단)"
+        })
+
+        show_df.index.name = "Date(날짜)"
 
         st.dataframe(show_df, use_container_width=True)
 
@@ -455,8 +493,40 @@ if run:
         st.markdown("## 해석 기준")
 
         guide_df = pd.DataFrame({
-            "매수 점수": ["0~49", "50~64", "65~79", "80 이상"],
-            "판단": ["대기", "관심 / 대기", "1차 매수 후보", "2차 매수 후보"],
+            "항목": [
+                "Current DD(현재낙폭%)",
+                "Max DD(최대낙폭%)",
+                "Recovery(회복필요%)",
+                "RSI(과매수/과매도)",
+                "Vol Ratio(거래량비율)",
+                "Buy Score(매수점수)",
+                "Decision(판단)"
+            ],
+            "의미": [
+                "현재가가 시작일 이후 기간고점 대비 몇 % 빠졌는지",
+                "시작일 이후 가장 크게 빠졌던 최대 낙폭",
+                "현재가에서 기간고점까지 회복하려면 필요한 상승률",
+                "30 이하 과매도, 70 이상 과매수",
+                "현재 거래량이 20일 평균 거래량 대비 몇 배인지",
+                "MDD, RSI, 이동평균, 거래량, 저점 방어를 종합한 점수",
+                "대기 / 관심 / 1차 매수 후보 / 2차 매수 후보 / 매수 금지"
+            ],
+            "활용": [
+                "물타기·저점매수 판단의 핵심값",
+                "종목의 위험도 참고용",
+                "회복 난이도 판단",
+                "과매도 반등 가능성 확인",
+                "투매인지 매수세 유입인지 확인",
+                "65점 이상이면 소액 분할매수 후보",
+                "최종 행동 판단"
+            ]
+        })
+
+        st.table(guide_df)
+
+        score_df = pd.DataFrame({
+            "Buy Score(매수점수)": ["0~49", "50~64", "65~79", "80 이상"],
+            "Decision(판단)": ["대기", "관심 / 대기", "1차 매수 후보", "2차 매수 후보"],
             "설명": [
                 "가격 매력 또는 반등 확인 부족",
                 "관찰 구간",
@@ -465,9 +535,72 @@ if run:
             ]
         })
 
-        st.table(guide_df)
+        st.markdown("## 매수 점수 기준")
+        st.table(score_df)
 
         st.warning(
             "주의: 이 도구는 매수 판단 보조용이다. "
-            "MDD가 깊다고 무조건 매수하면 안 되고, 지수·금리·환율·수급·뉴스를 함께 봐야 한다."
+            "Current DD가 깊다고 무조건 매수하면 안 된다. "
+            "지수, 금리, 환율, 수급, 뉴스, 미국 선물시장 반응을 함께 확인해야 한다."
         )
+
+# =========================================================
+# 설명 주석
+# =========================================================
+#
+# 1. Close(종가)
+#    - 해당 날짜의 종가다.
+#
+# 2. Peak(기간고점)
+#    - 사용자가 입력한 시작일 이후 현재까지의 누적 최고가다.
+#    - 예: 시작일 이후 가장 높았던 가격.
+#
+# 3. Current DD(현재낙폭%)
+#    - 현재 종가가 Peak(기간고점) 대비 몇 % 빠졌는지 보여준다.
+#    - 물타기·저점매수 판단에서 가장 먼저 봐야 하는 값이다.
+#    - 예: -10%면 기간고점 대비 10% 하락한 상태.
+#
+# 4. Max DD(최대낙폭%)
+#    - 시작일 이후 가장 크게 빠졌던 낙폭이다.
+#    - 현재 낙폭이 아니라, 기간 중 최악의 하락폭이다.
+#    - 그래서 한 번 -20%까지 빠진 적이 있으면 이후 회복해도 Max DD는 계속 -20%로 남는다.
+#
+# 5. Recovery(회복필요%)
+#    - 현재 가격에서 다시 Peak(기간고점)까지 회복하려면 몇 % 상승이 필요한지 보여준다.
+#    - 예: Current DD가 -20%면 Recovery는 +25%다.
+#
+# 6. RSI(과매수/과매도)
+#    - 보통 RSI 30 이하이면 과매도, 70 이상이면 과매수로 본다.
+#    - RSI가 30 이하에서 다시 30 위로 올라오면 과매도 탈출 신호로 본다.
+#
+# 7. Vol Ratio(거래량비율)
+#    - 현재 거래량이 20일 평균 거래량 대비 몇 배인지 보여준다.
+#    - 1.5 이상이면 평소보다 거래량이 크게 증가한 것이다.
+#    - 거래량 증가 + 양봉이면 매수세 유입 가능성.
+#    - 거래량 증가 + 음봉이면 투매 또는 기관 매도 가능성.
+#
+# 8. Buy Score(매수점수)
+#    - Current DD, RSI, 이동평균, 거래량, 볼린저밴드, 저점 방어 여부를 합산한 점수다.
+#    - 65점 이상이면 1차 매수 후보.
+#    - 80점 이상이면 2차 매수 후보.
+#    - 단, 추세 훼손 위험 신호가 있으면 점수가 높아도 매수 금지가 나올 수 있다.
+#
+# 9. Decision(판단)
+#    - 대기: 아직 매수 근거 부족.
+#    - 관심 / 대기: 관찰 구간.
+#    - 1차 매수 후보: 소액 분할매수 검토 가능.
+#    - 2차 매수 후보: 강한 과매도 + 반등 신호.
+#    - 매수 금지 / 추세 확인: 낙폭은 크지만 추세 훼손 위험이 커서 물타기 금지.
+#
+# 10. 핵심 사용법
+#    - Current DD가 -8~-12%면 관심.
+#    - Current DD가 -12~-15%면 1차 매수 후보.
+#    - Current DD가 -15~-20%면 조건부 매수 후보.
+#    - Current DD가 -20% 이하이면 무조건 매수하지 말고 추세 훼손 여부를 먼저 확인해야 한다.
+#
+# 11. 주의
+#    - MDD 계산기는 가격 위치를 보는 도구다.
+#    - 실제 매수는 시장 지수, 금리, 환율, 외국인 수급, 미국 선물, 뉴스와 함께 판단해야 한다.
+#    - 특히 한국 ETF는 미국 본주 움직임과 환율, ETF 리밸런싱 수급까지 함께 봐야 한다.
+#
+# =========================================================
