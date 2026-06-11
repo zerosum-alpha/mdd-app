@@ -123,4 +123,4 @@ if st.button("분석 차트 그리기", use_container_width=True):
                     ax1.grid(True, alpha=0.3)
                     
                     ax2.plot(df.index, df['Drawdown'] * 100, color='red')
-                    ax2.fill_between(df.index, df['Drawdown'] * 100, 0, color='red', alpha=0.2
+                    ax2.fill_between(df.index, df['Drawdown'] * 100, 0, color='red', alpha=0.2)
