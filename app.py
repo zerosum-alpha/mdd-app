@@ -3,12 +3,11 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import yfinance as yf
 import FinanceDataReader as fdr
-from datetime import datetime
 
 st.set_page_config(page_title="MDD 저점매수 분석기", layout="wide")
 
 # =========================
-# 비밀번호
+# Password
 # =========================
 MY_PASSWORD = "1234"
 
@@ -21,7 +20,7 @@ if entered_password != MY_PASSWORD:
     st.stop()
 
 # =========================
-# 종목 리스트
+# Stock list
 # =========================
 @st.cache_data
 def get_stock_list():
@@ -43,11 +42,11 @@ def find_ticker(query):
     if query == "":
         return None, None, None
 
-    # 한국 6자리 코드
+    # Korean 6-digit code
     if query.isdigit() and len(query) == 6:
         return "KR", query, query
 
-    # 한국 종목명
+    # Korean stock name
     if not stock_list.empty and "Name" in stock_list.columns:
         match = stock_list[stock_list["Name"] == query]
         if not match.empty:
@@ -55,12 +54,12 @@ def find_ticker(query):
             name = match.iloc[0]["Name"]
             return "KR", code, name
 
-    # 미국 티커
+    # US ticker
     return "US", query.upper(), query.upper()
 
 
 # =========================
-# 데이터 로드
+# Load price data
 # =========================
 @st.cache_data(ttl=3600)
 def load_price_data(market, ticker, start_date):
@@ -70,13 +69,6 @@ def load_price_data(market, ticker, start_date):
         df = fdr.DataReader(ticker, start)
         if df.empty:
             return pd.DataFrame()
-        df = df.rename(columns={
-            "Close": "Close",
-            "Open": "Open",
-            "High": "High",
-            "Low": "Low",
-            "Volume": "Volume"
-        })
         return df
 
     if market == "US":
@@ -90,7 +82,7 @@ def load_price_data(market, ticker, start_date):
 
 
 # =========================
-# RSI 계산
+# RSI
 # =========================
 def calculate_rsi(close, period=14):
     delta = close.diff()
@@ -108,7 +100,7 @@ def calculate_rsi(close, period=14):
 
 
 # =========================
-# 지표 계산
+# Indicators
 # =========================
 def calculate_indicators(df):
     df = df.copy()
@@ -141,7 +133,7 @@ def calculate_indicators(df):
 
 
 # =========================
-# 매수 점수 계산
+# Buy score
 # =========================
 def calculate_buy_score(row, prev_row=None):
     score = 0
@@ -155,14 +147,13 @@ def calculate_buy_score(row, prev_row=None):
 
     ma5 = row["MA5"]
     ma20 = row["MA20"]
-    ma60 = row["MA60"]
     ma200 = row["MA200"]
     vol_ratio = row["Volume_Ratio"]
     ret = row["Return"]
     low20 = row["Low20"]
     bb_lower = row["BB_Lower"]
 
-    # 1. MDD 점수
+    # 1. MDD score
     if dd <= -0.20:
         score += 20
         reasons.append("MDD -20% 이하: 가격은 깊은 조정권")
@@ -181,7 +172,7 @@ def calculate_buy_score(row, prev_row=None):
         score += 10
         reasons.append("MDD -5% 이하: 관심 구간")
 
-    # 2. RSI 점수
+    # 2. RSI score
     if pd.notna(rsi):
         if rsi <= 25:
             score += 25
@@ -193,7 +184,7 @@ def calculate_buy_score(row, prev_row=None):
             score += 10
             reasons.append("RSI 40 이하: 약한 과매도")
 
-    # RSI 30 회복
+    # RSI recovery
     if prev_row is not None:
         prev_rsi = prev_row["RSI"]
         if pd.notna(prev_rsi) and pd.notna(rsi):
@@ -201,7 +192,7 @@ def calculate_buy_score(row, prev_row=None):
                 score += 15
                 reasons.append("RSI 30 회복: 과매도 탈출 신호")
 
-    # 3. 이동평균 반등 신호
+    # 3. Moving average recovery
     if pd.notna(ma5) and close > ma5:
         score += 10
         reasons.append("종가 MA5 회복: 단기 반등 신호")
@@ -210,7 +201,7 @@ def calculate_buy_score(row, prev_row=None):
         score += 15
         reasons.append("종가 MA20 회복: 반등 신뢰 상승")
 
-    # 4. 장기 추세 필터
+    # 4. Long-term trend filter
     if pd.notna(ma200):
         if close > ma200:
             score += 10
@@ -220,7 +211,7 @@ def calculate_buy_score(row, prev_row=None):
             danger = True
             danger_reasons.append("MA200 대비 -10% 이상 이탈: 장기 추세 훼손 가능")
 
-    # 5. 거래량 판단
+    # 5. Volume filter
     if pd.notna(vol_ratio):
         if vol_ratio >= 1.5 and ret > 0:
             score += 15
@@ -229,13 +220,13 @@ def calculate_buy_score(row, prev_row=None):
             score -= 15
             danger_reasons.append("거래량 증가 음봉: 투매 또는 기관 매도 가능")
 
-    # 6. 볼린저 하단 근처
+    # 6. Bollinger lower band
     if pd.notna(bb_lower):
         if close <= bb_lower:
             score += 10
             reasons.append("볼린저 하단 이하: 단기 과매도")
 
-    # 7. 최근 저점 이탈 방지
+    # 7. Recent low filter
     if pd.notna(low20):
         if close <= low20 * 1.005:
             score -= 20
@@ -245,10 +236,8 @@ def calculate_buy_score(row, prev_row=None):
             score += 10
             reasons.append("최근 저점 대비 3% 이상 회복")
 
-    # 점수 제한
     score = max(0, min(100, score))
 
-    # 판단
     if danger and score < 70:
         decision = "매수 금지 / 추세 확인"
     elif score >= 80:
@@ -274,6 +263,7 @@ def apply_buy_score(df):
         prev_row = df.iloc[i - 1] if i > 0 else None
 
         score, decision, reasons, dangers = calculate_buy_score(row, prev_row)
+
         scores.append(score)
         decisions.append(decision)
         reason_list.append(" / ".join(reasons))
@@ -288,7 +278,7 @@ def apply_buy_score(df):
 
 
 # =========================
-# 화면
+# Main screen
 # =========================
 st.title("📈 MDD 저점매수 분석기")
 
@@ -336,7 +326,7 @@ if run:
         st.subheader(f"분석 대상: {display_name} / {ticker} / {market}")
 
         # =========================
-        # 핵심 지표 카드
+        # Metrics
         # =========================
         c1, c2, c3, c4, c5, c6 = st.columns(6)
 
@@ -348,7 +338,7 @@ if run:
         c6.metric("매수 점수", f"{buy_score:.0f}점")
 
         # =========================
-        # 최종 판단
+        # Decision
         # =========================
         st.markdown("## 최종 판단")
 
@@ -363,7 +353,10 @@ if run:
         else:
             st.info(f"⚪ {decision}")
 
-        st.write(f"**현재 RSI:** {rsi:.2f}" if pd.notna(rsi) else "**현재 RSI:** 계산 불가")
+        if pd.notna(rsi):
+            st.write(f"**현재 RSI:** {rsi:.2f}")
+        else:
+            st.write("**현재 RSI:** 계산 불가")
 
         if latest["Reasons"]:
             st.markdown("### 긍정 신호")
@@ -376,11 +369,11 @@ if run:
                 st.write(f"- {r}")
 
         # =========================
-        # 차트
+        # Charts - English labels only
         # =========================
         fig, axes = plt.subplots(3, 1, figsize=(14, 13), sharex=True)
 
-        # 1. 가격 차트
+        # 1. Price chart
         axes[0].plot(df.index, df["Close"], label="Close", color="black")
         axes[0].plot(df.index, df["Peak"], label="Peak", color="blue", linestyle="--", alpha=0.7)
         axes[0].plot(df.index, df["MA20"], label="MA20", color="orange", alpha=0.8)
@@ -399,31 +392,33 @@ if run:
             label="Buy Candidate"
         )
 
-        axes[0].set_title(f"{ticker} Price / Moving Average")
+        axes[0].set_title(f"{ticker} Price / Moving Averages")
+        axes[0].set_ylabel("Price")
         axes[0].legend()
         axes[0].grid(True, alpha=0.3)
 
-        # 2. MDD 차트
+        # 2. Drawdown chart
         axes[1].plot(df.index, df["Drawdown"] * 100, color="red", label="Drawdown")
-        axes[1].axhline(y=-8, color="gray", linestyle="--", alpha=0.6, label="-8% 관심")
-        axes[1].axhline(y=-12, color="green", linestyle="--", alpha=0.8, label="-12% 1차")
-        axes[1].axhline(y=-15, color="orange", linestyle="--", alpha=0.8, label="-15% 2차")
-        axes[1].axhline(y=-20, color="red", linestyle="--", alpha=0.8, label="-20% 위험")
-        axes[1].axhline(y=-target_dd, color="blue", linestyle=":", alpha=0.8, label="사용자 기준")
+        axes[1].axhline(y=-8, color="gray", linestyle="--", alpha=0.6, label="-8% Watch")
+        axes[1].axhline(y=-12, color="green", linestyle="--", alpha=0.8, label="-12% Buy 1")
+        axes[1].axhline(y=-15, color="orange", linestyle="--", alpha=0.8, label="-15% Buy 2")
+        axes[1].axhline(y=-20, color="red", linestyle="--", alpha=0.8, label="-20% Risk")
+        axes[1].axhline(y=-target_dd, color="blue", linestyle=":", alpha=0.8, label="User Target")
 
         axes[1].set_title("Drawdown / MDD")
         axes[1].set_ylabel("Drawdown (%)")
         axes[1].legend()
         axes[1].grid(True, alpha=0.3)
 
-        # 3. 매수 점수
+        # 3. Buy score chart
         axes[2].plot(df.index, df["Buy_Score"], color="darkgreen", label="Buy Score")
-        axes[2].axhline(y=50, color="gray", linestyle="--", alpha=0.6, label="관심")
-        axes[2].axhline(y=65, color="green", linestyle="--", alpha=0.8, label="1차 매수")
-        axes[2].axhline(y=80, color="orange", linestyle="--", alpha=0.8, label="2차 매수")
+        axes[2].axhline(y=50, color="gray", linestyle="--", alpha=0.6, label="Watch")
+        axes[2].axhline(y=65, color="green", linestyle="--", alpha=0.8, label="Buy 1")
+        axes[2].axhline(y=80, color="orange", linestyle="--", alpha=0.8, label="Buy 2")
 
         axes[2].set_title("Buy Score")
         axes[2].set_ylabel("Score")
+        axes[2].set_xlabel("Date")
         axes[2].legend()
         axes[2].grid(True, alpha=0.3)
 
@@ -431,7 +426,7 @@ if run:
         st.pyplot(fig)
 
         # =========================
-        # 최근 데이터
+        # Recent data
         # =========================
         st.markdown("## 최근 20거래일 데이터")
 
@@ -455,11 +450,11 @@ if run:
         st.dataframe(show_df, use_container_width=True)
 
         # =========================
-        # 매수 해석
+        # Guide
         # =========================
         st.markdown("## 해석 기준")
 
-        st.table(pd.DataFrame({
+        guide_df = pd.DataFrame({
             "매수 점수": ["0~49", "50~64", "65~79", "80 이상"],
             "판단": ["대기", "관심 / 대기", "1차 매수 후보", "2차 매수 후보"],
             "설명": [
@@ -468,7 +463,9 @@ if run:
                 "소액 분할매수 검토 가능",
                 "강한 과매도 + 반등 신호"
             ]
-        }))
+        })
+
+        st.table(guide_df)
 
         st.warning(
             "주의: 이 도구는 매수 판단 보조용이다. "
