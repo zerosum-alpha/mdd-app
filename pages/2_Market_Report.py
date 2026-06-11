@@ -6,11 +6,13 @@ from datetime import datetime, timedelta
 from auth import require_login, logout_button
 
 # =========================================================
-# 시장 리포트 페이지
+# 시장 리포트 페이지 FINAL
+# 목적:
 # - MDD 계산 로직과 분리
-# - 자동 매수판단 없음
-# - 뉴스·리스크·SNS·테마 영향 수동 정리
-# - CSV 다운로드 지원
+# - 주요 시장 지표 자동 조회
+# - 주요 뉴스 / 리스크 / SNS / 테마 영향은 기본 리포트 형태로 제공
+# - 사용자가 수정하면 아래 리포트 출력도 같이 변경
+# - CSV / Markdown 다운로드 지원
 # =========================================================
 
 st.set_page_config(page_title="시장 리포트", layout="wide")
@@ -21,8 +23,9 @@ logout_button()
 st.title("📰 시장 리포트")
 
 st.warning(
-    "이 페이지는 참고용입니다. "
-    "뉴스 자동 크롤링, 자동 위험점수, Buy Score 강제 연동, 자동 매수추천은 포함하지 않습니다."
+    "이 페이지는 시장 판단 참고용입니다. "
+    "MDD Buy Score 계산에는 직접 반영하지 않습니다. "
+    "뉴스·리스크·SNS 내용은 사용자가 직접 수정해서 당일 리포트로 관리합니다."
 )
 
 
@@ -89,48 +92,220 @@ def make_csv_download(df, filename, button_label):
     )
 
 
+def safe_value(value):
+    if pd.isna(value) or value is None:
+        return "-"
+    return str(value)
+
+
+def format_pct(value):
+    if pd.isna(value) or value is None:
+        return "-"
+    return f"{value:.2f}%"
+
+
+def market_comment(change_pct):
+    if change_pct is None or pd.isna(change_pct):
+        return "데이터 확인 필요"
+    if change_pct >= 1.0:
+        return "강한 반등"
+    if change_pct >= 0.3:
+        return "상승 우위"
+    if change_pct > -0.3:
+        return "중립"
+    if change_pct > -1.0:
+        return "약세"
+    return "리스크 확대"
+
+
 def default_news_df():
     return pd.DataFrame({
-        "뉴스 제목": ["", "", ""],
-        "출처": ["Reuters", "Bloomberg", "연합뉴스"],
-        "구분": ["보도", "보도", "공식"],
-        "영향": ["중립", "중립", "중립"],
-        "관련 테마": ["전체", "나스닥", "한국장"],
-        "단기 영향": ["중립", "중립", "중립"],
-        "중기 영향": ["확인 부족", "확인 부족", "확인 부족"],
-        "메모": ["", "", ""]
+        "뉴스 제목": [
+            "미국 물가·금리 이벤트 대기",
+            "반도체 섹터 반등 여부 확인",
+            "AI 인프라 투자 부담 논란",
+            "우주·SpaceX 관련 기대감 지속"
+        ],
+        "출처": [
+            "경제 캘린더 / 주요 보도",
+            "SOXX / MU / NVDA 흐름",
+            "Reuters / 시장 보도",
+            "Reuters / 시장 보도"
+        ],
+        "구분": [
+            "공식",
+            "보도",
+            "보도",
+            "보도"
+        ],
+        "영향": [
+            "중립",
+            "긍정",
+            "부정",
+            "긍정"
+        ],
+        "관련 테마": [
+            "나스닥, 전체",
+            "메모리, 엔비디아",
+            "전력, AI 인프라",
+            "우주"
+        ],
+        "단기 영향": [
+            "중립",
+            "긍정",
+            "부정",
+            "긍정"
+        ],
+        "중기 영향": [
+            "확인 부족",
+            "긍정",
+            "중립",
+            "확인 부족"
+        ],
+        "메모": [
+            "CPI/PPI/FOMC 등 이벤트 전후 변동성 확대 가능성",
+            "SOXX, MU, NVDA 회복 여부가 MDD 신호 신뢰도에 중요",
+            "AI 수요는 유지되나 CapEx 부담 뉴스 반복 시 전력·인프라 ETF 부담",
+            "이벤트성 기대는 가능하나 재료소멸과 변동성 주의"
+        ]
     })
 
 
 def default_risk_df():
     return pd.DataFrame({
-        "리스크 제목": ["", "", ""],
-        "구분": ["지정학", "유가", "금리"],
-        "영향": ["중립", "중립", "중립"],
-        "관련 테마": ["전체", "나스닥", "한국장"],
-        "확인 상태": ["보도", "공식", "공식"],
-        "메모": ["", "", ""]
+        "리스크 제목": [
+            "지정학·전쟁 리스크",
+            "유가 급등 가능성",
+            "미국 금리 재상승",
+            "달러 강세",
+            "ETF 리밸런싱 / 수급 왜곡"
+        ],
+        "구분": [
+            "지정학",
+            "유가",
+            "금리",
+            "환율",
+            "수급"
+        ],
+        "영향": [
+            "부정",
+            "부정",
+            "부정",
+            "부정",
+            "부정"
+        ],
+        "관련 테마": [
+            "전체",
+            "나스닥, 한국장",
+            "나스닥, 반도체",
+            "한국장, 해외 ETF",
+            "한국장, 반도체"
+        ],
+        "확인 상태": [
+            "보도",
+            "공식",
+            "공식",
+            "공식",
+            "리서치"
+        ],
+        "메모": [
+            "전쟁·제재·해상 운송 리스크 확대 시 위험자산 부담",
+            "유가 상승은 물가 재부담 → 성장주 할인율 부담",
+            "10년물 금리 상승 시 QQQ, SOXX, AI 성장주 부담",
+            "원화 약세는 한국 상장 해외 ETF에는 단기 방어, 신규 진입에는 부담",
+            "리밸런싱 시 특정 대형주 수급 왜곡 가능"
+        ]
     })
 
 
 def default_sns_df():
     return pd.DataFrame({
-        "내용": ["", "", ""],
-        "출처": ["X", "커뮤니티", "Reddit"],
-        "신뢰도": ["낮음", "낮음", "보통"],
-        "영향": ["중립", "중립", "중립"],
-        "관련 테마": ["전체", "한국장", "우주"],
-        "확인 필요 메모": ["공식 확인 필요", "공시 확인 필요", "거래량 확인 필요"]
+        "내용": [
+            "데이터센터 투자 지연설",
+            "특정 AI·반도체 ETF 편입 기대",
+            "SpaceX 관련 우주주 관심 증가",
+            "메모리 가격 반등 기대 확산"
+        ],
+        "출처": [
+            "X / 커뮤니티",
+            "커뮤니티",
+            "Reddit / X",
+            "커뮤니티 / 리서치 언급"
+        ],
+        "신뢰도": [
+            "낮음",
+            "낮음",
+            "보통",
+            "보통"
+        ],
+        "영향": [
+            "부정",
+            "긍정",
+            "긍정",
+            "긍정"
+        ],
+        "관련 테마": [
+            "전력",
+            "한국장",
+            "우주",
+            "메모리"
+        ],
+        "확인 필요 메모": [
+            "공식 보도 또는 기업 가이던스 확인 필요",
+            "ETF 공시·구성종목 변경 확인 필요",
+            "실제 거래량과 관련주 동반 상승 여부 확인",
+            "MU, WDC, HBM 관련 뉴스와 가격 반응 확인"
+        ]
     })
 
 
 def default_theme_df():
     return pd.DataFrame({
-        "테마": ["나스닥", "메모리", "엔비디아", "전력", "구글", "우주", "한국장"],
-        "단기 영향": ["중립", "중립", "중립", "중립", "중립", "중립", "중립"],
-        "중기 영향": ["중립", "중립", "중립", "중립", "중립", "확인 부족", "중립"],
-        "핵심 근거": ["", "", "", "", "", "", ""],
-        "주의점": ["", "", "", "", "", "", ""]
+        "테마": [
+            "나스닥",
+            "메모리",
+            "엔비디아",
+            "전력",
+            "구글",
+            "우주",
+            "한국장"
+        ],
+        "단기 영향": [
+            "중립",
+            "긍정",
+            "중립",
+            "중립",
+            "중립",
+            "중립",
+            "중립"
+        ],
+        "중기 영향": [
+            "긍정",
+            "긍정",
+            "긍정",
+            "긍정",
+            "중립",
+            "확인 부족",
+            "중립"
+        ],
+        "핵심 근거": [
+            "QQQ 회복 여부, 금리 안정 여부",
+            "MU, SOXX 반등과 HBM·메모리 업황 기대",
+            "AI 대장주 지위 유지, NVDA 가격 방어 여부",
+            "AI 전력 수요는 유효하나 CapEx 부담 뉴스 존재",
+            "AI·클라우드 노출은 있으나 단기 주도력 확인 필요",
+            "SpaceX 기대감은 있으나 이벤트성 변동성 큼",
+            "KOSPI·KOSDAQ·EWY·환율·외국인 수급 확인 필요"
+        ],
+        "주의점": [
+            "금리·유가·VIX 상승 시 반등 제한",
+            "급반등 후 차익실현 가능성",
+            "고점권 변동성, 5일선 이탈 여부",
+            "데이터센터 지연설, 금리 부담",
+            "빅테크 내 상대 강도 약화 가능성",
+            "재료 소멸, 관련 종목 실질성 부족",
+            "외국인 매도, 리밸런싱, 환율 부담"
+        ]
     })
 
 
@@ -148,7 +323,7 @@ def default_mdd_ref_df():
             "조건부",
             "필요",
             "금지",
-            ""
+            "MDD가 깊은 종목은 소액 선진입 가능하나, 시장 지표 회복과 주요 리스크 완화 확인 필요"
         ]
     })
 
@@ -157,14 +332,40 @@ def default_next_check_df():
     return pd.DataFrame({
         "확인할 것": [
             "SOXX 회복 여부",
+            "MU / 메모리주 반등 지속",
             "NVDA 주요 가격대 유지",
-            "유가 안정",
-            "미국 주요 이벤트",
+            "QQQ 5일선 회복 여부",
+            "VIX 안정 여부",
+            "유가 안정 여부",
             "한국 외국인 수급"
         ],
-        "중요도": ["높음", "높음", "높음", "중간", "높음"],
-        "관련 테마": ["메모리, 반도체", "엔비디아, AI", "전체", "나스닥", "한국장"],
-        "메모": ["", "", "", "", ""]
+        "중요도": [
+            "높음",
+            "높음",
+            "높음",
+            "높음",
+            "중간",
+            "높음",
+            "높음"
+        ],
+        "관련 테마": [
+            "메모리, 반도체",
+            "메모리",
+            "엔비디아, AI",
+            "나스닥",
+            "전체",
+            "전체",
+            "한국장"
+        ],
+        "메모": [
+            "반도체 반등 지속성 확인",
+            "MDD 저점매수 신뢰도에 직접 영향",
+            "AI 대장주 방어 여부 확인",
+            "성장주 반등 지속 조건",
+            "공포 완화 여부 확인",
+            "물가 부담 재확대 여부 확인",
+            "한국 ETF·종목 반등 지속 여부 확인"
+        ]
     })
 
 
@@ -193,12 +394,23 @@ with c3:
     buy_mood = st.selectbox(
         "매수 분위기",
         ["가능", "소액 가능", "대기", "금지"],
-        index=2
+        index=1
     )
 
-today_summary = st.text_input("오늘 핵심 한 줄", value="")
-today_key_risk = st.text_input("오늘 핵심 리스크", value="")
-today_positive = st.text_input("오늘 긍정 요인", value="")
+today_summary = st.text_input(
+    "오늘 핵심 한 줄",
+    value="반도체·AI 주요 지표 회복 여부가 MDD 저점매수 신뢰도를 결정"
+)
+
+today_key_risk = st.text_input(
+    "오늘 핵심 리스크",
+    value="유가, 금리, 지정학, 주요 이벤트 전후 변동성"
+)
+
+today_positive = st.text_input(
+    "오늘 긍정 요인",
+    value="SOXX, MU, QQQ 회복 시 MDD 깊은 종목의 소액 선진입 신뢰도 상승"
+)
 
 summary_df = pd.DataFrame({
     "항목": [
@@ -271,7 +483,7 @@ for ticker in ticker_list:
         "티커": ticker,
         "현재가": None if close is None else round(close, 2),
         "등락률(%)": None if change_pct is None else round(change_pct, 2),
-        "판단 메모": ""
+        "판단 메모": market_comment(change_pct)
     })
 
 kospi_close, kospi_change = load_fdr_index_latest("KS11")
@@ -282,7 +494,7 @@ market_rows.append({
     "티커": "KS11",
     "현재가": None if kospi_close is None else round(kospi_close, 2),
     "등락률(%)": None if kospi_change is None else round(kospi_change, 2),
-    "판단 메모": ""
+    "판단 메모": market_comment(kospi_change)
 })
 
 market_rows.append({
@@ -290,7 +502,7 @@ market_rows.append({
     "티커": "KQ11",
     "현재가": None if kosdaq_close is None else round(kosdaq_close, 2),
     "등락률(%)": None if kosdaq_change is None else round(kosdaq_change, 2),
-    "판단 메모": ""
+    "판단 메모": market_comment(kosdaq_change)
 })
 
 market_indicator_df = pd.DataFrame(market_rows)
@@ -314,7 +526,7 @@ make_csv_download(
 # =========================================================
 st.markdown("## 3. 주요 뉴스")
 
-st.write("공식 뉴스와 보도 뉴스를 정리하는 영역입니다.")
+st.write("아래 기본 뉴스 리포트를 당일 상황에 맞게 수정하세요.")
 
 news_df = st.data_editor(
     default_news_df(),
@@ -352,8 +564,6 @@ make_csv_download(
 # 4. 주요 리스크
 # =========================================================
 st.markdown("## 4. 주요 리스크")
-
-st.write("전쟁, 지정학, 유가, 금리, 환율, 제재, 관세, 공급망, 금융 리스크를 정리합니다.")
 
 risk_df = st.data_editor(
     default_risk_df(),
@@ -499,9 +709,83 @@ make_csv_download(
 
 
 # =========================================================
-# 전체 리포트 통합 다운로드
+# 9. 오늘 시장 리포트 출력
 # =========================================================
-st.markdown("## 전체 리포트 통합 다운로드")
+st.markdown("## 9. 오늘 시장 리포트 출력")
+
+today = datetime.today().strftime("%Y-%m-%d")
+
+market_table_md = edited_market_indicator_df.to_markdown(index=False)
+news_table_md = news_df.to_markdown(index=False)
+risk_table_md = risk_df.to_markdown(index=False)
+sns_table_md = sns_df.to_markdown(index=False)
+theme_table_md = theme_df.to_markdown(index=False)
+mdd_ref_table_md = mdd_ref_df.to_markdown(index=False)
+next_check_table_md = next_check_df.to_markdown(index=False)
+
+report_markdown = f"""
+# 시장 리포트 - {today}
+
+## 1. 오늘 결론
+
+- 시장 분위기: **{market_mood}**
+- 시장 위험도: **{market_risk}**
+- 매수 분위기: **{buy_mood}**
+- 핵심 한 줄: **{today_summary}**
+- 핵심 리스크: **{today_key_risk}**
+- 긍정 요인: **{today_positive}**
+
+## 2. 주요 시장 지표
+
+{market_table_md}
+
+## 3. 주요 뉴스
+
+{news_table_md}
+
+## 4. 주요 리스크
+
+{risk_table_md}
+
+## 5. SNS·소문·찌라시
+
+주의: 이 항목은 확정 사실이 아니라 참고용 비공식 신호다.
+
+{sns_table_md}
+
+## 6. 테마별 영향
+
+{theme_table_md}
+
+## 7. 오늘 MDD 판단 참고
+
+{mdd_ref_table_md}
+
+## 8. 다음 확인사항
+
+{next_check_table_md}
+
+## 9. 최종 메모
+
+오늘 MDD 신호는 단독 매수 신호가 아니다.  
+시장 지표, 주요 뉴스, 리스크, 테마 영향과 함께 확인해야 한다.  
+특히 SOXX, QQQ, MU, NVDA, VIX, 유가, 금리 흐름이 MDD 저점매수 신뢰도를 결정한다.
+"""
+
+st.markdown(report_markdown)
+
+st.download_button(
+    label="오늘 시장 리포트 Markdown 다운로드",
+    data=report_markdown.encode("utf-8-sig"),
+    file_name="today_market_report.md",
+    mime="text/markdown"
+)
+
+
+# =========================================================
+# 10. 전체 CSV 다운로드
+# =========================================================
+st.markdown("## 10. 전체 CSV 다운로드")
 
 combined_report = {
     "today_summary": summary_df,
@@ -527,9 +811,4 @@ st.download_button(
     data=combined_csv,
     file_name="full_market_report.csv",
     mime="text/csv"
-)
-
-st.warning(
-    "저장 버튼은 CSV 다운로드 방식입니다. "
-    "화면을 새로고침하면 입력 내용은 사라질 수 있으므로, 작성 후 반드시 다운로드하세요."
 )
