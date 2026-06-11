@@ -9,7 +9,7 @@ import requests
 st.set_page_config(page_title="MDD & 줍줍 분석기", layout="centered")
 
 # --- [비밀번호 설정] ---
-MY_PASSWORD = "1234"
+MY_PASSWORD = "1123"
 
 st.title("🔒 나만의 주식 분석기")
 entered_password = st.text_input("비밀번호를 입력하세요", type="password")
