@@ -7,11 +7,12 @@ from datetime import datetime, timedelta
 from auth import require_login, logout_button
 
 # =========================================================
-# Market Report Page - Issue Scanner Version
+# Market Report Page - Live Issue Scanner
 # 목적:
-# - 실시간 주요 지표 확인
-# - RSS 뉴스에서 현재 주요 이슈 자동 수집
-# - 전쟁/유가/금리/반도체/AI/한국장 등 이슈 분류
+# - 실시간 주요 시장 지표 확인
+# - 한국어 RSS 뉴스 수집
+# - 현재 시장 주요 이슈 자동 분류
+# - 테마별 뉴스 연결
 # - 매수/매도 판단 없음
 # - MDD Buy Score 반영 없음
 # =========================================================
@@ -25,21 +26,22 @@ st.title("📰 시장 리포트")
 
 st.warning(
     "이 페이지는 현재 시장 주요 이슈 확인용입니다. "
-    "매수/매도 판단이나 MDD Buy Score에는 반영하지 않습니다."
+    "매수/매도 판단이나 MDD Buy Score에는 직접 반영하지 않습니다."
 )
 
-
 # =========================================================
-# RSS sources
+# RSS Sources - 한국어 중심
 # =========================================================
 RSS_SOURCES = {
-    "Investing 전체 뉴스": "https://www.investing.com/rss/news.rss",
-    "Investing 주식 뉴스": "https://www.investing.com/rss/news_25.rss",
-    "Investing 경제지표 뉴스": "https://www.investing.com/rss/news_95.rss",
-    "Investing 상품 뉴스": "https://www.investing.com/rss/news_11.rss",
-    "Investing IPO 뉴스": "https://www.investing.com/rss/news_450.rss",
+    "Investing KR 전체 뉴스": "https://kr.investing.com/rss/news.rss",
+    "Investing KR 주식 뉴스": "https://kr.investing.com/rss/news_25.rss",
+    "Investing KR 경제 뉴스": "https://kr.investing.com/rss/news_14.rss",
+    "Investing KR 경제지표 뉴스": "https://kr.investing.com/rss/news_95.rss",
+    "Investing KR 상품 뉴스": "https://kr.investing.com/rss/news_11.rss",
+    "Investing KR IPO 뉴스": "https://kr.investing.com/rss/news_450.rss",
+    "Investing KR 시장 개황": "https://kr.investing.com/rss/market_overview.rss",
+    "Investing KR 주식 분석": "https://kr.investing.com/rss/stock.rss",
 }
-
 
 # =========================================================
 # Helper functions
@@ -159,7 +161,7 @@ def market_comment(ticker, change_pct):
             return "달러 부담 완화"
         return "위험자산 우호"
 
-    # 일반 주가지수/ETF
+    # 일반 지수/ETF: 상승이 긍정
     if change_pct >= 1.0:
         return "강한 반등"
     if change_pct >= 0.3:
@@ -179,7 +181,12 @@ def load_rss_news(selected_sources, max_items_per_source):
         url = RSS_SOURCES[source_name]
 
         try:
-            feed = feedparser.parse(url)
+            feed = feedparser.parse(
+                url,
+                request_headers={
+                    "User-Agent": "Mozilla/5.0"
+                }
+            )
 
             for entry in feed.entries[:max_items_per_source]:
                 title = getattr(entry, "title", "")
@@ -188,69 +195,97 @@ def load_rss_news(selected_sources, max_items_per_source):
 
                 if title:
                     rows.append({
-                        "source": source_name,
-                        "title": title,
-                        "published": published,
-                        "link": link
+                        "출처": source_name,
+                        "뉴스 제목": title,
+                        "발행": published,
+                        "링크": link
                     })
 
         except Exception:
             continue
 
     if not rows:
-        return pd.DataFrame(columns=["source", "title", "published", "link"])
+        return pd.DataFrame(columns=["출처", "뉴스 제목", "발행", "링크"])
 
     df = pd.DataFrame(rows)
-    df = df.drop_duplicates(subset=["title"])
+    df = df.drop_duplicates(subset=["뉴스 제목"])
     return df
 
 
 def classify_news(title):
-    text = title.lower()
+    text = str(title).lower()
 
     issue_rules = {
         "전쟁·지정학": [
             "war", "attack", "missile", "iran", "israel", "gaza",
             "russia", "ukraine", "conflict", "geopolitical",
-            "sanction", "military", "red sea", "houthi"
+            "sanction", "military", "red sea", "houthi",
+            "전쟁", "공격", "미사일", "이란", "이스라엘", "가자",
+            "러시아", "우크라이나", "분쟁", "지정학", "제재", "군사",
+            "홍해", "후티", "호르무즈"
         ],
         "유가·원자재": [
             "oil", "crude", "brent", "wti", "opec", "gas",
-            "energy", "commodity", "gold", "copper"
+            "energy", "commodity", "gold", "copper",
+            "유가", "원유", "브렌트", "천연가스", "원자재",
+            "금", "구리", "에너지", "opec"
         ],
         "금리·물가·연준": [
             "fed", "fomc", "rate", "yield", "treasury",
             "inflation", "cpi", "ppi", "powell", "jobless",
-            "payroll", "employment"
+            "payroll", "employment",
+            "연준", "fomc", "금리", "국채", "수익률",
+            "물가", "인플레이션", "cpi", "ppi", "파월",
+            "고용", "실업수당", "비농업", "채권"
         ],
         "AI·반도체": [
             "nvidia", "ai", "artificial intelligence", "semiconductor",
             "chip", "chips", "micron", "broadcom", "amd", "intel",
-            "tsmc", "memory", "hbm", "dram"
+            "tsmc", "memory", "hbm", "dram",
+            "엔비디아", "인공지능", "ai", "반도체", "칩",
+            "마이크론", "브로드컴", "amd", "인텔", "tsmc",
+            "메모리", "hbm", "dram", "sk하이닉스", "삼성전자"
+        ],
+        "전력·AI인프라": [
+            "power", "electricity", "grid", "data center", "datacenter",
+            "utility", "energy infrastructure", "vertiv", "ge vernova",
+            "전력", "전력망", "전기", "데이터센터", "데이터 센터",
+            "전력인프라", "인프라", "버티브", "ge버노바", "냉각"
         ],
         "빅테크·나스닥": [
             "nasdaq", "apple", "microsoft", "amazon", "google",
-            "alphabet", "meta", "tesla", "tech", "growth stocks"
+            "alphabet", "meta", "tesla", "tech", "growth stocks",
+            "나스닥", "애플", "마이크로소프트", "아마존", "구글",
+            "알파벳", "메타", "테슬라", "빅테크", "성장주", "기술주"
         ],
         "한국장": [
             "korea", "kospi", "kosdaq", "won", "samsung",
-            "sk hynix", "south korea"
+            "sk hynix", "south korea",
+            "한국", "코스피", "코스닥", "원화", "환율",
+            "삼성전자", "sk하이닉스", "외국인", "기관"
         ],
         "중국·아시아": [
             "china", "hong kong", "asia", "japan", "taiwan",
-            "yuan", "nikkei", "hang seng"
+            "yuan", "nikkei", "hang seng",
+            "중국", "홍콩", "아시아", "일본", "대만",
+            "위안", "니케이", "항셍"
         ],
         "우주·방산": [
             "spacex", "space", "rocket", "satellite", "defense",
-            "aerospace"
+            "aerospace",
+            "스페이스x", "우주", "로켓", "위성", "방산", "항공우주"
         ],
         "실적·가이던스": [
             "earnings", "revenue", "profit", "forecast", "guidance",
-            "outlook", "beat", "misses", "results"
+            "outlook", "beat", "misses", "results",
+            "실적", "매출", "이익", "가이던스", "전망",
+            "어닝", "컨센서스", "상회", "하회"
         ],
         "금융·신용": [
             "bank", "credit", "debt", "default", "liquidity",
-            "bond", "loan", "financial"
+            "bond", "loan", "financial",
+            "은행", "신용", "부채", "디폴트", "유동성",
+            "채권", "대출", "금융"
         ]
     }
 
@@ -259,6 +294,7 @@ def classify_news(title):
         "유가·원자재": "전체, 나스닥, 한국장",
         "금리·물가·연준": "나스닥, 반도체, 성장주",
         "AI·반도체": "메모리, 엔비디아, AI",
+        "전력·AI인프라": "전력, AI 인프라",
         "빅테크·나스닥": "나스닥, 구글, 빅테크",
         "한국장": "한국장, 반도체",
         "중국·아시아": "한국장, 아시아 ETF",
@@ -300,12 +336,17 @@ def classify_news(title):
     negative_words = [
         "fall", "drop", "plunge", "risk", "war", "attack", "concern",
         "worry", "fear", "loss", "miss", "cut", "weak", "slowdown",
-        "inflation", "yield rises", "higher rates"
+        "inflation", "higher rates",
+        "하락", "급락", "위험", "전쟁", "공격", "우려", "공포",
+        "손실", "부진", "둔화", "인플레이션", "금리 상승", "악화",
+        "부담", "제재", "관세"
     ]
 
     positive_words = [
         "rise", "gain", "jump", "surge", "rally", "beat", "record",
-        "optimism", "growth", "strong", "rebound", "upgrade"
+        "optimism", "growth", "strong", "rebound", "upgrade",
+        "상승", "급등", "반등", "랠리", "호조", "상회", "기록",
+        "낙관", "성장", "강세", "개선", "상향"
     ]
 
     if any(word in text for word in negative_words):
@@ -339,13 +380,17 @@ def summarize_issues(news_df):
     rows = []
 
     for issue, group in issue_df.groupby("이슈"):
+        related_theme_text = " / ".join(
+            sorted(set(group["관련 테마"].dropna().astype(str)))
+        )
+
         rows.append({
             "이슈": issue,
             "뉴스 수": len(group),
             "부정": int((group["영향"] == "부정").sum()),
             "긍정": int((group["영향"] == "긍정").sum()),
             "중립": int((group["영향"] == "중립").sum()),
-            "관련 테마": " / ".join(sorted(set(group["관련 테마"].dropna().astype(str))))[:120]
+            "관련 테마": related_theme_text[:120]
         })
 
     result = pd.DataFrame(rows)
@@ -376,7 +421,7 @@ def make_issue_comment(issue_summary_df):
     if total_negative > total_positive:
         lines.append("부정 이슈 비중이 더 높아 시장 리스크 확인이 우선입니다.")
     elif total_positive > total_negative:
-        lines.append("긍정 이슈 비중이 더 높지만, 지표 확인은 필요합니다.")
+        lines.append("긍정 이슈 비중이 더 높지만, 시장 지표 확인은 필요합니다.")
     else:
         lines.append("긍정·부정 이슈가 혼재되어 방향성 확인이 필요합니다.")
 
@@ -388,6 +433,23 @@ def make_issue_comment(issue_summary_df):
     lines.append("이 결과는 매수·매도 판단이 아니라, MDD 분석 전 확인해야 할 시장 이슈 요약입니다.")
 
     return "\n\n".join(lines)
+
+
+def df_to_markdown(df):
+    if df.empty:
+        return "데이터 없음"
+
+    headers = list(df.columns)
+    lines = []
+
+    lines.append("| " + " | ".join(headers) + " |")
+    lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
+
+    for _, row in df.iterrows():
+        values = [str(row[col]).replace("\n", " ") for col in headers]
+        lines.append("| " + " | ".join(values) + " |")
+
+    return "\n".join(lines)
 
 
 # =========================================================
@@ -468,10 +530,10 @@ with col1:
         "뉴스 소스 선택",
         list(RSS_SOURCES.keys()),
         default=[
-            "Investing 전체 뉴스",
-            "Investing 주식 뉴스",
-            "Investing 경제지표 뉴스",
-            "Investing 상품 뉴스"
+            "Investing KR 전체 뉴스",
+            "Investing KR 주식 뉴스",
+            "Investing KR 경제지표 뉴스",
+            "Investing KR 상품 뉴스"
         ]
     )
 
@@ -493,17 +555,17 @@ if raw_news_df.empty:
 classified_rows = []
 
 for _, row in raw_news_df.iterrows():
-    issue, related_theme, risk_flag, tone = classify_news(row["title"])
+    issue, related_theme, risk_flag, tone = classify_news(row["뉴스 제목"])
 
     classified_rows.append({
-        "뉴스 제목": row["title"],
-        "출처": row["source"],
+        "뉴스 제목": row["뉴스 제목"],
+        "출처": row["출처"],
         "이슈": issue,
         "관련 테마": related_theme,
         "영향": tone,
         "구분": risk_flag,
-        "발행": row["published"],
-        "링크": row["link"]
+        "발행": row["발행"],
+        "링크": row["링크"]
     })
 
 news_df = pd.DataFrame(classified_rows)
@@ -518,9 +580,9 @@ st.dataframe(
 
 
 # =========================================================
-# 3. 주요 이슈 Top 5
+# 3. 주요 이슈 Top 10
 # =========================================================
-st.markdown("## 3. 주요 이슈 Top 5")
+st.markdown("## 3. 주요 이슈 Top 10")
 
 issue_summary_df = summarize_issues(news_df)
 
@@ -560,11 +622,11 @@ else:
 # =========================================================
 st.markdown("## 5. 테마별 뉴스 연결")
 
-theme_keywords = {
-    "나스닥": ["나스닥", "빅테크·나스닥", "금리·물가·연준"],
+theme_issue_map = {
+    "나스닥": ["빅테크·나스닥", "금리·물가·연준"],
     "메모리": ["AI·반도체"],
     "엔비디아": ["AI·반도체"],
-    "전력": ["AI·반도체", "유가·원자재"],
+    "전력": ["전력·AI인프라"],
     "구글": ["빅테크·나스닥"],
     "우주": ["우주·방산"],
     "한국장": ["한국장", "중국·아시아", "금리·물가·연준"]
@@ -572,17 +634,29 @@ theme_keywords = {
 
 theme_rows = []
 
-for theme, keywords in theme_keywords.items():
+for theme, issue_keys in theme_issue_map.items():
     matched = news_df[
-        news_df["이슈"].apply(lambda x: any(keyword in x for keyword in keywords))
+        news_df["이슈"].apply(lambda x: any(issue_key in x for issue_key in issue_keys))
     ]
+
+    if not matched.empty:
+        issue_counts = (
+            matched["이슈"]
+            .str.split(", ")
+            .explode()
+            .value_counts()
+            .head(3)
+        )
+        main_issues = ", ".join(issue_counts.index.tolist())
+    else:
+        main_issues = "-"
 
     theme_rows.append({
         "테마": theme,
         "관련 뉴스 수": len(matched),
         "부정 뉴스": int((matched["영향"] == "부정").sum()) if not matched.empty else 0,
         "긍정 뉴스": int((matched["영향"] == "긍정").sum()) if not matched.empty else 0,
-        "주요 이슈": ", ".join(sorted(set(matched["이슈"].astype(str))))[:120] if not matched.empty else "-"
+        "주요 이슈": main_issues
     })
 
 theme_df = pd.DataFrame(theme_rows)
@@ -598,17 +672,16 @@ st.markdown("## 6. 오늘 시장 리포트 출력")
 
 today = datetime.today().strftime("%Y-%m-%d")
 
-top_issue_md = issue_summary_df.head(10).to_markdown(index=False)
-market_md = market_df.to_markdown(index=False)
-theme_md = theme_df.to_markdown(index=False)
+top_issue_md = df_to_markdown(issue_summary_df.head(10))
+market_md = df_to_markdown(market_df)
+theme_md = df_to_markdown(theme_df)
 
-risk_md = (
-    risk_news_df[["뉴스 제목", "출처", "이슈", "관련 테마", "영향"]]
-    .head(15)
-    .to_markdown(index=False)
-    if not risk_news_df.empty
-    else "리스크성 뉴스가 뚜렷하게 많지 않음"
-)
+if not risk_news_df.empty:
+    risk_md = df_to_markdown(
+        risk_news_df[["뉴스 제목", "출처", "이슈", "관련 테마", "영향"]].head(15)
+    )
+else:
+    risk_md = "리스크성 뉴스가 뚜렷하게 많지 않음"
 
 report_markdown = f"""
 # 시장 주요 이슈 리포트 - {today}
