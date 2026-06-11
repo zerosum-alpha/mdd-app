@@ -1,6 +1,6 @@
 import streamlit as st
 
-PASSWORD = "1234"
+PASSWORD = "0914"
 
 
 def require_login():
