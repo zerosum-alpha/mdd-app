@@ -16,14 +16,14 @@ col1, col2 = st.columns(2)
 
 with col1:
     st.page_link(
-        "pages/1_MDD_분석기.py",
+        "pages/1_MDD.py",
         label="📊 MDD 분석기 열기",
         icon="📊"
     )
 
 with col2:
     st.page_link(
-        "pages/2_시장_리포트.py",
+        "pages/2_Market_Report.py",
         label="📰 시장 리포트 열기",
         icon="📰"
     )
