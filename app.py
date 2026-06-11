@@ -5,6 +5,7 @@ import urllib.parse
 import json
 import requests
 import FinanceDataReader as fdr
+import yfinance as yf
 
 st.set_page_config(page_title="MDD & 줍줍 분석기", layout="centered")
 
@@ -19,38 +20,45 @@ if entered_password != MY_PASSWORD:
         st.error("❌ 비밀번호가 틀렸습니다.")
     st.stop()
 
-# --- [메인 프로그램] ---
 st.success("✅ 인증 완료! 분석기를 시작합니다.")
 
-def search_ticker_naver(user_input):
+# 💡 무적의 검색 엔진: 네이버가 차단하면 즉시 다음(Daum) 금융으로 자동 우회
+def translate_name_to_ticker(user_input):
     user_input = user_input.strip().upper()
     
-    # 💡 치명적 오류 수정: 순수 영어 알파벳(A-Z)일 때만 미국 주식으로 인식!
-    if user_input.isascii() and user_input.isalpha():
-        return user_input
-        
-    if user_input.endswith('.KS') or user_input.endswith('.KQ'):
-        return user_input[:-3]
-        
-    if len(user_input) == 6 and user_input.isalnum() and user_input.isascii():
-        return user_input
-        
-    # 한글 이름일 경우 네이버를 통해 6자리 번호로 통역
+    if user_input.isascii() and user_input.isalpha(): return user_input
+    if user_input.endswith('.KS') or user_input.endswith('.KQ'): return user_input[:-3]
+    if len(user_input) == 6 and user_input.isalnum() and user_input.isascii(): return user_input
+    
+    # 1. 네이버 금융 우회 시도
+    headers_n = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://finance.naver.com/"
+    }
     try:
-        encoded_keyword = urllib.parse.quote(user_input)
-        url = f"https://ac.finance.naver.com/ac?q={encoded_keyword}&q_enc=utf-8&st=1&r_format=json"
+        url_n = f"https://ac.finance.naver.com/ac?q={urllib.parse.quote(user_input)}&q_enc=utf-8&st=1&r_format=json"
+        res_n = requests.get(url_n, headers=headers_n, timeout=3)
+        data_n = res_n.json()
+        if data_n.get('items') and data_n['items'][0]:
+            return data_n['items'][0][0][0]
+    except:
+        pass
         
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36"
-        }
-        
-        response = requests.get(url, headers=headers, timeout=5)
-        data = json.loads(response.text)
-        
-        if data and 'items' in data and data['items'] and data['items'][0]:
-            code = data['items'][0][0][0]
-            return code
-    except Exception:
+    # 2. 네이버 차단 시 다음(Daum) 금융 API로 2차 시도 (스트림릿 클라우드 차단 확률 매우 낮음)
+    headers_d = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://finance.daum.net/"
+    }
+    try:
+        url_d = f"https://finance.daum.net/api/search/search?q={urllib.parse.quote(user_input)}"
+        res_d = requests.get(url_d, headers=headers_d, timeout=3)
+        data_d = res_d.json()
+        if data_d.get('assets'):
+            for item in data_d['assets']:
+                if item.get('country') == 'KOREA':
+                    code = item.get('symbolCode')
+                    return code[1:] if code.startswith('A') else code
+    except:
         pass
         
     return None
@@ -72,13 +80,27 @@ if st.button("분석 차트 그리기", use_container_width=True):
     if not user_input:
         st.warning("⚠️ 검색할 종목명이나 코드를 먼저 입력해 주세요.")
     else:
-        ticker = search_ticker_naver(user_input)
+        ticker = translate_name_to_ticker(user_input)
         if not ticker:
-            st.error(f"❌ '{user_input}' 종목을 찾을 수 없습니다. 오타를 확인해 주세요.")
+            st.error(f"❌ '{user_input}' 종목을 찾을 수 없습니다. (만약 서버 차단이 계속된다면 번거로우시더라도 6자리 코드 번호를 직접 입력해 주세요.)")
         else:
-            with st.spinner('안전한 서버에서 데이터를 분석 중입니다...'):
+            with st.spinner('안전한 이중 서버망에서 데이터를 분석 중입니다...'):
                 try:
-                    df = fdr.DataReader(ticker, start_date.strftime('%Y-%m-%d'))
+                    # 💡 이중 데이터 호출 엔진: FDR이 고장나면 야후 파이낸스로 즉시 대체 가동
+                    df = pd.DataFrame()
+                    
+                    try:
+                        df = fdr.DataReader(ticker, start_date.strftime('%Y-%m-%d'))
+                    except:
+                        pass
+                        
+                    if df.empty:
+                        if ticker.isascii() and ticker.isalpha(): # 미국 주식일 경우
+                            df = yf.Ticker(ticker).history(start=start_date.strftime('%Y-%m-%d'))
+                        else: # 한국 주식일 경우
+                            df = yf.Ticker(f"{ticker}.KS").history(start=start_date.strftime('%Y-%m-%d'))
+                            if df.empty:
+                                df = yf.Ticker(f"{ticker}.KQ").history(start=start_date.strftime('%Y-%m-%d'))
                     
                     if df.empty:
                         st.error("❌ 데이터를 찾을 수 없습니다. (상장일 이전 날짜인지 확인해 주세요)")
@@ -122,4 +144,4 @@ if st.button("분석 차트 그리기", use_container_width=True):
                         plt.tight_layout()
                         st.pyplot(fig)
                 except Exception as e:
-                    st.error(f"❌ 데이터 수집 중 오류가 발생했습니다: {e}")
+                    st.error(f"❌ 데이터 수집
