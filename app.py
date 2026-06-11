@@ -9,7 +9,7 @@ import FinanceDataReader as fdr
 st.set_page_config(page_title="MDD & 줍줍 분석기", layout="centered")
 
 # --- [비밀번호 설정] ---
-MY_PASSWORD = "1234"
+MY_PASSWORD = "0914"
 
 st.title("🔒 나만의 주식 분석기")
 entered_password = st.text_input("비밀번호를 입력하세요", type="password")
@@ -25,15 +25,17 @@ st.success("✅ 인증 완료! 분석기를 시작합니다.")
 def search_ticker_naver(user_input):
     user_input = user_input.strip().upper()
     
-    if user_input.isalpha():
+    # 💡 치명적 오류 수정: 순수 영어 알파벳(A-Z)일 때만 미국 주식으로 인식!
+    if user_input.isascii() and user_input.isalpha():
         return user_input
         
     if user_input.endswith('.KS') or user_input.endswith('.KQ'):
         return user_input[:-3]
         
-    if len(user_input) == 6 and user_input.isalnum():
+    if len(user_input) == 6 and user_input.isalnum() and user_input.isascii():
         return user_input
         
+    # 한글 이름일 경우 네이버를 통해 6자리 번호로 통역
     try:
         encoded_keyword = urllib.parse.quote(user_input)
         url = f"https://ac.finance.naver.com/ac?q={encoded_keyword}&q_enc=utf-8&st=1&r_format=json"
@@ -45,7 +47,6 @@ def search_ticker_naver(user_input):
         response = requests.get(url, headers=headers, timeout=5)
         data = json.loads(response.text)
         
-        # 네이버에서 종목코드 6자리만 쏙 빼옵니다.
         if data and 'items' in data and data['items'] and data['items'][0]:
             code = data['items'][0][0][0]
             return code
@@ -71,14 +72,12 @@ if st.button("분석 차트 그리기", use_container_width=True):
     if not user_input:
         st.warning("⚠️ 검색할 종목명이나 코드를 먼저 입력해 주세요.")
     else:
-        # 1. 한글 이름을 코드로 변환
         ticker = search_ticker_naver(user_input)
         if not ticker:
             st.error(f"❌ '{user_input}' 종목을 찾을 수 없습니다. 오타를 확인해 주세요.")
         else:
             with st.spinner('안전한 서버에서 데이터를 분석 중입니다...'):
                 try:
-                    # 2. 야후 대신 FinanceDataReader로 데이터 가져오기 (차단 없음)
                     df = fdr.DataReader(ticker, start_date.strftime('%Y-%m-%d'))
                     
                     if df.empty:
