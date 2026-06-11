@@ -22,7 +22,7 @@ st.set_page_config(page_title="MDD 저점매수 분석기 FINAL", layout="wide")
 # =========================
 # Password
 # =========================
-MY_PASSWORD = "1234"
+MY_PASSWORD = "0914"
 
 st.title("🔒 MDD 저점매수 분석기 FINAL")
 entered_password = st.text_input("비밀번호를 입력하세요", type="password")
