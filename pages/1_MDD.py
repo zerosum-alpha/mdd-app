@@ -6,11 +6,10 @@ import FinanceDataReader as fdr
 from auth import require_login, logout_button
 
 # =========================================================
-# MDD 저점매수 분석기 FINAL
-# - 비밀번호는 auth.py + Streamlit Secrets에서 처리
+# MDD 저점매수 분석기 FINAL + Valuation
 # - 기존 MDD 계산 로직 유지
-# - 시장 Risk 감점은 Current DD 구간별 완화
-# - 1차 선진입 / 2차 확인매수 단계 분리
+# - Buy Score 계산 변경 없음
+# - Valuation은 참고용 보조 필터
 # =========================================================
 
 st.set_page_config(page_title="MDD 분석기", layout="wide")
@@ -55,7 +54,7 @@ def find_ticker(query):
 
 
 # =========================
-# Load data
+# Load price data
 # =========================
 @st.cache_data(ttl=3600)
 def load_price_data(market, ticker, start_date):
@@ -94,6 +93,260 @@ def load_us_benchmark(ticker, start_date):
         return df
     except Exception:
         return pd.DataFrame()
+
+
+# =========================
+# Valuation data
+# =========================
+@st.cache_data(ttl=3600)
+def load_valuation_data(market, ticker):
+    """
+    미국 종목은 yfinance Ticker.info 사용.
+    한국 종목은 데이터 부정확 가능성이 높으므로 기본 N/A 처리.
+    앱이 멈추지 않도록 모든 예외는 N/A 반환.
+    """
+
+    empty_data = {
+        "trailing_pe": None,
+        "forward_pe": None,
+        "price_to_sales": None,
+        "peg_ratio": None,
+        "market_cap": None,
+        "enterprise_to_ebitda": None,
+        "data_status": "N/A"
+    }
+
+    try:
+        if market != "US":
+            return empty_data
+
+        info = yf.Ticker(ticker).info
+
+        return {
+            "trailing_pe": info.get("trailingPE"),
+            "forward_pe": info.get("forwardPE"),
+            "price_to_sales": info.get("priceToSalesTrailing12Months"),
+            "peg_ratio": info.get("pegRatio"),
+            "market_cap": info.get("marketCap"),
+            "enterprise_to_ebitda": info.get("enterpriseToEbitda"),
+            "data_status": "OK"
+        }
+
+    except Exception:
+        return empty_data
+
+
+def is_valid_number(value):
+    if value is None:
+        return False
+    try:
+        if pd.isna(value):
+            return False
+        float(value)
+        return True
+    except Exception:
+        return False
+
+
+def format_valuation_value(value):
+    if not is_valid_number(value):
+        return "N/A"
+
+    return f"{float(value):,.2f}"
+
+
+def format_market_cap(value):
+    if not is_valid_number(value):
+        return "N/A"
+
+    value = float(value)
+
+    if value >= 1_000_000_000_000:
+        return f"{value / 1_000_000_000_000:.2f}T"
+
+    if value >= 1_000_000_000:
+        return f"{value / 1_000_000_000:.2f}B"
+
+    return f"{value:,.0f}"
+
+
+def is_etf_like(asset_type, display_name, ticker):
+    text = f"{asset_type} {display_name} {ticker}".upper()
+
+    etf_keywords = [
+        "ETF", "TIGER", "KODEX", "ACE", "TIME", "RISE",
+        "SOL", "KOACT", "WON", "PLUS", "QQQ", "SPY",
+        "SOXX", "IWM", "EWY", "SMH"
+    ]
+
+    return any(keyword in text for keyword in etf_keywords)
+
+
+def interpret_trailing_pe(value):
+    if not is_valid_number(value):
+        return "과거PER 데이터 없음"
+
+    value = float(value)
+
+    if value <= 0:
+        return "해석 제외"
+    if value <= 15:
+        return "현재 이익 기준 부담 낮음"
+    if value <= 30:
+        return "현재 이익 기준 보통"
+    if value <= 50:
+        return "현재 이익 기준 부담 있음"
+    return "현재 이익 기준 고평가 주의"
+
+
+def interpret_forward_pe(value):
+    if not is_valid_number(value):
+        return "예상PER 데이터 없음"
+
+    value = float(value)
+
+    if value <= 0:
+        return "해석 제외"
+    if value <= 15:
+        return "밸류 부담 낮음"
+    if value <= 30:
+        return "보통"
+    if value <= 50:
+        return "성장 기대 반영, 부담 있음"
+    return "고평가·추격 주의"
+
+
+def interpret_price_to_sales(value):
+    if not is_valid_number(value):
+        return "매출배수 데이터 없음"
+
+    value = float(value)
+
+    if value <= 3:
+        return "매출 대비 부담 낮음"
+    if value <= 10:
+        return "보통~성장주 구간"
+    if value <= 30:
+        return "고성장 기대 반영"
+    return "과열 가능성, 추격 주의"
+
+
+def interpret_peg(value):
+    if not is_valid_number(value):
+        return "PEG 데이터 없음"
+
+    value = float(value)
+
+    if value <= 0:
+        return "해석 제외"
+    if value <= 1:
+        return "성장 대비 밸류 양호"
+    if value <= 2:
+        return "보통"
+    return "성장 대비 밸류 부담"
+
+
+def interpret_ev_ebitda(value):
+    if not is_valid_number(value):
+        return "EV/EBITDA 데이터 없음"
+
+    value = float(value)
+
+    if value <= 0:
+        return "해석 제외"
+    if value <= 15:
+        return "현금창출 대비 부담 낮음"
+    if value <= 30:
+        return "현금창출 대비 보통"
+    return "현금창출 대비 부담 있음"
+
+
+def interpret_market_cap(value):
+    if not is_valid_number(value):
+        return "시가총액 데이터 없음"
+
+    value = float(value)
+
+    if value >= 1_000_000_000_000:
+        return "초대형주"
+    if value >= 100_000_000_000:
+        return "대형주"
+    if value >= 10_000_000_000:
+        return "중형주"
+    return "소형주"
+
+
+def make_valuation_table(valuation):
+    rows = [
+        {
+            "항목": "Trailing P/E(과거PER)",
+            "값": format_valuation_value(valuation["trailing_pe"]),
+            "해석": interpret_trailing_pe(valuation["trailing_pe"])
+        },
+        {
+            "항목": "Forward P/E(예상PER)",
+            "값": format_valuation_value(valuation["forward_pe"]),
+            "해석": interpret_forward_pe(valuation["forward_pe"])
+        },
+        {
+            "항목": "P/S(매출배수)",
+            "값": format_valuation_value(valuation["price_to_sales"]),
+            "해석": interpret_price_to_sales(valuation["price_to_sales"])
+        },
+        {
+            "항목": "PEG(성장대비PER)",
+            "값": format_valuation_value(valuation["peg_ratio"]),
+            "해석": interpret_peg(valuation["peg_ratio"])
+        },
+        {
+            "항목": "EV/EBITDA",
+            "값": format_valuation_value(valuation["enterprise_to_ebitda"]),
+            "해석": interpret_ev_ebitda(valuation["enterprise_to_ebitda"])
+        },
+        {
+            "항목": "Market Cap(시가총액)",
+            "값": format_market_cap(valuation["market_cap"]),
+            "해석": interpret_market_cap(valuation["market_cap"])
+        }
+    ]
+
+    return pd.DataFrame(rows)
+
+
+def make_mdd_valuation_comment(current_dd, valuation):
+    forward_pe = valuation["forward_pe"]
+    ps = valuation["price_to_sales"]
+
+    forward_pe_valid = is_valid_number(forward_pe) and float(forward_pe) > 0
+    ps_valid = is_valid_number(ps)
+
+    if not forward_pe_valid and not ps_valid:
+        return "밸류 판단 불가. MDD·차트·수급 중심으로 판단해야 합니다."
+
+    comments = []
+
+    if forward_pe_valid:
+        pe = float(forward_pe)
+
+        if current_dd <= -0.12 and pe <= 30:
+            comments.append("MDD가 깊고 Forward P/E도 30 이하라 밸류 부담이 완화된 구간입니다.")
+
+        elif current_dd <= -0.12 and pe > 50:
+            comments.append("MDD는 깊지만 Forward P/E가 50 초과라 밸류 부담이 여전히 큽니다. 소액 접근만 적합합니다.")
+
+        elif current_dd > -0.08 and pe > 50:
+            comments.append("낙폭은 얕고 Forward P/E가 50 초과라 추격 매수 금지 구간입니다.")
+
+    if ps_valid:
+        ps_value = float(ps)
+
+        if current_dd <= -0.15 and ps_value > 30:
+            comments.append("Current DD는 깊지만 P/S가 30 초과라 고성장 기대가 여전히 과도하게 반영된 구간입니다.")
+
+    if not comments:
+        comments.append("MDD와 밸류에이션이 명확한 극단 구간은 아닙니다. 기존 MDD 신호와 시장 필터를 함께 확인하세요.")
+
+    return " ".join(comments)
 
 
 # =========================
@@ -679,6 +932,11 @@ if run:
 
         recommended_buy_amount = planned_buy_amount * buy_ratio
 
+        valuation = load_valuation_data(market, ticker)
+        valuation_df = make_valuation_table(valuation)
+        valuation_comment = make_mdd_valuation_comment(current_dd, valuation)
+        etf_flag = is_etf_like(asset_type, display_name, ticker)
+
         st.subheader(f"분석 대상: {display_name} / {ticker} / {market}")
         st.write(f"종목 유형: **{asset_type}**")
         st.write(
@@ -687,6 +945,9 @@ if run:
             f"현재 적용 감점: **{market_penalty}점**"
         )
 
+        # =========================
+        # 1. 기존 핵심 지표 카드
+        # =========================
         c1, c2, c3, c4, c5, c6 = st.columns(6)
 
         c1.metric("현재가", f"{current_price:,.2f}")
@@ -696,6 +957,9 @@ if run:
         c5.metric("회복 필요", f"{recovery_needed * 100:.2f}%")
         c6.metric("매수 점수", f"{buy_score:.0f}점")
 
+        # =========================
+        # 2. 최종 판단
+        # =========================
         st.markdown("## 최종 판단")
 
         if "매수 금지" in decision:
@@ -709,7 +973,10 @@ if run:
         else:
             st.info(f"⚪ {decision}")
 
-        st.markdown("## 진입 유형")
+        # =========================
+        # 3. 권장 행동
+        # =========================
+        st.markdown("## 권장 행동")
 
         e1, e2, e3, e4 = st.columns(4)
 
@@ -719,8 +986,6 @@ if run:
         e4.metric("Market Penalty", f"{market_penalty}점")
 
         st.write(f"확인매수 조건: **{confirm_buy_condition}**")
-
-        st.markdown("## 권장 행동")
 
         if recommended_buy_amount > 0:
             st.success(
@@ -742,6 +1007,36 @@ if run:
         else:
             st.write("현재 RSI: 계산 불가")
 
+        # =========================
+        # 4. Valuation
+        # =========================
+        st.markdown("## Valuation(밸류에이션)")
+
+        st.info(
+            "밸류에이션은 매수 신호가 아니라 참고용 보조 필터입니다. "
+            "Buy Score 계산에는 반영하지 않습니다."
+        )
+
+        if etf_flag:
+            st.warning(
+                "ETF는 자체 PER보다 구성종목 가중평균 밸류에이션이 중요합니다. "
+                "이 값은 참고용으로만 사용하세요."
+            )
+
+        if market != "US":
+            st.warning(
+                "한국 종목은 yfinance 밸류에이션 데이터가 없거나 부정확할 수 있습니다. "
+                "값이 없으면 N/A로 표시합니다."
+            )
+
+        st.dataframe(valuation_df, use_container_width=True)
+
+        st.markdown("### MDD + Valuation 참고 해석")
+        st.write(valuation_comment)
+
+        # =========================
+        # 물타기 후 평단 시뮬레이션
+        # =========================
         st.markdown("## 물타기 후 평단 시뮬레이션")
 
         sim = simulate_avg_price(
@@ -789,6 +1084,9 @@ if run:
 
             st.dataframe(show_market_df, use_container_width=True)
 
+        # =========================
+        # 5. 차트
+        # =========================
         fig, axes = plt.subplots(3, 1, figsize=(14, 13), sharex=True)
 
         axes[0].plot(df.index, df["Close"], label="Close", color="black")
@@ -852,6 +1150,9 @@ if run:
         plt.tight_layout()
         st.pyplot(fig)
 
+        # =========================
+        # 6. 최근 20거래일 데이터
+        # =========================
         st.markdown("## 최근 20거래일 데이터")
 
         view_cols = [
@@ -896,6 +1197,9 @@ if run:
 
         st.dataframe(show_df, use_container_width=True)
 
+        # =========================
+        # 7. 해석 기준
+        # =========================
         st.markdown("## 해석 기준")
 
         guide_df = pd.DataFrame({
@@ -909,6 +1213,7 @@ if run:
                 "Entry Type(진입유형)",
                 "Confirm Condition(확인조건)",
                 "Market Override(시장위험보정)",
+                "Valuation(밸류에이션)",
                 "Decision(판단)"
             ],
             "의미": [
@@ -921,6 +1226,7 @@ if run:
                 "선진입 / 확인매수 / 대기 / 금지",
                 "MA5 회복, RSI 30 회복, 거래량 증가 양봉 등 추가매수 확인 조건",
                 "시장 Risk지만 Current DD가 깊어 소액 허용 여부",
+                "Forward P/E, P/S, PEG 등으로 가격 부담을 참고",
                 "대기 / 관심 / 1차 선진입 후보 / 2차 확인매수 후보 / 매수 금지"
             ],
             "활용": [
@@ -933,6 +1239,7 @@ if run:
                 "매수 단계를 구분",
                 "2차 매수 전 확인해야 할 조건",
                 "시장 Risk에서도 소액 선진입 가능한지 판단",
+                "MDD가 깊어도 여전히 비싼지 확인",
                 "최종 행동 판단"
             ]
         })
@@ -966,6 +1273,38 @@ if run:
         st.markdown("## 매수 단계 기준")
         st.table(score_df)
 
+        valuation_guide_df = pd.DataFrame({
+            "항목": [
+                "Forward P/E 15 이하",
+                "Forward P/E 15~30",
+                "Forward P/E 30~50",
+                "Forward P/E 50 초과",
+                "P/S 3 이하",
+                "P/S 3~10",
+                "P/S 10~30",
+                "P/S 30 초과",
+                "PEG 1 이하",
+                "PEG 1~2",
+                "PEG 2 초과"
+            ],
+            "해석": [
+                "밸류 부담 낮음",
+                "보통",
+                "성장 기대 반영, 부담 있음",
+                "고평가·추격 주의",
+                "매출 대비 부담 낮음",
+                "보통~성장주 구간",
+                "고성장 기대 반영",
+                "과열 가능성, 추격 주의",
+                "성장 대비 밸류 양호",
+                "보통",
+                "성장 대비 밸류 부담"
+            ]
+        })
+
+        st.markdown("## 밸류에이션 해석 기준")
+        st.table(valuation_guide_df)
+
         penalty_df = pd.DataFrame({
             "Current DD 구간": [
                 "0 ~ -5%",
@@ -995,6 +1334,7 @@ if run:
 
         st.warning(
             "주의: 이 도구는 매수 판단 보조용이다. "
-            "업황 훼손 여부는 코드가 직접 판별하지 못한다. "
+            "밸류에이션은 Buy Score에 직접 반영하지 않는다. "
+            "ETF는 자체 PER보다 구성종목 가중평균 밸류에이션이 중요하다. "
             "Current DD가 깊어도 실적, 뉴스, 지수, 금리, 환율, 외국인 수급, 미국 선물 흐름과 함께 확인해야 한다."
-        )
+    )
