@@ -6,10 +6,13 @@ import FinanceDataReader as fdr
 from auth import require_login, logout_button
 
 # =========================================================
-# MDD 저점매수 분석기 FINAL + Valuation
+# MDD 저점매수 분석기 FINAL + Valuation + Target Price
 # - 기존 MDD 계산 로직 유지
-# - Buy Score 계산 변경 없음
-# - Valuation은 참고용 보조 필터
+# - 한국 종목명 검색 보강
+# - Valuation 보조 필터 추가
+# - MDD 기준 매수 목표가 추가
+# - Valuation 기준 참고 목표가 추가
+# - Buy Score 계산에는 Valuation 미반영
 # =========================================================
 
 st.set_page_config(page_title="MDD 분석기", layout="wide")
@@ -23,13 +26,44 @@ st.title("📈 MDD 저점매수 분석기 FINAL")
 # =========================
 # Stock list
 # =========================
-@st.cache_data
+@st.cache_data(ttl=86400)
 def get_stock_list():
     try:
-        return fdr.StockListing("KRX")
+        df = fdr.StockListing("KRX")
+
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        df = df.copy()
+        df["Code"] = df["Code"].astype(str).str.zfill(6)
+        df["Name"] = df["Name"].astype(str).str.strip()
+
+        return df
+
     except Exception:
         return pd.DataFrame()
 
+
+KR_FALLBACK_MAP = {
+    "삼성전자": "005930",
+    "삼성전자우": "005935",
+    "SK하이닉스": "000660",
+    "sk하이닉스": "000660",
+    "현대차": "005380",
+    "기아": "000270",
+    "NAVER": "035420",
+    "네이버": "035420",
+    "카카오": "035720",
+    "LG에너지솔루션": "373220",
+    "엘지에너지솔루션": "373220",
+    "삼성SDI": "006400",
+    "삼성바이오로직스": "207940",
+    "셀트리온": "068270",
+    "POSCO홀딩스": "005490",
+    "포스코홀딩스": "005490",
+    "한화에어로스페이스": "012450",
+    "두산에너빌리티": "034020",
+}
 
 stock_list = get_stock_list()
 
@@ -40,16 +74,39 @@ def find_ticker(query):
     if query == "":
         return None, None, None
 
+    # 한국 6자리 종목코드
     if query.isdigit() and len(query) == 6:
         return "KR", query, query
 
-    if not stock_list.empty and "Name" in stock_list.columns:
-        match = stock_list[stock_list["Name"] == query]
-        if not match.empty:
-            code = match.iloc[0]["Code"]
-            name = match.iloc[0]["Name"]
+    # fallback 우선 처리
+    if query in KR_FALLBACK_MAP:
+        code = KR_FALLBACK_MAP[query]
+        return "KR", code, query
+
+    # KRX 종목명 정확 매칭
+    if not stock_list.empty and "Name" in stock_list.columns and "Code" in stock_list.columns:
+        exact_match = stock_list[stock_list["Name"] == query]
+
+        if not exact_match.empty:
+            code = exact_match.iloc[0]["Code"]
+            name = exact_match.iloc[0]["Name"]
             return "KR", code, name
 
+        # 부분 매칭
+        partial_match = stock_list[
+            stock_list["Name"].str.contains(query, case=False, na=False)
+        ]
+
+        if not partial_match.empty:
+            code = partial_match.iloc[0]["Code"]
+            name = partial_match.iloc[0]["Name"]
+            return "KR", code, name
+
+    # 한국어가 포함되어 있는데 못 찾으면 미국 티커로 보내지 않음
+    if any("가" <= ch <= "힣" for ch in query):
+        return None, None, None
+
+    # 미국 티커
     return "US", query.upper(), query.upper()
 
 
@@ -100,12 +157,6 @@ def load_us_benchmark(ticker, start_date):
 # =========================
 @st.cache_data(ttl=3600)
 def load_valuation_data(market, ticker):
-    """
-    미국 종목은 yfinance Ticker.info 사용.
-    한국 종목은 데이터 부정확 가능성이 높으므로 기본 N/A 처리.
-    앱이 멈추지 않도록 모든 예외는 N/A 반환.
-    """
-
     empty_data = {
         "trailing_pe": None,
         "forward_pe": None,
@@ -168,6 +219,18 @@ def format_market_cap(value):
         return f"{value / 1_000_000_000:.2f}B"
 
     return f"{value:,.0f}"
+
+
+def format_price(value):
+    if not is_valid_number(value):
+        return "N/A"
+    return f"{float(value):,.2f}"
+
+
+def format_pct_value(value):
+    if not is_valid_number(value):
+        return "N/A"
+    return f"{float(value):.2f}%"
 
 
 def is_etf_like(asset_type, display_name, ticker):
@@ -345,6 +408,126 @@ def make_mdd_valuation_comment(current_dd, valuation):
 
     if not comments:
         comments.append("MDD와 밸류에이션이 명확한 극단 구간은 아닙니다. 기존 MDD 신호와 시장 필터를 함께 확인하세요.")
+
+    return " ".join(comments)
+
+
+# =========================
+# Target price helpers
+# =========================
+def make_mdd_target_table(peak_price, current_price, profile):
+    rows = []
+
+    levels = [
+        ("Watch 기준가", profile["watch"], "관심 구간"),
+        ("Buy 1 기준가", profile["buy1"], "1차 선진입 후보 기준"),
+        ("Buy 2 기준가", profile["buy2"], "2차 매수 후보 기준"),
+        ("Risk 기준가", profile["risk"], "추세 훼손 주의 기준")
+    ]
+
+    for name, dd_level, memo in levels:
+        target_price = peak_price * (1 + dd_level)
+        gap_pct = (target_price / current_price - 1) * 100 if current_price > 0 else None
+
+        if current_price <= target_price:
+            status = "이미 해당 MDD 구간 도달"
+        else:
+            status = "추가 하락 시 도달"
+
+        rows.append({
+            "구분": name,
+            "MDD 기준": f"{dd_level * 100:.2f}%",
+            "목표가": format_price(target_price),
+            "현재가 대비": format_pct_value(gap_pct),
+            "상태": status,
+            "해석": memo
+        })
+
+    return pd.DataFrame(rows)
+
+
+def make_valuation_target_table(current_price, valuation):
+    rows = []
+
+    forward_pe = valuation["forward_pe"]
+    ps = valuation["price_to_sales"]
+
+    if is_valid_number(forward_pe) and float(forward_pe) > 0:
+        forward_pe = float(forward_pe)
+        forward_eps = current_price / forward_pe
+
+        pe_targets = [
+            ("Forward P/E 15x", 15, "밸류 부담 낮은 기준"),
+            ("Forward P/E 30x", 30, "성장주 보통 상단 기준"),
+            ("Forward P/E 50x", 50, "고평가 경계 기준")
+        ]
+
+        for label, multiple, memo in pe_targets:
+            target_price = forward_eps * multiple
+            gap_pct = (target_price / current_price - 1) * 100 if current_price > 0 else None
+
+            rows.append({
+                "기준": label,
+                "목표 배수": f"{multiple}x",
+                "참고 목표가": format_price(target_price),
+                "현재가 대비": format_pct_value(gap_pct),
+                "해석": memo
+            })
+
+    if is_valid_number(ps) and float(ps) > 0:
+        ps = float(ps)
+
+        ps_targets = [
+            ("P/S 3x", 3, "매출 대비 부담 낮은 기준"),
+            ("P/S 10x", 10, "성장주 보통~상단 기준"),
+            ("P/S 30x", 30, "고성장 기대 과열 경계")
+        ]
+
+        for label, multiple, memo in ps_targets:
+            target_price = current_price * (multiple / ps)
+            gap_pct = (target_price / current_price - 1) * 100 if current_price > 0 else None
+
+            rows.append({
+                "기준": label,
+                "목표 배수": f"{multiple}x",
+                "참고 목표가": format_price(target_price),
+                "현재가 대비": format_pct_value(gap_pct),
+                "해석": memo
+            })
+
+    if not rows:
+        return pd.DataFrame({
+            "기준": ["N/A"],
+            "목표 배수": ["N/A"],
+            "참고 목표가": ["N/A"],
+            "현재가 대비": ["N/A"],
+            "해석": ["Forward P/E 또는 P/S 데이터가 없어 밸류 기준 목표가 계산 불가"]
+        })
+
+    return pd.DataFrame(rows)
+
+
+def make_target_comment(current_price, mdd_target_df, valuation_target_df):
+    comments = []
+
+    buy1_row = mdd_target_df[mdd_target_df["구분"] == "Buy 1 기준가"]
+    buy2_row = mdd_target_df[mdd_target_df["구분"] == "Buy 2 기준가"]
+
+    if not buy1_row.empty:
+        comments.append(f"MDD 기준 1차 관심가는 **{buy1_row.iloc[0]['목표가']}** 입니다.")
+
+    if not buy2_row.empty:
+        comments.append(f"MDD 기준 2차 관심가는 **{buy2_row.iloc[0]['목표가']}** 입니다.")
+
+    if not valuation_target_df.empty and valuation_target_df.iloc[0]["참고 목표가"] != "N/A":
+        comments.append(
+            "Valuation 기준 목표가는 Forward P/E 또는 P/S를 단순 환산한 참고값입니다. "
+            "실적 추정치와 성장률이 변하면 목표가는 크게 바뀔 수 있습니다."
+        )
+    else:
+        comments.append("밸류 데이터가 없어 Valuation 기준 목표가는 계산하지 않았습니다.")
+
+    comments.append("목표가는 자동 매수 가격이 아니라 MDD·밸류 부담을 비교하기 위한 참고선입니다.")
 
     return " ".join(comments)
 
@@ -889,7 +1072,11 @@ if run:
     market, ticker, display_name = find_ticker(user_input)
 
     if ticker is None:
-        st.error("종목을 찾을 수 없습니다.")
+        st.error(
+            "종목을 찾을 수 없습니다. "
+            "한국 종목은 종목명 또는 6자리 코드로 입력하세요. "
+            "예: 삼성전자 또는 005930"
+        )
         st.stop()
 
     with st.spinner("데이터 분석 중..."):
@@ -900,7 +1087,11 @@ if run:
         df = load_price_data(market, ticker, start_date)
 
         if df.empty:
-            st.error("가격 데이터를 가져오지 못했습니다. 종목명/코드/티커를 확인하세요.")
+            st.error(
+                "가격 데이터를 가져오지 못했습니다. "
+                "한국 종목은 6자리 코드 또는 정확한 종목명을 입력하세요. "
+                "예: 삼성전자, 005930, SK하이닉스, 000660"
+            )
             st.stop()
 
         df = calculate_indicators(df)
@@ -936,6 +1127,10 @@ if run:
         valuation_df = make_valuation_table(valuation)
         valuation_comment = make_mdd_valuation_comment(current_dd, valuation)
         etf_flag = is_etf_like(asset_type, display_name, ticker)
+
+        mdd_target_df = make_mdd_target_table(peak_price, current_price, profile)
+        valuation_target_df = make_valuation_target_table(current_price, valuation)
+        target_comment = make_target_comment(current_price, mdd_target_df, valuation_target_df)
 
         st.subheader(f"분석 대상: {display_name} / {ticker} / {market}")
         st.write(f"종목 유형: **{asset_type}**")
@@ -1035,6 +1230,25 @@ if run:
         st.write(valuation_comment)
 
         # =========================
+        # 5. Target Price
+        # =========================
+        st.markdown("## Target Price(목표가 참고선)")
+
+        st.info(
+            "목표가는 자동 매수/매도 가격이 아닙니다. "
+            "MDD 기준 가격 부담과 Valuation 기준 가격 부담을 비교하기 위한 참고선입니다."
+        )
+
+        st.markdown("### MDD 기준 매수 목표가")
+        st.dataframe(mdd_target_df, use_container_width=True)
+
+        st.markdown("### Valuation 기준 참고 목표가")
+        st.dataframe(valuation_target_df, use_container_width=True)
+
+        st.markdown("### 목표가 참고 해석")
+        st.write(target_comment)
+
+        # =========================
         # 물타기 후 평단 시뮬레이션
         # =========================
         st.markdown("## 물타기 후 평단 시뮬레이션")
@@ -1085,7 +1299,7 @@ if run:
             st.dataframe(show_market_df, use_container_width=True)
 
         # =========================
-        # 5. 차트
+        # 6. 차트
         # =========================
         fig, axes = plt.subplots(3, 1, figsize=(14, 13), sharex=True)
 
@@ -1151,7 +1365,7 @@ if run:
         st.pyplot(fig)
 
         # =========================
-        # 6. 최근 20거래일 데이터
+        # 7. 최근 20거래일 데이터
         # =========================
         st.markdown("## 최근 20거래일 데이터")
 
@@ -1198,7 +1412,7 @@ if run:
         st.dataframe(show_df, use_container_width=True)
 
         # =========================
-        # 7. 해석 기준
+        # 8. 해석 기준
         # =========================
         st.markdown("## 해석 기준")
 
@@ -1214,6 +1428,7 @@ if run:
                 "Confirm Condition(확인조건)",
                 "Market Override(시장위험보정)",
                 "Valuation(밸류에이션)",
+                "Target Price(목표가 참고선)",
                 "Decision(판단)"
             ],
             "의미": [
@@ -1227,6 +1442,7 @@ if run:
                 "MA5 회복, RSI 30 회복, 거래량 증가 양봉 등 추가매수 확인 조건",
                 "시장 Risk지만 Current DD가 깊어 소액 허용 여부",
                 "Forward P/E, P/S, PEG 등으로 가격 부담을 참고",
+                "MDD 기준가와 밸류 배수 기준가를 비교",
                 "대기 / 관심 / 1차 선진입 후보 / 2차 확인매수 후보 / 매수 금지"
             ],
             "활용": [
@@ -1240,38 +1456,12 @@ if run:
                 "2차 매수 전 확인해야 할 조건",
                 "시장 Risk에서도 소액 선진입 가능한지 판단",
                 "MDD가 깊어도 여전히 비싼지 확인",
+                "가격이 빠져도 밸류 부담이 줄었는지 확인",
                 "최종 행동 판단"
             ]
         })
 
         st.table(guide_df)
-
-        score_df = pd.DataFrame({
-            "구분": [
-                "대기",
-                "관심 / 소액 후보",
-                "1차 선진입 후보",
-                "2차 확인매수 후보",
-                "매수 금지"
-            ],
-            "조건": [
-                "가격 매력 또는 반등 확인 부족",
-                "Current DD -8~-12% 또는 점수 50점 이상",
-                "Current DD -12% 이하 + 점수 충족",
-                "MA5 회복, RSI 30 회복, 거래량 양봉 등 확인",
-                "Current DD -20% 이하 + 저점 이탈 또는 추세 훼손"
-            ],
-            "권장 행동": [
-                "매수 없음",
-                "관찰 또는 Good 시장에서 5%",
-                "예정금의 5~20% 분할",
-                "예정금의 10~30% 추가 분할",
-                "매수 금지"
-            ]
-        })
-
-        st.markdown("## 매수 단계 기준")
-        st.table(score_df)
 
         valuation_guide_df = pd.DataFrame({
             "항목": [
@@ -1305,6 +1495,27 @@ if run:
         st.markdown("## 밸류에이션 해석 기준")
         st.table(valuation_guide_df)
 
+        target_guide_df = pd.DataFrame({
+            "항목": [
+                "MDD 기준 매수 목표가",
+                "Forward P/E 기준 참고 목표가",
+                "P/S 기준 참고 목표가"
+            ],
+            "의미": [
+                "기간 고점 대비 특정 낙폭에 도달하는 가격",
+                "현재 예상PER에서 역산한 Forward EPS에 목표 PER을 적용한 가격",
+                "현재 P/S에서 목표 P/S 배수로 단순 환산한 가격"
+            ],
+            "주의점": [
+                "자동 매수 가격 아님",
+                "실적 추정치가 변하면 크게 바뀜",
+                "매출 성장률과 마진 변화는 반영하지 않음"
+            ]
+        })
+
+        st.markdown("## 목표가 해석 기준")
+        st.table(target_guide_df)
+
         penalty_df = pd.DataFrame({
             "Current DD 구간": [
                 "0 ~ -5%",
@@ -1334,7 +1545,8 @@ if run:
 
         st.warning(
             "주의: 이 도구는 매수 판단 보조용이다. "
-            "밸류에이션은 Buy Score에 직접 반영하지 않는다. "
+            "밸류에이션과 목표가는 Buy Score에 직접 반영하지 않는다. "
             "ETF는 자체 PER보다 구성종목 가중평균 밸류에이션이 중요하다. "
+            "목표가는 자동 매수/매도 가격이 아니라 참고선이다. "
             "Current DD가 깊어도 실적, 뉴스, 지수, 금리, 환율, 외국인 수급, 미국 선물 흐름과 함께 확인해야 한다."
-    )
+        )
