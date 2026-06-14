@@ -401,8 +401,8 @@ def build_signals(df):
         ((sig["Close"] >= sig["Peak"] * 0.99) & (sig["RSI"] >= 65))
     )
 
-    buy_mark = _first_signal_with_gap(sig["Buy_Signal"], min_gap=20)
-    cash_mark = _first_signal_with_gap(sig["Cash_Signal"], min_gap=20)
+    buy_mark = _first_signal_with_gap(sig["Buy_Signal"], min_gap=30)
+    cash_mark = _first_signal_with_gap(sig["Cash_Signal"], min_gap=60)
 
     sig["Buy_Display"] = sig["Close"].where(buy_mark)
     sig["Cash_Display"] = sig["Close"].where(cash_mark)
@@ -426,6 +426,112 @@ def make_core_action(latest, per_available):
     if close > ma20 and rsi >= 50:
         return "확인매수 후보", "MA20 위 + RSI 회복"
     return "대기", "가격 매력 또는 반등 확인 부족"
+
+
+def _pct_change_over_days(series, days):
+    s = series.dropna()
+    if len(s) <= days:
+        return None
+    old = safe_float(s.iloc[-days - 1])
+    new = safe_float(s.iloc[-1])
+    if old is None or new is None or old == 0:
+        return None
+    return new / old - 1
+
+
+def make_auto_chart_comment(df, per_df, vix_df, latest, action, action_reason, per_source):
+    """차트 아래에 바로 붙일 매매 참고용 5줄 해석."""
+    comments = []
+    bullets = []
+
+    close = safe_float(latest.get("Close"))
+    ma20 = safe_float(latest.get("MA20"))
+    ma60 = safe_float(latest.get("MA60"))
+    ma200 = safe_float(latest.get("MA200"))
+    dd = safe_float(latest.get("Current_Drawdown"))
+    rsi = safe_float(latest.get("RSI"))
+    vol_ratio = safe_float(latest.get("Volume_Ratio"))
+
+    # 가격 추세
+    if close is not None and ma20 is not None and ma60 is not None:
+        if close > ma20 > ma60:
+            bullets.append("가격: MA20·MA60 위라 단기 추세는 살아 있습니다.")
+        elif close < ma20 and ma20 < ma60:
+            bullets.append("가격: MA20·MA60 아래라 단기 추세가 약합니다.")
+        elif close < ma20:
+            bullets.append("가격: MA20 아래라 반등 확인이 아직 부족합니다.")
+        else:
+            bullets.append("가격: MA20은 회복했지만 MA60 방향을 추가 확인해야 합니다.")
+
+    if close is not None and ma200 is not None:
+        if close > ma200:
+            bullets.append("장기추세: MA200 위라 장기 추세 훼손은 제한적입니다.")
+        else:
+            bullets.append("장기추세: MA200 아래라 보수적으로 봐야 합니다.")
+
+    # MDD
+    if dd is not None:
+        if dd <= -0.20:
+            bullets.append(f"MDD: {dd*100:.1f}%로 깊습니다. 추세 훼손 여부를 먼저 확인해야 합니다.")
+        elif dd <= -0.12:
+            bullets.append(f"MDD: {dd*100:.1f}%로 저점매수 관심 구간입니다.")
+        elif dd <= -0.08:
+            bullets.append(f"MDD: {dd*100:.1f}%로 관심 구간 초입입니다.")
+        else:
+            bullets.append(f"MDD: {dd*100:.1f}%로 낙폭 매력은 크지 않습니다.")
+
+    # PER 방향성: 최근 60거래일 기준
+    if per_df is not None and not per_df.empty and "PER" in per_df.columns:
+        aligned = df[["Close"]].join(per_df[["PER"]], how="left")
+        aligned["PER"] = aligned["PER"].ffill()
+        price_chg = _pct_change_over_days(aligned["Close"], 60)
+        per_chg = _pct_change_over_days(aligned["PER"], 60)
+        cur_per = safe_float(aligned["PER"].dropna().iloc[-1]) if not aligned["PER"].dropna().empty else None
+        if price_chg is not None and per_chg is not None:
+            if price_chg > 0 and per_chg < 0:
+                bullets.append(f"PER: 최근 60거래일 주가 +{price_chg*100:.1f}%, PER {per_chg*100:.1f}%입니다. 주가 상승을 이익 개선이 일부 정당화하는 구간입니다.")
+            elif price_chg > 0 and per_chg > 0:
+                bullets.append(f"PER: 최근 60거래일 주가 +{price_chg*100:.1f}%, PER +{per_chg*100:.1f}%입니다. 기대감 선반영·추격 부담을 확인해야 합니다.")
+            elif price_chg < 0 and per_chg < 0:
+                bullets.append(f"PER: 최근 60거래일 주가 {price_chg*100:.1f}%, PER {per_chg*100:.1f}%입니다. 밸류 부담은 낮아졌지만 업황 훼손 여부 확인이 필요합니다.")
+            elif price_chg < 0 and per_chg > 0:
+                bullets.append(f"PER: 최근 60거래일 주가 {price_chg*100:.1f}%, PER +{per_chg*100:.1f}%입니다. 이익 악화 가능성이 있어 저점매수 주의입니다.")
+        elif cur_per is not None:
+            bullets.append(f"PER: 현재 추정 P/E는 {cur_per:.1f}배입니다. 방향성 판단에는 데이터가 더 필요합니다.")
+    else:
+        bullets.append(f"PER: 시계열 데이터가 없습니다. 현재 PER 카드만 참고하세요. 원인: {per_source}")
+
+    # VIX
+    if vix_df is not None and not vix_df.empty and "VIX" in vix_df.columns:
+        vix_latest = safe_float(vix_df["VIX"].dropna().iloc[-1]) if not vix_df["VIX"].dropna().empty else None
+        if vix_latest is not None:
+            if vix_latest >= 30:
+                bullets.append(f"VIX: {vix_latest:.1f}로 공포 구간입니다. 신규매수보다 분할·리스크 관리가 우선입니다.")
+            elif vix_latest >= 20:
+                bullets.append(f"VIX: {vix_latest:.1f}로 변동성 주의 구간입니다.")
+            else:
+                bullets.append(f"VIX: {vix_latest:.1f}로 시장 공포는 크지 않습니다.")
+
+    # RSI / volume
+    if rsi is not None:
+        if rsi <= 30:
+            bullets.append(f"RSI: {rsi:.1f}로 과매도입니다. 다만 MA 회복 확인이 필요합니다.")
+        elif rsi >= 70:
+            bullets.append(f"RSI: {rsi:.1f}로 과열입니다. 추격매수보다 현금확보 후보입니다.")
+    if vol_ratio is not None and vol_ratio >= 1.5:
+        bullets.append(f"거래량: 20일 평균 대비 {vol_ratio:.1f}배입니다. 방향성 확인이 중요합니다.")
+
+    # 최종 결론
+    conclusion = f"최종: {action} — {action_reason}"
+    if dd is not None and dd <= -0.12 and rsi is not None and rsi <= 40:
+        if close is not None and ma20 is not None and close > ma20:
+            conclusion = "최종: 1차 소액 가능. DD가 깊고 RSI가 낮으며 MA20을 회복했습니다."
+        else:
+            conclusion = "최종: 1차 후보지만 확인 필요. DD와 RSI는 매력적이나 MA20 회복 전에는 소액만 적합합니다."
+    elif dd is not None and dd > -0.08 and rsi is not None and rsi >= 65:
+        conclusion = "최종: 추격 금지. 낙폭은 얕고 RSI가 높아 현금확보 또는 대기 우선입니다."
+
+    return conclusion, bullets[:7]
 
 
 # =========================================================
@@ -610,6 +716,20 @@ if run:
         st.caption(
             "한국 종목 차트의 P/E는 pykrx/KRX 기반 과거 P/E입니다. 증권사 리포트의 12개월 예상 PER과는 다를 수 있습니다."
         )
+
+    st.markdown("### 차트 자동 해석")
+    auto_conclusion, auto_bullets = make_auto_chart_comment(
+        df=df,
+        per_df=per_df,
+        vix_df=vix_df,
+        latest=latest,
+        action=action,
+        action_reason=action_reason,
+        per_source=per_source,
+    )
+    st.success(auto_conclusion)
+    for item in auto_bullets:
+        st.write(f"- {item}")
 
     # =====================================================
     # Current valuation
