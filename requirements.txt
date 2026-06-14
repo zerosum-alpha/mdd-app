@@ -1,8 +1,8 @@
 streamlit
 pandas
 matplotlib
+numpy
 yfinance
 finance-datareader
 feedparser
 pykrx
-scikit-learn
