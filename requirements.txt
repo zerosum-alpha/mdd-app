@@ -5,5 +5,5 @@ numpy
 yfinance
 finance-datareader
 feedparser
+setuptools==80.9.0
 pykrx
-setuptools
