@@ -1759,7 +1759,10 @@ def make_us_price_implied_pe_series(price_df, current_price, valuation):
 
 def make_us_price_pe_like_kr_chart(price_pe_df, ticker, title_suffix="Estimated P/E"):
     """
-    미국 종목도 한국 종목처럼 상단 Price / 하단 P/E 분리 차트로 표시한다.
+    미국 종목용 Price/PER 겹침 차트.
+    - 왼쪽 축: Price
+    - 오른쪽 축: P/E
+    - P/E 평균, ±1SD, ±2SD 밴드는 같은 P/E 축에 표시
     """
     if price_pe_df is None or price_pe_df.empty:
         return None, pd.DataFrame()
@@ -1781,37 +1784,35 @@ def make_us_price_pe_like_kr_chart(price_pe_df, ticker, title_suffix="Estimated 
     if plot_df.empty or len(plot_df) < 6:
         plot_df = chart_df.copy()
 
-    fig = plt.figure(figsize=(13.5, 7.2))
-    gs = fig.add_gridspec(4, 1, hspace=0.10)
-    ax_price = fig.add_subplot(gs[0:3, 0])
-    ax_pe = fig.add_subplot(gs[3, 0], sharex=ax_price)
+    fig, ax_price = plt.subplots(figsize=(13.5, 5.8))
 
     ax_price.plot(plot_df["date"], plot_df["price"], label="Price", linewidth=2)
-    ax_price.set_title(f"{ticker} Price vs {title_suffix}")
     ax_price.set_ylabel("Price")
     ax_price.grid(True, alpha=0.3)
-    ax_price.legend(loc="upper left")
 
-    ax_pe.plot(plot_df["date"], plot_df["pe_ttm"], label=title_suffix, linewidth=2)
+    ax_pe = ax_price.twinx()
+    ax_pe.plot(plot_df["date"], plot_df["pe_ttm"], linestyle="--", label=title_suffix, linewidth=2)
     ax_pe.set_ylabel("P/E")
-    ax_pe.grid(True, alpha=0.3)
 
     pe_mean = plot_df["pe_ttm"].mean()
     pe_std = plot_df["pe_ttm"].std()
 
     if is_valid_number(pe_mean):
-        ax_pe.axhline(pe_mean, linestyle="-", alpha=0.45, label="P/E avg")
+        ax_pe.axhline(pe_mean, linestyle="-", alpha=0.35, label="P/E avg")
     if is_valid_number(pe_std) and pe_std > 0:
-        ax_pe.axhline(pe_mean + pe_std, linestyle=":", alpha=0.45, label="P/E +1SD")
-        ax_pe.axhline(max(pe_mean - pe_std, 0), linestyle=":", alpha=0.45, label="P/E -1SD")
-        ax_pe.axhline(pe_mean + 2 * pe_std, linestyle="-.", alpha=0.28, label="P/E +2SD")
-        ax_pe.axhline(max(pe_mean - 2 * pe_std, 0), linestyle="-.", alpha=0.28, label="P/E -2SD")
+        ax_pe.axhline(pe_mean + pe_std, linestyle=":", alpha=0.35, label="P/E +1SD")
+        ax_pe.axhline(max(pe_mean - pe_std, 0), linestyle=":", alpha=0.35, label="P/E -1SD")
+        ax_pe.axhline(pe_mean + 2 * pe_std, linestyle="-.", alpha=0.25, label="P/E +2SD")
+        ax_pe.axhline(max(pe_mean - 2 * pe_std, 0), linestyle="-.", alpha=0.25, label="P/E -2SD")
 
-    ax_pe.legend(loc="upper left", fontsize=8)
-    plt.setp(ax_price.get_xticklabels(), visible=False)
+    ax_price.set_title(f"{ticker} Price vs {title_suffix}")
+
+    lines1, labels1 = ax_price.get_legend_handles_labels()
+    lines2, labels2 = ax_pe.get_legend_handles_labels()
+    ax_price.legend(lines1 + lines2, labels1 + labels2, loc="best")
+
     plt.tight_layout()
     return fig, plot_df
-
 
 # =========================================================
 # Target Price
@@ -2841,7 +2842,7 @@ if run:
                     st.dataframe(show_kr_df[cols].tail(120), use_container_width=True)
 
         elif market == "US":
-            st.caption("미국 종목은 한국 종목처럼 상단 Price / 하단 P/E로 분리 표시합니다. 우선 yfinance 재무제표 기반 Estimated TTM P/E를 사용하고, 데이터가 부족하면 현재 Forward/Trailing P/E로 역산한 Price-implied P/E를 표시합니다. FactSet식 12개월 Forward P/E 시계열은 아닙니다.")
+            st.caption("미국 종목은 주가와 P/E를 한 차트에 겹쳐 표시합니다. 왼쪽 축은 Price, 오른쪽 축은 P/E입니다. 우선 yfinance 재무제표 기반 Estimated TTM P/E를 사용하고, 데이터가 부족하면 현재 Forward/Trailing P/E로 역산한 Price-implied P/E를 표시합니다. FactSet식 12개월 Forward P/E 시계열은 아닙니다.")
             if price_pe_chart is None:
                 st.warning(price_pe_comment)
                 if not price_pe_df.empty:
@@ -2868,13 +2869,16 @@ if run:
         else:
             st.info("P/E 추세 차트를 표시할 수 없습니다.")
 
-        st.markdown("### Valuation Band Chart")
-        if pe_band_fig is None:
-            st.warning(pe_band_comment)
-        else:
-            st.pyplot(pe_band_fig)
-            st.info(pe_band_comment)
-            with st.expander("Valuation Band 데이터 보기"):
+        with st.expander("참고용 Valuation Band 보기"):
+            st.caption(
+                "이 밴드는 현재 PER 또는 P/S만으로 역산한 참고용입니다. "
+                "주가/PER 동시 차트가 아니므로 기본 화면에는 표시하지 않습니다."
+            )
+            if pe_band_fig is None:
+                st.warning(pe_band_comment)
+            else:
+                st.pyplot(pe_band_fig)
+                st.info(pe_band_comment)
                 show_band_df = pe_band_df.copy()
                 for col in ["Price", "Current Gap(%)", "Multiple"]:
                     if col in show_band_df.columns:
