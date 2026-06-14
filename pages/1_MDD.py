@@ -6,6 +6,11 @@ import yfinance as yf
 import FinanceDataReader as fdr
 from datetime import datetime
 
+try:
+    from pykrx import stock as krx_stock
+except Exception:
+    krx_stock = None
+
 from auth import require_login, logout_button
 
 # =========================================================
@@ -13,7 +18,8 @@ from auth import require_login, logout_button
 # + 한국 종목 검색 보강
 # + Valuation Summary
 # + P/E Band Chart
-# + Price vs EPS/Revenue Trend
+# + KR Price vs PER/PBR/EPS Trend
+# + US Price vs estimated TTM P/E Trend
 # + MDD + Valuation Matrix
 # + Target Price
 # + Cash Warning Light
@@ -1157,6 +1163,295 @@ def make_cash_mdd_comment(current_dd, rsi, recovery_needed, total_score):
     return "MDD와 이벤트 리스크가 극단 구간은 아닙니다. 기존 Buy Score와 시장 필터를 함께 확인하세요."
 
 
+
+# =========================================================
+# Korean valuation trend - KRX PER/PBR/EPS
+# =========================================================
+@st.cache_data(ttl=86400)
+def load_kr_fundamental_by_date(ticker, start_date):
+    """
+    pykrx에서 한국 종목의 일별 PER/PBR/EPS를 가져온다.
+    주의:
+    - 이 PER은 Dataguide/FnGuide의 12개월 예상 PER이 아니다.
+    - KRX 제공 실적 기반 PER/PBR/EPS다.
+    - 그래도 '주가와 PER이 같이 어떻게 움직이는지'를 보는 용도로는 유용하다.
+    """
+    if krx_stock is None:
+        return pd.DataFrame()
+
+    try:
+        start = pd.Timestamp(start_date).strftime("%Y%m%d")
+        end = datetime.today().strftime("%Y%m%d")
+
+        f = krx_stock.get_market_fundamental_by_date(start, end, ticker)
+        if f is None or f.empty:
+            return pd.DataFrame()
+
+        f = f.copy()
+        f.index = pd.to_datetime(f.index)
+        f = f.reset_index().rename(columns={"날짜": "date", "index": "date"})
+
+        # pykrx 버전에 따라 컬럼명이 한글/영문일 수 있어 정규화
+        rename_map = {
+            "PER": "per",
+            "PBR": "pbr",
+            "EPS": "eps",
+            "BPS": "bps",
+            "DIV": "div",
+            "DPS": "dps",
+        }
+        f = f.rename(columns=rename_map)
+
+        keep_cols = [c for c in ["date", "per", "pbr", "eps", "bps", "div", "dps"] if c in f.columns]
+        f = f[keep_cols].copy()
+
+        for col in ["per", "pbr", "eps", "bps", "div", "dps"]:
+            if col in f.columns:
+                f[col] = pd.to_numeric(f[col], errors="coerce")
+
+        return f.sort_values("date")
+
+    except Exception:
+        return pd.DataFrame()
+
+
+def make_kr_price_valuation_df(ticker, start_date, price_df):
+    """
+    FinanceDataReader 주가와 pykrx PER/PBR/EPS를 날짜 기준으로 병합한다.
+    """
+    if price_df is None or price_df.empty:
+        return pd.DataFrame()
+
+    fundamental = load_kr_fundamental_by_date(ticker, start_date)
+    if fundamental.empty:
+        return pd.DataFrame()
+
+    try:
+        price = price_df.copy().reset_index()
+        date_col = price.columns[0]
+        price = price.rename(columns={date_col: "date", "Close": "price"})
+        price["date"] = pd.to_datetime(price["date"], errors="coerce")
+        price["price"] = pd.to_numeric(price["price"], errors="coerce")
+        price = price.dropna(subset=["date", "price"]).sort_values("date")
+
+        f = fundamental.copy()
+        f["date"] = pd.to_datetime(f["date"], errors="coerce")
+        f = f.dropna(subset=["date"]).sort_values("date")
+
+        merged = pd.merge_asof(
+            price[["date", "price"]],
+            f,
+            on="date",
+            direction="backward"
+        )
+
+        for col in ["per", "pbr", "eps", "bps"]:
+            if col in merged.columns:
+                merged[col] = pd.to_numeric(merged[col], errors="coerce")
+
+        if "per" in merged.columns:
+            merged.loc[(merged["per"] <= 0) | (merged["per"] > 300), "per"] = pd.NA
+        if "pbr" in merged.columns:
+            merged.loc[(merged["pbr"] <= 0) | (merged["pbr"] > 30), "pbr"] = pd.NA
+
+        return merged.sort_values("date")
+
+    except Exception:
+        return pd.DataFrame()
+
+
+def make_kr_price_per_chart(kr_val_df, ticker):
+    """
+    한국 종목용 Price vs PER 차트.
+    네가 보여준 이미지처럼 주가와 PER을 같은 날짜축에 보여준다.
+    """
+    if kr_val_df is None or kr_val_df.empty:
+        return None, pd.DataFrame()
+
+    needed = {"date", "price", "per"}
+    if not needed.issubset(set(kr_val_df.columns)):
+        return None, pd.DataFrame()
+
+    chart_df = kr_val_df.copy()
+    chart_df["date"] = pd.to_datetime(chart_df["date"], errors="coerce")
+    chart_df["price"] = pd.to_numeric(chart_df["price"], errors="coerce")
+    chart_df["per"] = pd.to_numeric(chart_df["per"], errors="coerce")
+    chart_df = chart_df.dropna(subset=["date", "price", "per"]).copy()
+    chart_df = chart_df[(chart_df["price"] > 0) & (chart_df["per"] > 0) & (chart_df["per"] < 300)].copy()
+    chart_df = chart_df.sort_values("date")
+
+    if chart_df.empty or len(chart_df) < 20:
+        return None, chart_df
+
+    # 너무 촘촘하면 보기 어려워 월말 기준으로 표시. 데이터가 적으면 주간으로 대체.
+    plot_df = make_monthly_view(chart_df)
+    if plot_df.empty or len(plot_df) < 6:
+        plot_df = chart_df.copy()
+
+    fig, ax_price = plt.subplots(figsize=(13, 5.8))
+
+    ax_price.plot(plot_df["date"], plot_df["price"], label="Price", linewidth=2)
+    ax_price.set_ylabel("Price")
+    ax_price.grid(True, alpha=0.3)
+
+    ax_per = ax_price.twinx()
+    ax_per.plot(plot_df["date"], plot_df["per"], linestyle="--", label="PER", linewidth=2)
+    ax_per.set_ylabel("PER")
+
+    per_mean = plot_df["per"].mean()
+    per_std = plot_df["per"].std()
+
+    if is_valid_number(per_mean):
+        ax_per.axhline(per_mean, linestyle="-", alpha=0.35, label="PER avg")
+
+    if is_valid_number(per_std) and per_std > 0:
+        ax_per.axhline(per_mean + per_std, linestyle=":", alpha=0.35, label="PER +1SD")
+        ax_per.axhline(max(per_mean - per_std, 0), linestyle=":", alpha=0.35, label="PER -1SD")
+        ax_per.axhline(per_mean + 2 * per_std, linestyle="-.", alpha=0.25, label="PER +2SD")
+        ax_per.axhline(max(per_mean - 2 * per_std, 0), linestyle="-.", alpha=0.25, label="PER -2SD")
+
+    ax_price.set_title(f"{ticker} Price vs PER")
+
+    lines1, labels1 = ax_price.get_legend_handles_labels()
+    lines2, labels2 = ax_per.get_legend_handles_labels()
+    ax_price.legend(lines1 + lines2, labels1 + labels2, loc="best")
+
+    plt.tight_layout()
+    return fig, plot_df
+
+
+def make_kr_price_pbr_chart(kr_val_df, ticker):
+    if kr_val_df is None or kr_val_df.empty:
+        return None
+    if not {"date", "price", "pbr"}.issubset(set(kr_val_df.columns)):
+        return None
+
+    chart_df = kr_val_df.copy()
+    chart_df["date"] = pd.to_datetime(chart_df["date"], errors="coerce")
+    chart_df["price"] = pd.to_numeric(chart_df["price"], errors="coerce")
+    chart_df["pbr"] = pd.to_numeric(chart_df["pbr"], errors="coerce")
+    chart_df = chart_df.dropna(subset=["date", "price", "pbr"]).copy()
+    chart_df = chart_df[(chart_df["price"] > 0) & (chart_df["pbr"] > 0) & (chart_df["pbr"] < 30)].copy()
+    chart_df = chart_df.sort_values("date")
+
+    if chart_df.empty or len(chart_df) < 20:
+        return None
+
+    plot_df = make_monthly_view(chart_df)
+    if plot_df.empty or len(plot_df) < 6:
+        plot_df = chart_df.copy()
+
+    fig, ax_price = plt.subplots(figsize=(13, 5.2))
+    ax_price.plot(plot_df["date"], plot_df["price"], label="Price", linewidth=2)
+    ax_price.set_ylabel("Price")
+    ax_price.grid(True, alpha=0.3)
+
+    ax_pbr = ax_price.twinx()
+    ax_pbr.plot(plot_df["date"], plot_df["pbr"], linestyle="--", label="PBR", linewidth=2)
+    ax_pbr.set_ylabel("PBR")
+
+    pbr_mean = plot_df["pbr"].mean()
+    pbr_std = plot_df["pbr"].std()
+
+    if is_valid_number(pbr_mean):
+        ax_pbr.axhline(pbr_mean, linestyle="-", alpha=0.35, label="PBR avg")
+    if is_valid_number(pbr_std) and pbr_std > 0:
+        ax_pbr.axhline(pbr_mean + pbr_std, linestyle=":", alpha=0.35, label="PBR +1SD")
+        ax_pbr.axhline(max(pbr_mean - pbr_std, 0), linestyle=":", alpha=0.35, label="PBR -1SD")
+
+    ax_price.set_title(f"{ticker} Price vs PBR")
+
+    lines1, labels1 = ax_price.get_legend_handles_labels()
+    lines2, labels2 = ax_pbr.get_legend_handles_labels()
+    ax_price.legend(lines1 + lines2, labels1 + labels2, loc="best")
+
+    plt.tight_layout()
+    return fig
+
+
+def make_kr_eps_chart(kr_val_df, ticker):
+    if kr_val_df is None or kr_val_df.empty:
+        return None
+    if not {"date", "eps"}.issubset(set(kr_val_df.columns)):
+        return None
+
+    chart_df = kr_val_df.copy()
+    chart_df["date"] = pd.to_datetime(chart_df["date"], errors="coerce")
+    chart_df["eps"] = pd.to_numeric(chart_df["eps"], errors="coerce")
+    chart_df = chart_df.dropna(subset=["date", "eps"]).copy()
+    chart_df = chart_df.sort_values("date")
+
+    if chart_df.empty or len(chart_df) < 20:
+        return None
+
+    plot_df = make_monthly_view(chart_df)
+    if plot_df.empty or len(plot_df) < 6:
+        plot_df = chart_df.copy()
+
+    fig, ax = plt.subplots(figsize=(13, 4.5))
+    ax.plot(plot_df["date"], plot_df["eps"], label="EPS", linewidth=2)
+    ax.axhline(y=0, linestyle="--", alpha=0.4)
+    ax.set_title(f"{ticker} EPS Trend")
+    ax.set_ylabel("EPS")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    plt.tight_layout()
+    return fig
+
+
+def make_kr_price_per_comment(kr_plot_df):
+    if kr_plot_df is None or kr_plot_df.empty or not {"date", "price", "per"}.issubset(set(kr_plot_df.columns)):
+        return "KRX PER 데이터를 가져오지 못했습니다. pykrx 설치 또는 종목코드를 확인하세요."
+
+    df = kr_plot_df.dropna(subset=["date", "price", "per"]).copy()
+    if df.empty or len(df) < 3:
+        return "주가와 PER 방향성을 해석하기에는 데이터가 부족합니다."
+
+    df = df.sort_values("date")
+    last_date = pd.to_datetime(df["date"].iloc[-1])
+    cutoff = last_date - pd.DateOffset(months=6)
+    base = df[pd.to_datetime(df["date"]) >= cutoff]
+    if len(base) < 3:
+        base = df.tail(6)
+
+    first_price = float(base["price"].iloc[0])
+    last_price = float(base["price"].iloc[-1])
+    first_per = float(base["per"].iloc[0])
+    last_per = float(base["per"].iloc[-1])
+
+    price_change = (last_price / first_price - 1) * 100 if first_price > 0 else None
+    per_change = (last_per / first_per - 1) * 100 if first_per > 0 else None
+
+    per_mean = df["per"].mean()
+    per_std = df["per"].std()
+
+    band_msg = ""
+    if is_valid_number(per_mean) and is_valid_number(per_std) and per_std > 0:
+        if last_per >= per_mean + 2 * per_std:
+            band_msg = "현재 PER은 +2SD 이상으로 과열 구간에 가깝습니다."
+        elif last_per >= per_mean + per_std:
+            band_msg = "현재 PER은 +1SD 이상으로 밸류 부담이 있는 구간입니다."
+        elif last_per <= per_mean - per_std:
+            band_msg = "현재 PER은 -1SD 이하로 밸류 부담이 완화된 구간입니다."
+        else:
+            band_msg = "현재 PER은 평균권 구간입니다."
+
+    if price_change is None or per_change is None:
+        return band_msg if band_msg else "주가/PER 변화율 계산 불가"
+
+    if price_change > 0 and per_change < 0:
+        direction_msg = "최근 주가는 상승했지만 PER은 하락했습니다. 이익 개선이 주가 상승을 정당화하는 구간일 수 있습니다."
+    elif price_change > 0 and per_change > 0:
+        direction_msg = "최근 주가와 PER이 같이 상승했습니다. 기대감 선반영 또는 밸류 부담 확대 여부를 확인해야 합니다."
+    elif price_change < 0 and per_change < 0:
+        direction_msg = "최근 주가와 PER이 같이 하락했습니다. 밸류 부담은 완화됐지만 업황 훼손 여부를 확인해야 합니다."
+    elif price_change < 0 and per_change > 0:
+        direction_msg = "최근 주가는 하락했지만 PER은 상승했습니다. 이익 하향 또는 실적 둔화 가능성이 있어 저점매수 주의가 필요합니다."
+    else:
+        direction_msg = "최근 주가/PER 방향성이 뚜렷하지 않습니다."
+
+    return f"최근 약 6개월 주가 변화 {price_change:.2f}%, PER 변화 {per_change:.2f}%. {direction_msg} {band_msg}"
+
 # =========================================================
 # Target Price
 # =========================================================
@@ -1794,14 +2089,27 @@ if run:
         price_pe_chart = None
         price_pe_comment = ""
 
+        kr_valuation_trend = pd.DataFrame()
+        kr_price_per_chart = None
+        kr_price_pbr_chart = None
+        kr_eps_chart = None
+        kr_price_per_comment = ""
+
         if market == "US":
             raw_financial_trend = load_financial_trend_data(ticker)
             financial_trend = add_price_to_financial_trend(raw_financial_trend, df)
             price_pe_chart, price_pe_df = make_price_pe_trend_chart(financial_trend, valuation, ticker)
             price_pe_comment = make_price_pe_comment(price_pe_df)
             financial_chart = make_financial_trend_chart(financial_trend, ticker)
+        elif market == "KR":
+            kr_valuation_trend = make_kr_price_valuation_df(ticker, start_date, df)
+            kr_price_per_chart, kr_price_per_plot_df = make_kr_price_per_chart(kr_valuation_trend, ticker)
+            kr_price_pbr_chart = make_kr_price_pbr_chart(kr_valuation_trend, ticker)
+            kr_eps_chart = make_kr_eps_chart(kr_valuation_trend, ticker)
+            kr_price_per_comment = make_kr_price_per_comment(kr_price_per_plot_df)
+            price_pe_comment = kr_price_per_comment
         else:
-            price_pe_comment = "한국 종목은 yfinance 재무제표 기반 P/E 추세 데이터가 제한적입니다."
+            price_pe_comment = "P/E 추세 데이터를 표시할 수 없습니다."
 
         default_event_df = normalize_event_schedule(make_default_event_schedule())
 
@@ -2006,31 +2314,72 @@ if run:
             "반대로 주가가 빠졌는데 P/E가 높아지면 이익 악화 가능성을 확인해야 합니다."
         )
 
-        if market != "US":
-            st.info("한국 종목은 yfinance 재무제표 기반 P/E 추세 데이터가 제한적이라 이 차트를 표시하지 않습니다.")
-        elif price_pe_chart is None:
-            st.warning(price_pe_comment)
-            if not price_pe_df.empty:
-                st.caption("아래는 yfinance에서 계산 가능한 원자료입니다. 점이 너무 적으면 추세 차트로 쓰지 않습니다.")
+        if market == "KR":
+            st.caption("한국 종목은 pykrx의 KRX 일별 PER/PBR/EPS 데이터를 사용합니다. Dataguide식 12개월 예상 PER은 아니지만, 주가와 PER 방향성을 함께 보는 용도입니다.")
+            if krx_stock is None:
+                st.error("pykrx가 설치되지 않았습니다. requirements.txt에 pykrx를 추가해야 합니다.")
+            elif kr_price_per_chart is None:
+                st.warning(kr_price_per_comment)
+                if not kr_valuation_trend.empty:
+                    with st.expander("KRX PER/PBR/EPS 원자료 보기"):
+                        show_kr_df = kr_valuation_trend.copy()
+                        show_kr_df["date"] = pd.to_datetime(show_kr_df["date"]).dt.strftime("%Y-%m-%d")
+                        for col in ["price", "per", "pbr", "eps", "bps"]:
+                            if col in show_kr_df.columns:
+                                show_kr_df[col] = show_kr_df[col].apply(lambda x: None if pd.isna(x) else round(float(x), 2))
+                        cols = [c for c in ["date", "price", "per", "pbr", "eps", "bps"] if c in show_kr_df.columns]
+                        st.dataframe(show_kr_df[cols].tail(120), use_container_width=True)
+            else:
+                st.pyplot(kr_price_per_chart)
+                st.write(kr_price_per_comment)
+
+                with st.expander("Price vs PBR / EPS 추가 차트 보기"):
+                    if kr_price_pbr_chart is not None:
+                        st.pyplot(kr_price_pbr_chart)
+                    else:
+                        st.info("PBR 차트를 표시할 데이터가 부족합니다.")
+
+                    if kr_eps_chart is not None:
+                        st.pyplot(kr_eps_chart)
+                    else:
+                        st.info("EPS 차트를 표시할 데이터가 부족합니다.")
+
+                with st.expander("KRX PER/PBR/EPS 데이터 보기"):
+                    show_kr_df = kr_valuation_trend.copy()
+                    show_kr_df["date"] = pd.to_datetime(show_kr_df["date"]).dt.strftime("%Y-%m-%d")
+                    for col in ["price", "per", "pbr", "eps", "bps"]:
+                        if col in show_kr_df.columns:
+                            show_kr_df[col] = show_kr_df[col].apply(lambda x: None if pd.isna(x) else round(float(x), 2))
+                    cols = [c for c in ["date", "price", "per", "pbr", "eps", "bps"] if c in show_kr_df.columns]
+                    st.dataframe(show_kr_df[cols].tail(120), use_container_width=True)
+
+        elif market == "US":
+            st.caption("미국 종목은 yfinance 재무제표 기반 추정 TTM P/E를 사용합니다. FactSet식 12개월 Forward P/E 시계열은 아닙니다.")
+            if price_pe_chart is None:
+                st.warning(price_pe_comment)
+                if not price_pe_df.empty:
+                    st.caption("아래는 yfinance에서 계산 가능한 원자료입니다. 점이 너무 적으면 추세 차트로 쓰지 않습니다.")
+                    show_price_pe_df = price_pe_df.copy()
+                    show_price_pe_df["date"] = pd.to_datetime(show_price_pe_df["date"]).dt.strftime("%Y-%m-%d")
+                    for col in ["price", "eps_ttm", "pe_ttm"]:
+                        if col in show_price_pe_df.columns:
+                            show_price_pe_df[col] = show_price_pe_df[col].apply(lambda x: None if pd.isna(x) else round(float(x), 2))
+                    with st.expander("Price + P/E 원자료 보기"):
+                        st.dataframe(show_price_pe_df[["date", "price", "eps_ttm", "pe_ttm"]], use_container_width=True)
+            else:
+                st.pyplot(price_pe_chart)
+                st.write(price_pe_comment)
+
                 show_price_pe_df = price_pe_df.copy()
                 show_price_pe_df["date"] = pd.to_datetime(show_price_pe_df["date"]).dt.strftime("%Y-%m-%d")
                 for col in ["price", "eps_ttm", "pe_ttm"]:
                     if col in show_price_pe_df.columns:
                         show_price_pe_df[col] = show_price_pe_df[col].apply(lambda x: None if pd.isna(x) else round(float(x), 2))
-                with st.expander("Price + P/E 원자료 보기"):
+
+                with st.expander("Price + P/E 데이터 보기"):
                     st.dataframe(show_price_pe_df[["date", "price", "eps_ttm", "pe_ttm"]], use_container_width=True)
         else:
-            st.pyplot(price_pe_chart)
-            st.write(price_pe_comment)
-
-            show_price_pe_df = price_pe_df.copy()
-            show_price_pe_df["date"] = pd.to_datetime(show_price_pe_df["date"]).dt.strftime("%Y-%m-%d")
-            for col in ["price", "eps_ttm", "pe_ttm"]:
-                if col in show_price_pe_df.columns:
-                    show_price_pe_df[col] = show_price_pe_df[col].apply(lambda x: None if pd.isna(x) else round(float(x), 2))
-
-            with st.expander("Price + P/E 데이터 보기"):
-                st.dataframe(show_price_pe_df[["date", "price", "eps_ttm", "pe_ttm"]], use_container_width=True)
+            st.info("P/E 추세 차트를 표시할 수 없습니다.")
 
         with st.expander("Forward P/E Band Chart 보기"):
             if pe_band_fig is None:
