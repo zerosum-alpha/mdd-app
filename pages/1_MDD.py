@@ -596,28 +596,51 @@ def normalize_series(value_series):
 
 
 def make_financial_trend_chart(fin_trend_df, ticker):
+    """
+    Price / Revenue TTM / EPS TTM index chart.
+    데이터 컬럼이 부족해도 앱이 멈추지 않도록 방어 처리한다.
+    """
+    if fin_trend_df is None or fin_trend_df.empty:
+        return None
+
+    required_any = ["price", "revenue_ttm", "eps_ttm"]
+    existing_cols = [col for col in required_any if col in fin_trend_df.columns]
+
+    if "date" not in fin_trend_df.columns or not existing_cols:
+        return None
+
     chart_df = fin_trend_df.copy()
-    chart_df = chart_df.dropna(how="all", subset=["price", "revenue_ttm", "eps_ttm"])
+    chart_df = chart_df.dropna(how="all", subset=existing_cols)
 
     if chart_df.empty:
         return None
 
     chart_df = make_monthly_view(chart_df)
 
-    if chart_df.empty:
+    if chart_df.empty or "date" not in chart_df.columns:
         return None
 
-    chart_df["price_index"] = normalize_series(chart_df["price"])
-    chart_df["revenue_index"] = normalize_series(chart_df["revenue_ttm"])
-    chart_df["eps_index"] = normalize_series(chart_df["eps_ttm"])
-
     fig, ax = plt.subplots(figsize=(12, 5))
+    plotted = False
 
-    ax.plot(chart_df["date"], chart_df["price_index"], marker="o", label="Price Index")
-    if chart_df["revenue_index"].notna().sum() >= 2:
+    if "price" in chart_df.columns and chart_df["price"].notna().sum() >= 2:
+        chart_df["price_index"] = normalize_series(chart_df["price"])
+        ax.plot(chart_df["date"], chart_df["price_index"], marker="o", label="Price Index")
+        plotted = True
+
+    if "revenue_ttm" in chart_df.columns and chart_df["revenue_ttm"].notna().sum() >= 2:
+        chart_df["revenue_index"] = normalize_series(chart_df["revenue_ttm"])
         ax.plot(chart_df["date"], chart_df["revenue_index"], marker="o", label="Revenue TTM Index")
-    if chart_df["eps_index"].notna().sum() >= 2:
+        plotted = True
+
+    if "eps_ttm" in chart_df.columns and chart_df["eps_ttm"].notna().sum() >= 2:
+        chart_df["eps_index"] = normalize_series(chart_df["eps_ttm"])
         ax.plot(chart_df["date"], chart_df["eps_index"], marker="o", label="EPS TTM Index")
+        plotted = True
+
+    if not plotted:
+        plt.close(fig)
+        return None
 
     ax.axhline(y=100, linestyle="--", alpha=0.5)
     ax.set_title(f"{ticker} Price vs Fundamentals Index")
@@ -630,20 +653,33 @@ def make_financial_trend_chart(fin_trend_df, ticker):
 
 
 def make_price_pe_trend_chart(fin_trend_df, valuation, ticker):
-    chart_df = fin_trend_df.copy()
-
-    if chart_df.empty or "pe_ttm" not in chart_df.columns:
+    """
+    Price + TTM P/E chart.
+    - 주가와 P/E를 같은 날짜축에서 같이 보여준다.
+    - 컬럼 부족/데이터 부족이면 차트를 숨기고 앱은 계속 실행한다.
+    """
+    if fin_trend_df is None or fin_trend_df.empty:
         return None, pd.DataFrame()
 
-    chart_df = chart_df.dropna(subset=["price", "pe_ttm"]).copy()
-    chart_df = chart_df[(chart_df["pe_ttm"] > 0) & (chart_df["pe_ttm"] < 500)].copy()
+    needed = {"date", "price", "pe_ttm"}
+    if not needed.issubset(set(fin_trend_df.columns)):
+        return None, pd.DataFrame()
+
+    chart_df = fin_trend_df.copy()
+    chart_df["date"] = pd.to_datetime(chart_df["date"], errors="coerce")
+    chart_df["price"] = pd.to_numeric(chart_df["price"], errors="coerce")
+    chart_df["pe_ttm"] = pd.to_numeric(chart_df["pe_ttm"], errors="coerce")
+
+    chart_df = chart_df.dropna(subset=["date", "price", "pe_ttm"]).copy()
+    chart_df = chart_df[(chart_df["price"] > 0) & (chart_df["pe_ttm"] > 0) & (chart_df["pe_ttm"] < 500)].copy()
+    chart_df = chart_df.sort_values("date")
 
     if chart_df.empty or len(chart_df) < 20:
         return None, chart_df
 
     chart_df = make_monthly_view(chart_df)
 
-    if chart_df.empty or len(chart_df) < 3:
+    if chart_df.empty or len(chart_df) < 4:
         return None, chart_df
 
     fig, ax_price = plt.subplots(figsize=(12, 5))
@@ -664,7 +700,7 @@ def make_price_pe_trend_chart(fin_trend_df, valuation, ticker):
 
     if is_valid_number(pe_std) and pe_std > 0:
         ax_pe.axhline(pe_mean + pe_std, linestyle=":", alpha=0.35, label="P/E +1SD")
-        ax_pe.axhline(pe_mean - pe_std, linestyle=":", alpha=0.35, label="P/E -1SD")
+        ax_pe.axhline(max(pe_mean - pe_std, 0), linestyle=":", alpha=0.35, label="P/E -1SD")
 
     current_forward_pe = valuation.get("forward_pe") if isinstance(valuation, dict) else None
     if is_valid_number(current_forward_pe) and float(current_forward_pe) > 0:
@@ -682,7 +718,10 @@ def make_price_pe_trend_chart(fin_trend_df, valuation, ticker):
 
 
 def make_price_pe_comment(price_pe_df):
-    df = price_pe_df.dropna(subset=["price", "pe_ttm"]).copy() if not price_pe_df.empty else pd.DataFrame()
+    if price_pe_df is None or price_pe_df.empty or not {"date", "price", "pe_ttm"}.issubset(set(price_pe_df.columns)):
+        df = pd.DataFrame()
+    else:
+        df = price_pe_df.dropna(subset=["date", "price", "pe_ttm"]).copy()
 
     if df.empty or len(df) < 3:
         return (
