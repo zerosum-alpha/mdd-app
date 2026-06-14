@@ -494,39 +494,89 @@ def load_financial_trend_data(ticker):
         return pd.DataFrame()
 
 
-def add_price_to_financial_trend(financial_df, price_df):
+def add_price_to_financial_trend(financial_df, price_df, report_lag_days=45):
+    """
+    재무제표의 TTM EPS를 일별 주가에 붙여서 일별 TTM P/E 추세를 만든다.
+
+    핵심 수정점:
+    - 이전 버전은 분기 재무제표 날짜의 가격만 찍어서 점이 1~2개처럼 보였다.
+    - 이번 버전은 분기별 EPS TTM을 발표 이후 기간에 step 방식으로 유지하고,
+      매일의 주가와 결합해 일별 P/E를 계산한다.
+
+    주의:
+    - yfinance는 실제 발표일을 안정적으로 제공하지 않으므로
+      fiscal period end + 45일을 근사 발표일로 사용한다.
+    - Forward P/E 과거 추이는 아니다. 실제 계산값은 TTM P/E이다.
+    """
     if financial_df.empty or price_df.empty:
         return pd.DataFrame()
 
-    rows = []
+    try:
+        fin = financial_df.copy()
+        fin["date"] = pd.to_datetime(fin["date"], errors="coerce")
+        fin = fin.dropna(subset=["date"]).sort_values("date")
 
-    price_df = price_df.copy()
-    price_df = price_df.sort_index()
+        if "eps_ttm" not in fin.columns:
+            return pd.DataFrame()
 
-    for _, row in financial_df.iterrows():
-        dt = row["date"]
-        prior_prices = price_df[price_df.index <= dt]
+        fin = fin.dropna(subset=["eps_ttm"]).copy()
+        fin = fin[fin["eps_ttm"].astype(float) > 0].copy()
 
-        if prior_prices.empty:
-            close_price = None
-        else:
-            close_price = prior_prices["Close"].iloc[-1]
+        if fin.empty:
+            return pd.DataFrame()
 
-        eps_ttm = row["eps_ttm"]
-        pe_ttm = None
-        if close_price is not None and is_valid_number(eps_ttm) and float(eps_ttm) > 0:
-            pe_ttm = close_price / float(eps_ttm)
+        fin["report_date"] = fin["date"] + pd.Timedelta(days=report_lag_days)
 
-        rows.append({
-            "date": dt,
-            "price": close_price,
-            "revenue_ttm": row["revenue_ttm"],
-            "eps_ttm": eps_ttm,
-            "pe_ttm": pe_ttm
-        })
+        price = price_df.copy().sort_index()
+        price = price.reset_index()
 
-    result = pd.DataFrame(rows)
-    return result
+        date_col = price.columns[0]
+        price = price.rename(columns={date_col: "date", "Close": "price"})
+        price["date"] = pd.to_datetime(price["date"], errors="coerce")
+        price = price.dropna(subset=["date", "price"]).sort_values("date")
+
+        merged = pd.merge_asof(
+            price[["date", "price"]],
+            fin[["report_date", "date", "revenue_ttm", "eps_ttm"]].rename(columns={"date": "fiscal_date"}),
+            left_on="date",
+            right_on="report_date",
+            direction="backward"
+        )
+
+        merged = merged.dropna(subset=["eps_ttm"]).copy()
+        merged["eps_ttm"] = pd.to_numeric(merged["eps_ttm"], errors="coerce")
+        merged["price"] = pd.to_numeric(merged["price"], errors="coerce")
+        merged = merged[(merged["eps_ttm"] > 0) & (merged["price"] > 0)].copy()
+
+        merged["pe_ttm"] = merged["price"] / merged["eps_ttm"]
+
+        # 극단 이상치 제거: 음수/비정상 EPS로 P/E가 폭발하는 경우 차트 왜곡 방지
+        merged = merged[(merged["pe_ttm"] > 0) & (merged["pe_ttm"] < 500)].copy()
+
+        return merged[["date", "price", "revenue_ttm", "eps_ttm", "pe_ttm", "fiscal_date", "report_date"]]
+
+    except Exception:
+        return pd.DataFrame()
+
+
+def make_monthly_view(df, date_col="date"):
+    if df.empty or date_col not in df.columns:
+        return df
+
+    temp = df.copy()
+    temp[date_col] = pd.to_datetime(temp[date_col], errors="coerce")
+    temp = temp.dropna(subset=[date_col]).sort_values(date_col)
+    temp = temp.set_index(date_col)
+
+    # 월말 기준으로 마지막 관측값만 사용해 차트를 보기 쉽게 만든다.
+    monthly = temp.resample("ME").last().dropna(how="all").reset_index()
+
+    if len(monthly) < 6:
+        # 데이터 기간이 짧으면 주간 기준으로 완화
+        weekly = temp.resample("W-FRI").last().dropna(how="all").reset_index()
+        return weekly
+
+    return monthly
 
 
 def normalize_series(value_series):
@@ -548,6 +598,11 @@ def normalize_series(value_series):
 def make_financial_trend_chart(fin_trend_df, ticker):
     chart_df = fin_trend_df.copy()
     chart_df = chart_df.dropna(how="all", subset=["price", "revenue_ttm", "eps_ttm"])
+
+    if chart_df.empty:
+        return None
+
+    chart_df = make_monthly_view(chart_df)
 
     if chart_df.empty:
         return None
@@ -581,13 +636,15 @@ def make_price_pe_trend_chart(fin_trend_df, valuation, ticker):
         return None, pd.DataFrame()
 
     chart_df = chart_df.dropna(subset=["price", "pe_ttm"]).copy()
+    chart_df = chart_df[(chart_df["pe_ttm"] > 0) & (chart_df["pe_ttm"] < 500)].copy()
 
-    # yfinance quarterly financials often provide only 1~2 usable TTM P/E points.
-    # Drawing a line chart with only 2~3 points is misleading, so block it.
-    if chart_df.empty or len(chart_df) < 6:
+    if chart_df.empty or len(chart_df) < 20:
         return None, chart_df
 
-    chart_df = chart_df.sort_values("date")
+    chart_df = make_monthly_view(chart_df)
+
+    if chart_df.empty or len(chart_df) < 3:
+        return None, chart_df
 
     fig, ax_price = plt.subplots(figsize=(12, 5))
 
@@ -625,19 +682,29 @@ def make_price_pe_trend_chart(fin_trend_df, valuation, ticker):
 
 
 def make_price_pe_comment(price_pe_df):
-    if price_pe_df.empty or len(price_pe_df.dropna(subset=["price", "pe_ttm"])) < 6:
+    df = price_pe_df.dropna(subset=["price", "pe_ttm"]).copy() if not price_pe_df.empty else pd.DataFrame()
+
+    if df.empty or len(df) < 3:
         return (
-            "Price + P/E 추세 차트를 그릴 만큼 데이터가 충분하지 않습니다. "
-            "2~3개 점만 연결하면 오판 가능성이 커서 차트를 표시하지 않습니다. "
-            "정확한 12개월 Forward P/E 추이는 FactSet/Bloomberg/Refinitiv 같은 컨센서스 데이터가 필요합니다."
+            "Price + P/E 추세 차트를 그릴 데이터가 부족합니다. "
+            "yfinance에서 EPS TTM을 충분히 가져오지 못한 상태입니다. "
+            "정확한 12개월 Forward P/E 추이는 별도 컨센서스 데이터가 필요합니다."
         )
 
-    df = price_pe_df.dropna(subset=["price", "pe_ttm"]).copy()
+    df = df.sort_values("date")
 
-    first_price = df["price"].iloc[0]
-    last_price = df["price"].iloc[-1]
-    first_pe = df["pe_ttm"].iloc[0]
-    last_pe = df["pe_ttm"].iloc[-1]
+    # 최근 6개월 전후 비교. 데이터가 짧으면 가능한 전체 구간 비교.
+    last_date = pd.to_datetime(df["date"].iloc[-1])
+    cutoff = last_date - pd.DateOffset(months=6)
+    base_df = df[pd.to_datetime(df["date"]) >= cutoff]
+
+    if len(base_df) < 3:
+        base_df = df
+
+    first_price = base_df["price"].iloc[0]
+    last_price = base_df["price"].iloc[-1]
+    first_pe = base_df["pe_ttm"].iloc[0]
+    last_pe = base_df["pe_ttm"].iloc[-1]
 
     price_change = (last_price / first_price - 1) * 100 if first_price else None
     pe_change = (last_pe / first_pe - 1) * 100 if first_pe else None
@@ -645,19 +712,21 @@ def make_price_pe_comment(price_pe_df):
     if price_change is None or pe_change is None:
         return "Price + P/E 추세 해석이 불가능합니다."
 
+    prefix = f"최근 비교 구간: 주가 {price_change:+.1f}%, TTM P/E {pe_change:+.1f}%. "
+
     if price_change > 0 and pe_change < 0:
-        return "주가는 상승했지만 P/E는 하락했습니다. 실적 개선이 주가 상승을 정당화하는 구간일 수 있습니다."
+        return prefix + "주가는 상승했지만 P/E는 하락했습니다. 실적 개선이 주가 상승을 정당화하는 구간일 수 있습니다."
 
     if price_change > 0 and pe_change > 0:
-        return "주가와 P/E가 함께 상승했습니다. 실적보다 기대감이 더 빠르게 반영되는 과열 구간인지 확인해야 합니다."
+        return prefix + "주가와 P/E가 함께 상승했습니다. 실적보다 기대감이 더 빠르게 반영되는 과열 구간인지 확인해야 합니다."
 
     if price_change < 0 and pe_change < 0:
-        return "주가와 P/E가 함께 하락했습니다. 밸류 부담은 완화됐지만 업황 훼손 여부를 확인해야 합니다."
+        return prefix + "주가와 P/E가 함께 하락했습니다. 밸류 부담은 완화됐지만 업황 훼손 여부를 확인해야 합니다."
 
     if price_change < 0 and pe_change > 0:
-        return "주가는 하락했지만 P/E는 상승했습니다. 이익 추정치가 더 빠르게 악화된 구간일 수 있어 저점매수 주의가 필요합니다."
+        return prefix + "주가는 하락했지만 P/E는 상승했습니다. 이익이 더 빠르게 악화된 구간일 수 있어 저점매수 주의가 필요합니다."
 
-    return "주가와 P/E 변화가 뚜렷하지 않습니다. MDD, RSI, 이벤트 리스크를 함께 확인하세요."
+    return prefix + "주가와 P/E 변화가 뚜렷하지 않습니다. MDD, RSI, 이벤트 리스크를 함께 확인하세요."
 
 
 # =========================================================
