@@ -6,7 +6,7 @@ import yfinance as yf
 import FinanceDataReader as fdr
 from datetime import datetime
 
-# 한국 주식 PER 데이터를 가져오기 위한 pykrx 
+# 한국 주식 PER 데이터를 가져오기 위한 pykrx
 try:
     from pykrx import stock as krx_stock
 except Exception:
@@ -89,16 +89,14 @@ def load_vix_data(start_date):
     return pd.DataFrame()
 
 # =========================================================
-# 2. PER(밸류에이션) 데이터 로드 및 계산 (복구됨)
+# 2. PER(밸류에이션) 데이터 로드 및 계산 (원본 폴백 로직 복구)
 # =========================================================
 @st.cache_data(ttl=86400)
 def load_krx_per_data(ticker, start_date):
     """한국 주식용 과거 PER 시계열 데이터 로드"""
     if krx_stock is None: return pd.DataFrame()
-    
     start_str = start_date.strftime("%Y%m%d")
     end_str = datetime.today().strftime("%Y%m%d")
-    
     try:
         df = krx_stock.get_market_fundamental(start_str, end_str, ticker)
         if not df.empty:
@@ -110,74 +108,111 @@ def load_krx_per_data(ticker, start_date):
 
 @st.cache_data(ttl=86400)
 def load_us_historical_per(ticker, price_df):
-    """미국 주식 EPS 추적 -> 일별 PER 시계열 데이터 생성 (복구 완료)"""
+    """미국 주식 EPS 추적 -> 일별 PER 시계열 데이터 생성 (강력한 방어 로직)"""
     if price_df is None or price_df.empty: return price_df
     
+    records = []
     try:
         t = yf.Ticker(ticker)
-        eps_data = pd.DataFrame()
         
-        # 1. earnings_dates 시도 (정확한 발표일 기준)
+        # 1) 재무제표 (Income Statement)에서 분기 EPS 추출 시도
+        stmt_candidates = []
+        for attr in ["quarterly_income_stmt", "quarterly_financials"]:
+            try:
+                q = getattr(t, attr)
+                if q is not None and not q.empty: stmt_candidates.append(q)
+            except: pass
         try:
-            ed = t.get_earnings_dates(limit=40)
+            q = t.get_income_stmt(freq="quarterly")
+            if q is not None and not q.empty: stmt_candidates.append(q)
+        except: pass
+
+        eps_rows = ["Diluted EPS", "Basic EPS", "DilutedEPS", "BasicEPS", "EPS Diluted", "EPS Basic"]
+        
+        for q in stmt_candidates:
+            try:
+                q.index = q.index.astype(str)
+                eps_s = None
+                for row in eps_rows:
+                    if row in q.index:
+                        eps_s = q.loc[row]
+                        break
+                
+                # EPS 라인이 없으면 Net Income / Shares로 직접 계산
+                if eps_s is None:
+                    ni = sh = None
+                    for row in ["Net Income", "Net Income Common Stockholders"]:
+                        if row in q.index: ni = pd.to_numeric(q.loc[row], errors="coerce"); break
+                    for row in ["Diluted Average Shares", "Basic Average Shares", "Ordinary Shares Number"]:
+                        if row in q.index: sh = pd.to_numeric(q.loc[row], errors="coerce"); break
+                    if ni is not None and sh is not None:
+                        eps_s = ni / sh
+
+                if eps_s is not None:
+                    for dt, eps_val in eps_s.items():
+                        if pd.notna(eps_val) and float(eps_val) != 0:
+                            # 실적 발표 지연을 고려해 분기말 날짜에 +45일 부여
+                            report_date = pd.to_datetime(dt, errors="coerce") + pd.Timedelta(days=45)
+                            records.append({"date": report_date, "eps_q": float(eps_val)})
+            except: continue
+
+        # 2) Earnings Dates에서 Reported EPS 추출 (API 폴백)
+        try:
+            ed = t.get_earnings_dates(limit=32)
             if ed is not None and not ed.empty:
                 ed = ed.reset_index()
                 date_col = ed.columns[0]
-                eps_col = [c for c in ed.columns if 'Reported' in str(c) and 'EPS' in str(c)]
-                if eps_col:
-                    ed = ed.dropna(subset=[date_col, eps_col[0]])
-                    ed['date'] = pd.to_datetime(ed[date_col], utc=True).dt.tz_localize(None)
-                    ed['eps'] = pd.to_numeric(ed[eps_col[0]], errors='coerce')
-                    ed = ed.sort_values('date').dropna(subset=['eps'])
-                    ed['eps_ttm'] = ed['eps'].rolling(4).sum()
-                    ed = ed.dropna(subset=['eps_ttm'])
-                    if not ed.empty:
-                        ed['report_date'] = ed['date'] + pd.Timedelta(days=1)
-                        eps_data = ed[['report_date', 'eps_ttm']]
+                rep_col = next((c for c in ed.columns if str(c).lower().replace(" ", "") in ["reportedeps", "epsactual"]), None)
+                if rep_col is not None:
+                    for _, r in ed.iterrows():
+                        eps_val = r.get(rep_col)
+                        dt = r.get(date_col)
+                        if pd.notna(eps_val) and pd.notna(dt) and float(eps_val) != 0:
+                            parsed_dt = pd.to_datetime(dt, errors="coerce")
+                            if getattr(parsed_dt, 'tzinfo', None): parsed_dt = parsed_dt.tz_localize(None)
+                            records.append({"date": parsed_dt, "eps_q": float(eps_val)})
         except: pass
 
-        # 2. 실패 시 재무제표 시도 (분기 종료일 기준 + 45일 지연 반영)
-        if eps_data.empty:
-            try:
-                inc = t.quarterly_income_stmt
-                if inc is not None and not inc.empty:
-                    inc = inc.T
-                    eps_cols = [c for c in inc.columns if 'Diluted EPS' in str(c) or 'Basic EPS' in str(c)]
-                    if eps_cols:
-                        inc['eps'] = pd.to_numeric(inc[eps_cols[0]], errors='coerce')
-                        inc = inc.dropna(subset=['eps']).sort_index()
-                        inc['eps_ttm'] = inc['eps'].rolling(4).sum()
-                        inc = inc.dropna(subset=['eps_ttm'])
-                        if not inc.empty:
-                            inc['date'] = pd.to_datetime(inc.index).tz_localize(None)
-                            inc['report_date'] = inc['date'] + pd.Timedelta(days=45)
-                            eps_data = inc[['report_date', 'eps_ttm']]
-            except: pass
-
-        # 3. 주가 데이터와 병합 (일별 PER 계산)
-        if not eps_data.empty:
-            p_df = price_df.copy()
-            p_df['join_date'] = pd.to_datetime(p_df.index).tz_localize(None)
+        # 3) EPS 데이터를 4분기(TTM) 합산하여 일별 PER로 병합
+        if records:
+            df_eps = pd.DataFrame(records)
+            df_eps["date"] = pd.to_datetime(df_eps["date"], errors="coerce").dt.tz_localize(None)
+            df_eps = df_eps.dropna(subset=["date", "eps_q"]).sort_values("date")
+            df_eps = df_eps.drop_duplicates(subset=["date"], keep="last")
             
-            eps_data = eps_data.sort_values('report_date')
-            p_df = p_df.sort_values('join_date')
+            # TTM (최근 4분기) 합산
+            df_eps["eps_ttm"] = df_eps["eps_q"].rolling(4).sum()
+            df_eps = df_eps.dropna(subset=["eps_ttm"])
+            df_eps = df_eps[df_eps["eps_ttm"] > 0]
             
-            merged = pd.merge_asof(
-                p_df, 
-                eps_data, 
-                left_on='join_date', 
-                right_on='report_date', 
-                direction='backward'
-            )
-            
-            merged['PER'] = merged['Close'] / merged['eps_ttm']
-            merged.loc[(merged['PER'] <= 0) | (merged['PER'] > 300), 'PER'] = np.nan
-            
-            price_df['PER'] = merged['PER'].values
-            return price_df
+            if not df_eps.empty:
+                p_df = price_df.copy()
+                p_df['original_index'] = p_df.index
+                p_df['join_date'] = pd.to_datetime(p_df.index).tz_localize(None)
+                
+                df_eps = df_eps.sort_values('date')
+                p_df = p_df.sort_values('join_date')
+                
+                # 과거 일자별로 가장 최근에 발표된 TTM EPS를 매핑
+                merged = pd.merge_asof(
+                    p_df, 
+                    df_eps[['date', 'eps_ttm']], 
+                    left_on='join_date', 
+                    right_on='date', 
+                    direction='backward'
+                )
+                
+                merged['PER'] = merged['Close'] / merged['eps_ttm']
+                # 비정상 PER 값 제거
+                merged.loc[(merged['PER'] <= 0) | (merged['PER'] > 300), 'PER'] = np.nan
+                
+                merged = merged.set_index('original_index')
+                price_df['PER'] = merged['PER']
+                return price_df
     except: pass
     
-    price_df['PER'] = np.nan
+    if 'PER' not in price_df.columns:
+        price_df['PER'] = np.nan
     return price_df
 
 @st.cache_data(ttl=3600)
@@ -203,7 +238,6 @@ def calculate_indicators_and_signals(df, vix_df=None, kr_per_df=None):
     df["Peak"] = df["Close"].cummax()
     df["Current_Drawdown"] = df["Close"] / df["Peak"] - 1
     df["Max_Drawdown"] = df["Current_Drawdown"].cummin()
-    
     df["MA20"] = df["Close"].rolling(20).mean()
     
     delta = df["Close"].diff()
@@ -218,24 +252,27 @@ def calculate_indicators_and_signals(df, vix_df=None, kr_per_df=None):
     else:
         df['VIX'] = np.nan
 
-    # 3. 한국 주식 PER 결합 (미국 주식은 이미 위에서 병합됨)
+    # 3. 한국 주식 PER 결합 (미국은 이미 df에 계산되어 있음)
     if kr_per_df is not None and not kr_per_df.empty:
         df = df.join(kr_per_df, how='left')
         df['PER'] = df['PER'].ffill()
     elif 'PER' not in df.columns:
         df['PER'] = np.nan
 
-    # 4. 실전 매매 타이밍 (Signal) 조건
+    # 4. 실전 매매 타이밍 (Signal) 조건 오버레이
+    # 매수(Buy): 낙폭이 깊고(-15% 이하) + (과매도(RSI<=30) 이거나 공포구간(VIX>=25))
     buy_cond = (df["Current_Drawdown"] <= -0.15) & ((df["RSI"] <= 30) | (df["VIX"] >= 25))
+    # 매도(Sell): 낙폭을 다 회복하고(-2% 이내) + 단기 과열(RSI>=70)
     sell_cond = (df["Current_Drawdown"] >= -0.02) & (df["RSI"] >= 70)
 
+    # 신호가 처음 발생한 시점(변곡점)만 화살표를 띄우기 위한 필터
     df['Buy_Signal'] = df['Close'][buy_cond & (~buy_cond.shift(1).fillna(False))]
     df['Sell_Signal'] = df['Close'][sell_cond & (~sell_cond.shift(1).fillna(False))]
 
     return df
 
 # =========================================================
-# 4. 3단 통합 차트 생성 (Price / PER / MDD+VIX)
+# 4. 3단 통합 시각화 (Price / PER / MDD+VIX)
 # =========================================================
 def make_comprehensive_chart(df, ticker, market):
     if df is None or df.empty: return None
@@ -254,7 +291,7 @@ def make_comprehensive_chart(df, ticker, market):
     ax1.legend(loc='upper left')
     ax1.grid(True, linestyle=':', alpha=0.6)
 
-    # --- [Panel 2]: 밸류에이션 (PER) 추이 복구 ---
+    # --- [Panel 2]: 밸류에이션 (PER) 추이 복구 영역 ---
     if 'PER' in df.columns and df['PER'].notna().any():
         color_per = "#D69E2E" if market == "KR" else "#2CA02C" 
         label_per = "Historical PER (KRX)" if market == "KR" else "Estimated TTM P/E (US)"
@@ -293,14 +330,14 @@ def make_comprehensive_chart(df, ticker, market):
     return fig
 
 # =========================================================
-# 메인 UI
+# 메인 UI 실행
 # =========================================================
 col_a, col_b, col_c = st.columns(3)
 
 with col_a:
     user_input = st.text_input("종목명 / 종목코드 / 미국 티커", value="NVDA")
 with col_b:
-    start_date = st.date_input("기준 시작일", pd.to_datetime("2024-01-01"))
+    start_date = st.date_input("기준 시작일", pd.to_datetime("2023-01-01"))
 with col_c:
     run = st.button("트레이딩 & 밸류에이션 분석 실행", type="primary", use_container_width=True)
 
@@ -320,21 +357,19 @@ if run:
             st.error("가격을 가져오지 못했습니다.")
             st.stop()
 
-        # 한국/미국 분기하여 PER 데이터 획득
         kr_per_df = None
         us_val = {}
         if market == "KR":
             kr_per_df = load_krx_per_data(ticker, start_date)
         else:
-            price_df = load_us_historical_per(ticker, price_df) # 미국주식 일별 PER 차트용 계산
-            us_val = load_us_valuation(ticker) # 미국주식 상단 카드용 계산
+            price_df = load_us_historical_per(ticker, price_df)
+            us_val = load_us_valuation(ticker) 
 
-        # 데이터 통합 및 시그널 계산
         df = calculate_indicators_and_signals(price_df, vix_df, kr_per_df)
         latest = df.iloc[-1]
         
         # ---------------------------------------------------------
-        # 1. 밸류에이션(PER) 요약 카드 
+        # 1. 밸류에이션(PER) 요약 상태판
         # ---------------------------------------------------------
         st.markdown("---")
         st.markdown(f"## 📊 1. 현재 밸류에이션 (PER) 상태: **{display_name}**")
@@ -348,9 +383,8 @@ if run:
             v3.metric("과거 평균 PER", f"{df['PER'].mean():.2f}x" if 'PER' in df.columns and df['PER'].notna().any() else "N/A")
             v4.info("👉 차트의 PER 추이와 평균선을 비교하여 고평가 여부를 확인하세요.")
         else:
-            # yfinance API가 고장나서 0.0이나 None을 뱉을 경우, 방금 직접 계산한 TTM PER로 강제 대체 (방어 로직)
+            # yfinance API 에러 방어: 직접 계산한 TTM PER 값으로 자동 대체
             calc_per = df['PER'].dropna().iloc[-1] if 'PER' in df.columns and df['PER'].notna().any() else None
-            
             t_pe = us_val.get('trailing_pe')
             if not t_pe or pd.isna(t_pe) or t_pe == 0: t_pe = calc_per
                 
@@ -364,7 +398,7 @@ if run:
             v4.metric("PEG Ratio", f"{peg:.2f}" if peg and peg != 0 else "N/A")
 
         # ---------------------------------------------------------
-        # 2. 실전 매매 타이밍 (Signal & MDD)
+        # 2. 실전 매매 타이밍 상태판
         # ---------------------------------------------------------
         st.markdown("## 🎯 2. 타이밍 및 시장 공포 상태")
         
@@ -379,7 +413,7 @@ if run:
             s4.metric("시장 구분", "한국(KRX) - 개별 종목 수급 우선")
 
         # ---------------------------------------------------------
-        # 3. 3단 통합 시각화 (Price + PER + MDD)
+        # 3. 3단 통합 시각화
         # ---------------------------------------------------------
         st.markdown("## 📈 3. 통합 매매 시그널 차트")
         st.caption("▲(매수): 깊은 낙폭(MDD -15% 이하) + 과매도/공포 구간 | ▼(매도): 전고점 회복 + 단기 과열(RSI 70 이상)")
@@ -389,7 +423,7 @@ if run:
             st.pyplot(chart_fig)
             
         # ---------------------------------------------------------
-        # 4. 최근 시그널 이력
+        # 4. 시그널 및 데이터 히스토리
         # ---------------------------------------------------------
         with st.expander("최근 30일 데이터 및 시그널 발생 내역 보기"):
             view_cols = ["Close", "Current_Drawdown", "RSI", "Buy_Signal", "Sell_Signal"]
