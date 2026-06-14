@@ -1,21 +1,27 @@
+
 import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
 import yfinance as yf
 import FinanceDataReader as fdr
-from datetime import datetime, timedelta
+from datetime import datetime
+
 from auth import require_login, logout_button
 
 # =========================================================
 # MDD 저점매수 분석기 FINAL
-# + Valuation
+# + 한국 종목 검색 보강
+# + Valuation Summary
+# + P/E Band Chart
+# + Price vs EPS/Revenue Trend
+# + MDD + Valuation Matrix
 # + Target Price
 # + Cash Warning Light
 #
-# 핵심:
-# - 기존 MDD / Buy Score 계산 로직 유지
-# - 현금확보 경고등은 Buy Score에 반영하지 않음
-# - 일정표 기반 자동 경고 + 돌발 리스크 수동 체크 4개만 반영
+# 원칙:
+# - 기존 MDD / Buy Score 계산 로직은 유지
+# - Valuation / Target / Cash Warning은 참고용 보조 필터
+# - Buy Score에 강제 반영하지 않음
 # =========================================================
 
 st.set_page_config(page_title="MDD 분석기", layout="wide")
@@ -140,40 +146,8 @@ def load_us_benchmark(ticker, start_date):
 
 
 # =========================================================
-# Valuation
+# 공통 포맷
 # =========================================================
-@st.cache_data(ttl=3600)
-def load_valuation_data(market, ticker):
-    empty_data = {
-        "trailing_pe": None,
-        "forward_pe": None,
-        "price_to_sales": None,
-        "peg_ratio": None,
-        "market_cap": None,
-        "enterprise_to_ebitda": None,
-        "data_status": "N/A"
-    }
-
-    try:
-        if market != "US":
-            return empty_data
-
-        info = yf.Ticker(ticker).info
-
-        return {
-            "trailing_pe": info.get("trailingPE"),
-            "forward_pe": info.get("forwardPE"),
-            "price_to_sales": info.get("priceToSalesTrailing12Months"),
-            "peg_ratio": info.get("pegRatio"),
-            "market_cap": info.get("marketCap"),
-            "enterprise_to_ebitda": info.get("enterpriseToEbitda"),
-            "data_status": "OK"
-        }
-
-    except Exception:
-        return empty_data
-
-
 def is_valid_number(value):
     if value is None:
         return False
@@ -226,6 +200,41 @@ def is_etf_like(asset_type, display_name, ticker):
         "SOXX", "IWM", "EWY", "SMH"
     ]
     return any(keyword in text for keyword in etf_keywords)
+
+
+# =========================================================
+# Valuation
+# =========================================================
+@st.cache_data(ttl=3600)
+def load_valuation_data(market, ticker):
+    empty_data = {
+        "trailing_pe": None,
+        "forward_pe": None,
+        "price_to_sales": None,
+        "peg_ratio": None,
+        "market_cap": None,
+        "enterprise_to_ebitda": None,
+        "data_status": "N/A"
+    }
+
+    try:
+        if market != "US":
+            return empty_data
+
+        info = yf.Ticker(ticker).info
+
+        return {
+            "trailing_pe": info.get("trailingPE"),
+            "forward_pe": info.get("forwardPE"),
+            "price_to_sales": info.get("priceToSalesTrailing12Months"),
+            "peg_ratio": info.get("pegRatio"),
+            "market_cap": info.get("marketCap"),
+            "enterprise_to_ebitda": info.get("enterpriseToEbitda"),
+            "data_status": "OK"
+        }
+
+    except Exception:
+        return empty_data
 
 
 def interpret_forward_pe(value):
@@ -388,6 +397,293 @@ def make_mdd_valuation_comment(current_dd, valuation):
         comments.append("MDD와 밸류에이션이 명확한 극단 구간은 아닙니다. 기존 MDD 신호와 시장 필터를 함께 확인하세요.")
 
     return " ".join(comments)
+
+
+def make_valuation_summary(valuation):
+    forward_pe = valuation["forward_pe"]
+    ps = valuation["price_to_sales"]
+    peg = valuation["peg_ratio"]
+
+    pe_text = format_valuation_value(forward_pe)
+    ps_text = format_valuation_value(ps)
+    peg_text = format_valuation_value(peg)
+
+    parts = [
+        f"Forward P/E {pe_text}",
+        f"P/S {ps_text}",
+        f"PEG {peg_text}"
+    ]
+
+    if is_valid_number(forward_pe):
+        pe = float(forward_pe)
+        if pe <= 30:
+            summary = "밸류 부담 보통 이하"
+        elif pe <= 50:
+            summary = "성장 기대 반영"
+        else:
+            summary = "추격 주의"
+    elif is_valid_number(ps):
+        ps_value = float(ps)
+        if ps_value <= 10:
+            summary = "매출배수 부담 보통 이하"
+        elif ps_value <= 30:
+            summary = "고성장 기대 반영"
+        else:
+            summary = "과열 가능성"
+    else:
+        summary = "밸류 판단 불가"
+
+    return " / ".join(parts) + f" → {summary}"
+
+
+# =========================================================
+# Financial trend
+# =========================================================
+@st.cache_data(ttl=86400)
+def load_financial_trend_data(ticker):
+    try:
+        t = yf.Ticker(ticker)
+
+        q_fin = t.quarterly_financials
+        q_inc = t.quarterly_income_stmt
+
+        if q_inc is not None and not q_inc.empty:
+            financials = q_inc.copy()
+        elif q_fin is not None and not q_fin.empty:
+            financials = q_fin.copy()
+        else:
+            return pd.DataFrame()
+
+        financials.columns = pd.to_datetime(financials.columns)
+        financials = financials.sort_index(axis=1)
+
+        def find_row(candidates):
+            for c in candidates:
+                if c in financials.index:
+                    return financials.loc[c]
+            return None
+
+        revenue = find_row(["Total Revenue", "TotalRevenue", "Revenue"])
+        eps = find_row(["Diluted EPS", "DilutedEPS", "Basic EPS", "BasicEPS"])
+
+        rows = []
+
+        if revenue is not None:
+            revenue_ttm = revenue.rolling(4).sum()
+        else:
+            revenue_ttm = None
+
+        if eps is not None:
+            eps_ttm = eps.rolling(4).sum()
+        else:
+            eps_ttm = None
+
+        for dt in financials.columns:
+            rows.append({
+                "date": pd.Timestamp(dt),
+                "revenue_ttm": None if revenue_ttm is None or pd.isna(revenue_ttm.get(dt)) else float(revenue_ttm.get(dt)),
+                "eps_ttm": None if eps_ttm is None or pd.isna(eps_ttm.get(dt)) else float(eps_ttm.get(dt))
+            })
+
+        trend_df = pd.DataFrame(rows)
+        trend_df = trend_df.dropna(how="all", subset=["revenue_ttm", "eps_ttm"])
+
+        return trend_df.tail(8)
+
+    except Exception:
+        return pd.DataFrame()
+
+
+def add_price_to_financial_trend(financial_df, price_df):
+    if financial_df.empty or price_df.empty:
+        return pd.DataFrame()
+
+    rows = []
+
+    price_df = price_df.copy()
+    price_df = price_df.sort_index()
+
+    for _, row in financial_df.iterrows():
+        dt = row["date"]
+        prior_prices = price_df[price_df.index <= dt]
+
+        if prior_prices.empty:
+            close_price = None
+        else:
+            close_price = prior_prices["Close"].iloc[-1]
+
+        rows.append({
+            "date": dt,
+            "price": close_price,
+            "revenue_ttm": row["revenue_ttm"],
+            "eps_ttm": row["eps_ttm"]
+        })
+
+    result = pd.DataFrame(rows)
+    return result
+
+
+def normalize_series(value_series):
+    s = pd.Series(value_series).astype(float)
+    s = s.replace([float("inf"), float("-inf")], pd.NA)
+    first_valid = s.dropna()
+
+    if first_valid.empty:
+        return s
+
+    base = first_valid.iloc[0]
+
+    if base == 0 or pd.isna(base):
+        return s
+
+    return s / base * 100
+
+
+def make_financial_trend_chart(fin_trend_df, ticker):
+    chart_df = fin_trend_df.copy()
+    chart_df = chart_df.dropna(how="all", subset=["price", "revenue_ttm", "eps_ttm"])
+
+    if chart_df.empty:
+        return None
+
+    chart_df["price_index"] = normalize_series(chart_df["price"])
+    chart_df["revenue_index"] = normalize_series(chart_df["revenue_ttm"])
+    chart_df["eps_index"] = normalize_series(chart_df["eps_ttm"])
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+
+    ax.plot(chart_df["date"], chart_df["price_index"], marker="o", label="Price Index")
+    if chart_df["revenue_index"].notna().sum() >= 2:
+        ax.plot(chart_df["date"], chart_df["revenue_index"], marker="o", label="Revenue TTM Index")
+    if chart_df["eps_index"].notna().sum() >= 2:
+        ax.plot(chart_df["date"], chart_df["eps_index"], marker="o", label="EPS TTM Index")
+
+    ax.axhline(y=100, linestyle="--", alpha=0.5)
+    ax.set_title(f"{ticker} Price vs Fundamentals Index")
+    ax.set_ylabel("Index = 100 at first available point")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+    plt.tight_layout()
+    return fig
+
+
+# =========================================================
+# Valuation charts
+# =========================================================
+def make_pe_band_data(current_price, valuation):
+    pe = valuation["forward_pe"]
+
+    if not is_valid_number(pe) or float(pe) <= 0 or current_price <= 0:
+        return pd.DataFrame()
+
+    pe = float(pe)
+    implied_eps = current_price / pe
+
+    bands = [
+        ("15x", implied_eps * 15),
+        ("30x", implied_eps * 30),
+        ("50x", implied_eps * 50),
+        ("Current", current_price)
+    ]
+
+    return pd.DataFrame(bands, columns=["Band", "Price"])
+
+
+def make_pe_band_chart(current_price, valuation, ticker):
+    band_df = make_pe_band_data(current_price, valuation)
+
+    if band_df.empty:
+        return None, band_df
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+
+    ax.bar(band_df["Band"], band_df["Price"])
+    ax.axhline(y=current_price, linestyle="--", alpha=0.7, label="Current Price")
+
+    ax.set_title(f"{ticker} Forward P/E Band")
+    ax.set_ylabel("Price")
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.legend()
+
+    plt.tight_layout()
+
+    return fig, band_df
+
+
+def make_valuation_zone(forward_pe, ps):
+    if not is_valid_number(forward_pe) and not is_valid_number(ps):
+        return "Unknown"
+
+    if is_valid_number(forward_pe):
+        pe = float(forward_pe)
+
+        if pe <= 30:
+            return "Low/Normal"
+        if pe <= 50:
+            return "High"
+        return "Very High"
+
+    ps_value = float(ps)
+
+    if ps_value <= 10:
+        return "Low/Normal"
+    if ps_value <= 30:
+        return "High"
+    return "Very High"
+
+
+def make_mdd_zone(current_dd):
+    if current_dd > -0.08:
+        return "Shallow DD"
+    if current_dd > -0.12:
+        return "Watch DD"
+    if current_dd > -0.15:
+        return "Buy1 DD"
+    return "Deep DD"
+
+
+def make_mdd_valuation_matrix(current_dd, valuation):
+    valuation_zone = make_valuation_zone(valuation["forward_pe"], valuation["price_to_sales"])
+    mdd_zone = make_mdd_zone(current_dd)
+
+    rules = {
+        ("Shallow DD", "Low/Normal"): "관망",
+        ("Shallow DD", "High"): "대기",
+        ("Shallow DD", "Very High"): "추격 금지",
+        ("Shallow DD", "Unknown"): "밸류 확인 불가",
+
+        ("Watch DD", "Low/Normal"): "관심",
+        ("Watch DD", "High"): "소액 후보",
+        ("Watch DD", "Very High"): "대기",
+        ("Watch DD", "Unknown"): "MDD 중심 판단",
+
+        ("Buy1 DD", "Low/Normal"): "1차 가능",
+        ("Buy1 DD", "High"): "1차 소액",
+        ("Buy1 DD", "Very High"): "소액만",
+        ("Buy1 DD", "Unknown"): "MDD 중심 1차 후보",
+
+        ("Deep DD", "Low/Normal"): "강한 후보",
+        ("Deep DD", "High"): "분할 가능",
+        ("Deep DD", "Very High"): "리스크 확인",
+        ("Deep DD", "Unknown"): "MDD 중심 분할 가능",
+    }
+
+    decision = rules.get((mdd_zone, valuation_zone), "판단 보류")
+
+    matrix_rows = []
+    for row_zone in ["Shallow DD", "Watch DD", "Buy1 DD", "Deep DD"]:
+        row = {"MDD 구간": row_zone}
+        for col_zone in ["Low/Normal", "High", "Very High", "Unknown"]:
+            value = rules.get((row_zone, col_zone), "-")
+            if row_zone == mdd_zone and col_zone == valuation_zone:
+                value = f"▶ {value}"
+            row[col_zone] = value
+        matrix_rows.append(row)
+
+    matrix_df = pd.DataFrame(matrix_rows)
+
+    return matrix_df, mdd_zone, valuation_zone, decision
 
 
 # =========================================================
@@ -590,9 +886,12 @@ def calculate_cash_warning(event_df, manual_score):
     }
 
 
-def make_cash_mdd_comment(current_dd, rsi, recovery_needed, cash_status, total_score):
+def make_cash_mdd_comment(current_dd, rsi, recovery_needed, total_score):
     rsi_valid = is_valid_number(rsi)
     rsi_value = float(rsi) if rsi_valid else None
+
+    if recovery_needed <= 0.05 and rsi_valid and rsi_value >= 70 and total_score >= 2:
+        return "MDD 회복 + RSI 과열 + 경고 높음: 현금확보 우선 구간입니다."
 
     if current_dd <= -0.12 and total_score <= 1:
         return "MDD 깊음 + 경고 낮음: 저점매수 가능 구간입니다. 단, 분할 접근이 우선입니다."
@@ -605,9 +904,6 @@ def make_cash_mdd_comment(current_dd, rsi, recovery_needed, cash_status, total_s
 
     if recovery_needed <= 0.05 and total_score >= 2:
         return "MDD 거의 회복 + 경고 높음: 일부 현금화 검토 구간입니다."
-
-    if recovery_needed <= 0.05 and rsi_valid and rsi_value >= 70 and total_score >= 2:
-        return "MDD 회복 + RSI 과열 + 경고 높음: 현금확보 우선 구간입니다."
 
     if total_score >= 4:
         return "경고 점수가 높습니다. 신규매수보다 현금확보와 리스크 관리가 우선입니다."
@@ -622,21 +918,21 @@ def make_mdd_target_table(peak_price, current_price, profile):
     rows = []
 
     levels = [
-        ("Watch 기준가", profile["watch"], "관심 구간"),
-        ("Buy 1 기준가", profile["buy1"], "1차 선진입 후보 기준"),
-        ("Buy 2 기준가", profile["buy2"], "2차 매수 후보 기준"),
-        ("Risk 기준가", profile["risk"], "추세 훼손 주의 기준")
+        ("관심가", profile["watch"], "관심 구간"),
+        ("1차 매수가", profile["buy1"], "1차 선진입 후보 기준"),
+        ("2차 매수가", profile["buy2"], "2차 매수 후보 기준"),
+        ("위험가", profile["risk"], "추세 훼손 주의 기준")
     ]
 
     for name, dd_level, memo in levels:
         target_price = peak_price * (1 + dd_level)
         gap_pct = (target_price / current_price - 1) * 100 if current_price > 0 else None
-        status = "이미 해당 MDD 구간 도달" if current_price <= target_price else "추가 하락 시 도달"
+        status = "도달" if current_price <= target_price else "미도달"
 
         rows.append({
             "구분": name,
             "MDD 기준": f"{dd_level * 100:.2f}%",
-            "목표가": format_price(target_price),
+            "가격": format_price(target_price),
             "현재가 대비": format_pct_value(gap_pct),
             "상태": status,
             "해석": memo
@@ -700,28 +996,6 @@ def make_valuation_target_table(current_price, valuation):
         })
 
     return pd.DataFrame(rows)
-
-
-def make_target_comment(mdd_target_df, valuation_target_df):
-    comments = []
-
-    buy1_row = mdd_target_df[mdd_target_df["구분"] == "Buy 1 기준가"]
-    buy2_row = mdd_target_df[mdd_target_df["구분"] == "Buy 2 기준가"]
-
-    if not buy1_row.empty:
-        comments.append(f"MDD 기준 1차 관심가는 **{buy1_row.iloc[0]['목표가']}** 입니다.")
-
-    if not buy2_row.empty:
-        comments.append(f"MDD 기준 2차 관심가는 **{buy2_row.iloc[0]['목표가']}** 입니다.")
-
-    if not valuation_target_df.empty and valuation_target_df.iloc[0]["참고 목표가"] != "N/A":
-        comments.append("Valuation 기준 목표가는 Forward P/E 또는 P/S를 단순 환산한 참고값입니다.")
-    else:
-        comments.append("밸류 데이터가 없어 Valuation 기준 목표가는 계산하지 않았습니다.")
-
-    comments.append("목표가는 자동 매수 가격이 아니라 MDD·밸류 부담을 비교하기 위한 참고선입니다.")
-
-    return " ".join(comments)
 
 
 # =========================================================
@@ -1161,6 +1435,28 @@ def simulate_avg_price(current_price, current_qty, avg_price, buy_amount):
     return add_qty, total_qty, new_avg, recovery_to_new_avg
 
 
+def make_final_trade_view(decision, cash_result, matrix_decision, current_dd, rsi, ma5, current_price, vol_ratio):
+    if cash_result["total_score"] >= 4:
+        return "현금확보 우선", "Event Risk가 높아 신규매수보다 현금확보와 리스크 관리 우선"
+
+    if "매수 금지" in decision:
+        return "매수 금지", "MDD/추세 조건상 저점 이탈 또는 추세 훼손 가능성 우선"
+
+    if current_dd <= -0.12 and cash_result["total_score"] <= 1 and matrix_decision in ["1차 가능", "강한 후보", "분할 가능"]:
+        return "1차 소액 가능", "MDD가 깊고 이벤트 리스크가 낮으며 밸류 부담도 과도하지 않음"
+
+    if current_dd <= -0.12 and cash_result["total_score"] >= 2:
+        return "소액만 가능", "가격 매력은 있으나 이벤트 리스크가 있어 비중 확대 금지"
+
+    if current_dd > -0.08 and cash_result["total_score"] >= 2:
+        return "추격 금지", "낙폭이 얕고 이벤트 리스크가 높음"
+
+    if pd.notna(ma5) and current_price > ma5 and pd.notna(rsi) and rsi >= 30:
+        return "확인매수 후보", "MA5 회복과 RSI 회복이 확인됨"
+
+    return "대기", "가격·수급·이벤트 조건 중 명확한 우위 부족"
+
+
 # =========================================================
 # Main screen
 # =========================================================
@@ -1201,7 +1497,6 @@ if run:
 
     with st.spinner("데이터 분석 중..."):
         profile = get_type_profile(asset_type)
-
         market_status, market_risk_points, market_df = get_market_filter(start_date)
 
         df = load_price_data(market, ticker, start_date)
@@ -1221,6 +1516,8 @@ if run:
         period_mdd = df["Max_Drawdown"].min()
         recovery_needed = latest["Recovery_To_Peak"]
         rsi = latest["RSI"]
+        ma5 = latest["MA5"]
+        vol_ratio = latest["Volume_Ratio"]
         buy_score = latest["Buy_Score"]
         decision = latest["Decision"]
         entry_type = latest["Entry_Type"]
@@ -1235,92 +1532,25 @@ if run:
         valuation = load_valuation_data(market, ticker)
         valuation_df = make_valuation_table(valuation)
         valuation_comment = make_mdd_valuation_comment(current_dd, valuation)
+        valuation_summary = make_valuation_summary(valuation)
         etf_flag = is_etf_like(asset_type, display_name, ticker)
 
         mdd_target_df = make_mdd_target_table(peak_price, current_price, profile)
         valuation_target_df = make_valuation_target_table(current_price, valuation)
-        target_comment = make_target_comment(mdd_target_df, valuation_target_df)
 
-        st.subheader(f"분석 대상: {display_name} / {ticker} / {market}")
-        st.write(f"종목 유형: **{asset_type}**")
-        st.write(
-            f"시장 필터: **{market_status}** / "
-            f"위험점수: **{market_risk_points:.1f}** / "
-            f"현재 적용 감점: **{market_penalty}점**"
-        )
+        matrix_df, mdd_zone, valuation_zone, matrix_decision = make_mdd_valuation_matrix(current_dd, valuation)
 
-        # 1. 핵심 지표 카드
-        c1, c2, c3, c4, c5, c6 = st.columns(6)
-        c1.metric("현재가", f"{current_price:,.2f}")
-        c2.metric("기간 고점", f"{peak_price:,.2f}")
-        c3.metric("현재 낙폭", f"{current_dd * 100:.2f}%")
-        c4.metric("최대 낙폭", f"{period_mdd * 100:.2f}%")
-        c5.metric("회복 필요", f"{recovery_needed * 100:.2f}%")
-        c6.metric("매수 점수", f"{buy_score:.0f}점")
+        pe_band_fig, pe_band_df = make_pe_band_chart(current_price, valuation, ticker)
 
-        # 2. 최종 판단
-        st.markdown("## 최종 판단")
+        financial_trend = pd.DataFrame()
+        financial_chart = None
 
-        if "매수 금지" in decision:
-            st.error(f"🚫 {decision}")
-        elif "2차" in decision:
-            st.warning(f"🟠 {decision}")
-        elif "1차" in decision:
-            st.success(f"🟢 {decision}")
-        elif "관심" in decision:
-            st.info(f"🔵 {decision}")
-        else:
-            st.info(f"⚪ {decision}")
+        if market == "US":
+            raw_financial_trend = load_financial_trend_data(ticker)
+            financial_trend = add_price_to_financial_trend(raw_financial_trend, df)
+            financial_chart = make_financial_trend_chart(financial_trend, ticker)
 
-        # 3. 권장 행동
-        st.markdown("## 권장 행동")
-
-        e1, e2, e3, e4 = st.columns(4)
-        e1.metric("Entry Type", entry_type)
-        e2.metric("First Buy Ratio", f"{buy_ratio * 100:.0f}%")
-        e3.metric("Market Override", market_risk_override)
-        e4.metric("Market Penalty", f"{market_penalty}점")
-
-        st.write(f"확인매수 조건: **{confirm_buy_condition}**")
-
-        if recommended_buy_amount > 0:
-            st.success(f"권장 추가매수: 예정금의 {buy_ratio * 100:.0f}% ≈ {recommended_buy_amount:,.0f}")
-        else:
-            st.warning("현재 권장 추가매수는 0원 또는 대기입니다.")
-
-        # 4. Valuation
-        st.markdown("## Valuation(밸류에이션)")
-
-        st.info("밸류에이션은 매수 신호가 아니라 참고용 보조 필터입니다. Buy Score 계산에는 반영하지 않습니다.")
-
-        if etf_flag:
-            st.warning("ETF는 자체 PER보다 구성종목 가중평균 밸류에이션이 중요합니다. 이 값은 참고용으로만 사용하세요.")
-
-        if market != "US":
-            st.warning("한국 종목은 yfinance 밸류에이션 데이터가 없거나 부정확할 수 있습니다. 값이 없으면 N/A로 표시합니다.")
-
-        st.dataframe(valuation_df, use_container_width=True)
-
-        st.markdown("### MDD + Valuation 참고 해석")
-        st.write(valuation_comment)
-
-        # 5. Target Price
-        st.markdown("## Target Price(목표가 참고선)")
-        st.info("목표가는 자동 매수/매도 가격이 아닙니다. MDD 기준 가격 부담과 Valuation 기준 가격 부담을 비교하기 위한 참고선입니다.")
-
-        st.markdown("### MDD 기준 매수 목표가")
-        st.dataframe(mdd_target_df, use_container_width=True)
-
-        st.markdown("### Valuation 기준 참고 목표가")
-        st.dataframe(valuation_target_df, use_container_width=True)
-
-        st.markdown("### 목표가 참고 해석")
-        st.write(target_comment)
-
-        # 6. 현금확보 경고등
-        st.markdown("## 🚦 현금확보 경고등")
-
-        default_event_df = make_default_event_schedule()
+        default_event_df = normalize_event_schedule(make_default_event_schedule())
 
         with st.expander("일정 CSV 업로드 / 전체 일정표 보기"):
             uploaded_csv = st.file_uploader(
@@ -1335,10 +1565,10 @@ if run:
                     event_df = normalize_event_schedule(event_df)
                     st.success("업로드한 일정표를 사용합니다.")
                 except Exception:
-                    event_df = normalize_event_schedule(default_event_df)
+                    event_df = default_event_df
                     st.error("CSV 형식 오류로 기본 일정표를 사용합니다.")
             else:
-                event_df = normalize_event_schedule(default_event_df)
+                event_df = default_event_df
                 st.info("CSV가 없으므로 기본 일정표를 사용합니다.")
 
             st.dataframe(event_df, use_container_width=True)
@@ -1351,27 +1581,95 @@ if run:
         with m1:
             if st.checkbox("유가 급등"):
                 manual_score += 1
-
         with m2:
             if st.checkbox("미국 10년물 금리 급등"):
                 manual_score += 1
-
         with m3:
             if st.checkbox("좋은 뉴스에도 주가 반응 약함"):
                 manual_score += 1
-
         with m4:
             if st.checkbox("주도주 둔화"):
                 manual_score += 1
 
         cash_result = calculate_cash_warning(event_df, manual_score)
-        cash_comment = make_cash_mdd_comment(
+        cash_comment = make_cash_mdd_comment(current_dd, rsi, recovery_needed, cash_result["total_score"])
+
+        final_action, final_reason = make_final_trade_view(
+            decision,
+            cash_result,
+            matrix_decision,
             current_dd,
             rsi,
-            recovery_needed,
-            cash_result["status"],
-            cash_result["total_score"]
+            ma5,
+            current_price,
+            vol_ratio
         )
+
+        st.subheader(f"분석 대상: {display_name} / {ticker} / {market}")
+        st.write(f"종목 유형: **{asset_type}**")
+        st.write(
+            f"시장 필터: **{market_status}** / "
+            f"위험점수: **{market_risk_points:.1f}** / "
+            f"현재 적용 감점: **{market_penalty}점**"
+        )
+
+        # =================================================
+        # 1. 매매 상태판
+        # =================================================
+        st.markdown("## 1. 매매 상태판")
+
+        if final_action in ["1차 소액 가능", "확인매수 후보"]:
+            st.success(f"최종 행동: {final_action}")
+        elif final_action in ["소액만 가능", "대기"]:
+            st.info(f"최종 행동: {final_action}")
+        elif final_action in ["추격 금지", "현금확보 우선"]:
+            st.error(f"최종 행동: {final_action}")
+        else:
+            st.warning(f"최종 행동: {final_action}")
+
+        st.write(f"핵심 이유: **{final_reason}**")
+
+        s1, s2, s3, s4, s5, s6 = st.columns(6)
+        s1.metric("Current DD", f"{current_dd * 100:.2f}%")
+        s2.metric("RSI", "N/A" if pd.isna(rsi) else f"{rsi:.2f}")
+        s3.metric("MA5 상태", "회복" if pd.notna(ma5) and current_price > ma5 else "미회복")
+        s4.metric("거래량", "N/A" if pd.isna(vol_ratio) else f"{vol_ratio:.2f}x")
+        s5.metric("Event Risk", f"{cash_result['total_score']}점")
+        s6.metric("Buy Score", f"{buy_score:.0f}점")
+
+        g1, g2, g3 = st.columns(3)
+        with g1:
+            st.caption("Buy Score")
+            st.progress(min(max(int(buy_score), 0), 100))
+        with g2:
+            st.caption("RSI")
+            st.progress(0 if pd.isna(rsi) else min(max(int(rsi), 0), 100))
+        with g3:
+            st.caption("Event Risk")
+            st.progress(min(cash_result["total_score"], 5) / 5)
+
+        # =================================================
+        # 2. 권장 행동
+        # =================================================
+        st.markdown("## 2. 권장 행동")
+
+        a1, a2, a3, a4 = st.columns(4)
+        a1.metric("Entry Type", entry_type)
+        a2.metric("First Buy Ratio", f"{buy_ratio * 100:.0f}%")
+        a3.metric("Market Override", market_risk_override)
+        a4.metric("Cash Action", cash_result["final_action"])
+
+        st.write(f"확인매수 조건: **{confirm_buy_condition}**")
+
+        if recommended_buy_amount > 0:
+            st.success(f"권장 추가매수: 예정금의 {buy_ratio * 100:.0f}% ≈ {recommended_buy_amount:,.0f}")
+        else:
+            st.warning("현재 권장 추가매수는 0원 또는 대기입니다.")
+
+        # =================================================
+        # 3. 현금확보 경고등
+        # =================================================
+        st.markdown("## 3. 현금확보 경고등")
 
         wc1, wc2, wc3, wc4 = st.columns(4)
         wc1.metric("현재 상태", cash_result["status"])
@@ -1390,53 +1688,77 @@ if run:
             for msg in cash_result["warning_messages"]:
                 st.error(msg)
 
-        st.markdown("### MDD + 현금확보 경고등 참고 해석")
         st.write(cash_comment)
 
-        st.markdown("### 가까운 이벤트")
-        if cash_result["near_events"].empty:
-            st.success("앞으로 10영업일 이내 주요 일정이 없습니다.")
+        if not cash_result["near_events"].empty:
+            nearest_event = cash_result["near_events"].iloc[0]
+            st.info(
+                f"가까운 이벤트: D-{nearest_event['D-Day']} / "
+                f"{nearest_event['이벤트명']} / {nearest_event['중요도']}"
+            )
+
+        with st.expander("가까운 이벤트 표 보기"):
+            if cash_result["near_events"].empty:
+                st.success("앞으로 10영업일 이내 주요 일정이 없습니다.")
+            else:
+                st.dataframe(cash_result["near_events"], use_container_width=True)
+
+        # =================================================
+        # 4. MDD 기준 매수가 카드
+        # =================================================
+        st.markdown("## 4. MDD 기준 매수가")
+
+        mt1, mt2, mt3, mt4 = st.columns(4)
+
+        for idx, col in enumerate([mt1, mt2, mt3, mt4]):
+            row = mdd_target_df.iloc[idx]
+            with col:
+                st.metric(row["구분"], row["가격"], row["상태"])
+
+        with st.expander("MDD 기준가 상세 보기"):
+            st.dataframe(mdd_target_df, use_container_width=True)
+
+        # =================================================
+        # 5. Valuation Summary + Matrix
+        # =================================================
+        st.markdown("## 5. Valuation Summary")
+
+        st.info(valuation_summary)
+
+        if etf_flag:
+            st.warning("ETF는 자체 PER보다 구성종목 가중평균 밸류에이션이 중요합니다. 이 값은 참고용으로만 사용하세요.")
+
+        if market != "US":
+            st.warning("한국 종목은 yfinance 밸류에이션 데이터가 없거나 부정확할 수 있습니다. 값이 없으면 N/A로 표시합니다.")
+
+        v1, v2, v3, v4 = st.columns(4)
+        v1.metric("Forward P/E", format_valuation_value(valuation["forward_pe"]))
+        v2.metric("P/S", format_valuation_value(valuation["price_to_sales"]))
+        v3.metric("PEG", format_valuation_value(valuation["peg_ratio"]))
+        v4.metric("Matrix", matrix_decision)
+
+        st.markdown("### MDD + Valuation Matrix")
+        st.dataframe(matrix_df, use_container_width=True)
+        st.write(f"현재 구간: **{mdd_zone} / {valuation_zone} → {matrix_decision}**")
+        st.write(valuation_comment)
+
+        # =================================================
+        # 6. P/E Band Chart
+        # =================================================
+        st.markdown("## 6. P/E Band Chart")
+
+        if pe_band_fig is None:
+            st.info("Forward P/E 데이터가 없어 P/E Band Chart를 표시할 수 없습니다.")
         else:
-            st.dataframe(cash_result["near_events"], use_container_width=True)
+            st.pyplot(pe_band_fig)
+            st.dataframe(pe_band_df, use_container_width=True)
 
-        # 7. 물타기 후 평단
-        st.markdown("## 물타기 후 평단 시뮬레이션")
+        # =================================================
+        # 7. 차트
+        # =================================================
+        st.markdown("## 7. Price / MDD Chart")
 
-        sim = simulate_avg_price(current_price, current_qty, avg_price, recommended_buy_amount)
-
-        if sim is None:
-            st.info("보유수량과 평균단가를 입력하면 물타기 후 평단이 계산됩니다.")
-        else:
-            add_qty, total_qty, new_avg, recovery_to_new_avg = sim
-            s1, s2, s3, s4 = st.columns(4)
-            s1.metric("추가매수 수량", f"{add_qty:,.2f}")
-            s2.metric("총 보유수량", f"{total_qty:,.2f}")
-            s3.metric("새 평균단가", f"{new_avg:,.2f}")
-            s4.metric("새 평단 회복 필요", f"{recovery_to_new_avg * 100:.2f}%")
-
-        # 8. 긍정/위험 신호
-        if latest["Reasons"]:
-            st.markdown("### 긍정 신호")
-            for r in latest["Reasons"].split(" / "):
-                st.write(f"- {r}")
-
-        if latest["Danger_Reasons"]:
-            st.markdown("### 위험 신호")
-            for r in latest["Danger_Reasons"].split(" / "):
-                st.write(f"- {r}")
-
-        # 9. 시장 필터
-        st.markdown("## 시장 필터: QQQ / SOXX / NVDA / MU")
-        show_market_df = market_df.copy()
-
-        if not show_market_df.empty:
-            show_market_df["Close"] = show_market_df["Close"].apply(lambda x: None if pd.isna(x) else round(x, 2))
-            show_market_df["Current DD(%)"] = show_market_df["Current DD(%)"].apply(lambda x: None if pd.isna(x) else round(x, 2))
-            show_market_df["MA5"] = show_market_df["MA5"].apply(lambda x: None if pd.isna(x) else round(x, 2))
-            st.dataframe(show_market_df, use_container_width=True)
-
-        # 10. 차트
-        fig, axes = plt.subplots(3, 1, figsize=(14, 13), sharex=True)
+        fig, axes = plt.subplots(2, 1, figsize=(14, 10), sharex=True)
 
         axes[0].plot(df.index, df["Close"], label="Close", color="black")
         axes[0].plot(df.index, df["Peak"], label="Peak", color="blue", linestyle="--", alpha=0.7)
@@ -1467,87 +1789,119 @@ if run:
         axes[1].legend()
         axes[1].grid(True, alpha=0.3)
 
-        axes[2].plot(df.index, df["Buy_Score"], color="darkgreen", label="Buy Score")
-        axes[2].axhline(y=50, color="gray", linestyle="--", alpha=0.6, label="Watch")
-        axes[2].axhline(y=65, color="green", linestyle="--", alpha=0.8, label="Early Entry")
-        axes[2].axhline(y=80, color="orange", linestyle="--", alpha=0.8, label="Confirm Buy")
-        axes[2].set_title("Buy Score")
-        axes[2].set_ylabel("Score")
-        axes[2].set_xlabel("Date")
-        axes[2].legend()
-        axes[2].grid(True, alpha=0.3)
-
         plt.tight_layout()
         st.pyplot(fig)
 
-        # 11. 최근 데이터
-        st.markdown("## 최근 20거래일 데이터")
+        # =================================================
+        # 8. 상세 정보
+        # =================================================
+        with st.expander("Price vs EPS/Revenue Trend 보기"):
+            if market != "US":
+                st.info("한국 종목은 yfinance 재무제표 추세 데이터가 제한적이라 표시하지 않습니다.")
+            elif financial_chart is None:
+                st.info("재무제표 추세 데이터를 가져오지 못했습니다.")
+            else:
+                st.pyplot(financial_chart)
+                st.dataframe(financial_trend, use_container_width=True)
 
-        view_cols = [
-            "Close", "Peak", "Current_Drawdown", "Max_Drawdown",
-            "Recovery_To_Peak", "RSI", "Volume_Ratio",
-            "Market_Penalty", "Buy_Score", "Entry_Type",
-            "Decision", "Confirm_Buy_Condition", "Market_Risk_Override"
-        ]
+        with st.expander("Valuation 상세표 보기"):
+            st.dataframe(valuation_df, use_container_width=True)
 
-        show_df = df[view_cols].tail(20).copy()
-        show_df["Current_Drawdown"] = show_df["Current_Drawdown"] * 100
-        show_df["Max_Drawdown"] = show_df["Max_Drawdown"] * 100
-        show_df["Recovery_To_Peak"] = show_df["Recovery_To_Peak"] * 100
+        with st.expander("Valuation 기준 목표가 보기"):
+            st.dataframe(valuation_target_df, use_container_width=True)
 
-        show_df = show_df.rename(columns={
-            "Close": "Close(종가)",
-            "Peak": "Peak(기간고점)",
-            "Current_Drawdown": "Current DD(현재낙폭%)",
-            "Max_Drawdown": "Max DD(최대낙폭%)",
-            "Recovery_To_Peak": "Recovery(회복필요%)",
-            "RSI": "RSI(과매수/과매도)",
-            "Volume_Ratio": "Vol Ratio(거래량비율)",
-            "Market_Penalty": "Market Penalty(시장감점)",
-            "Buy_Score": "Buy Score(매수점수)",
-            "Entry_Type": "Entry Type(진입유형)",
-            "Decision": "Decision(판단)",
-            "Confirm_Buy_Condition": "Confirm Condition(확인조건)",
-            "Market_Risk_Override": "Market Override(시장위험보정)"
-        })
+        with st.expander("Buy Score 차트 보기"):
+            fig_score, ax_score = plt.subplots(figsize=(14, 4))
+            ax_score.plot(df.index, df["Buy_Score"], color="darkgreen", label="Buy Score")
+            ax_score.axhline(y=50, color="gray", linestyle="--", alpha=0.6, label="Watch")
+            ax_score.axhline(y=65, color="green", linestyle="--", alpha=0.8, label="Early Entry")
+            ax_score.axhline(y=80, color="orange", linestyle="--", alpha=0.8, label="Confirm Buy")
+            ax_score.set_title("Buy Score")
+            ax_score.set_ylabel("Score")
+            ax_score.set_xlabel("Date")
+            ax_score.legend()
+            ax_score.grid(True, alpha=0.3)
+            plt.tight_layout()
+            st.pyplot(fig_score)
 
-        show_df.index.name = "Date(날짜)"
-        st.dataframe(show_df, use_container_width=True)
-
-        # 12. 해석 기준
-        st.markdown("## 해석 기준")
-
-        guide_df = pd.DataFrame({
-            "항목": [
-                "Current DD",
-                "Buy Score",
-                "Valuation",
-                "Target Price",
-                "현금확보 경고등",
-                "Cash Warning Score"
-            ],
-            "의미": [
-                "기간 고점 대비 현재 낙폭",
-                "MDD·RSI·이평·거래량·시장필터 기반 매수점수",
-                "밸류 부담 참고",
-                "MDD·밸류 기준 참고 가격",
-                "다가오는 일정 기반 현금확보 필요성",
-                "자동 일정 점수 + 수동 돌발 리스크 점수"
-            ],
-            "주의점": [
-                "낙폭만으로 매수 판단 금지",
-                "절대 매수 신호 아님",
-                "Buy Score에 반영 안 됨",
-                "자동 매수 가격 아님",
-                "Buy Score에 반영 안 됨",
-                "일정표 정확도에 따라 달라짐"
+        with st.expander("최근 20거래일 데이터 보기"):
+            view_cols = [
+                "Close", "Peak", "Current_Drawdown", "Max_Drawdown",
+                "Recovery_To_Peak", "RSI", "Volume_Ratio",
+                "Market_Penalty", "Buy_Score", "Entry_Type",
+                "Decision", "Confirm_Buy_Condition", "Market_Risk_Override"
             ]
-        })
 
-        st.table(guide_df)
+            show_df = df[view_cols].tail(20).copy()
+            show_df["Current_Drawdown"] = show_df["Current_Drawdown"] * 100
+            show_df["Max_Drawdown"] = show_df["Max_Drawdown"] * 100
+            show_df["Recovery_To_Peak"] = show_df["Recovery_To_Peak"] * 100
+
+            show_df = show_df.rename(columns={
+                "Close": "Close(종가)",
+                "Peak": "Peak(기간고점)",
+                "Current_Drawdown": "Current DD(현재낙폭%)",
+                "Max_Drawdown": "Max DD(최대낙폭%)",
+                "Recovery_To_Peak": "Recovery(회복필요%)",
+                "RSI": "RSI(과매수/과매도)",
+                "Volume_Ratio": "Vol Ratio(거래량비율)",
+                "Market_Penalty": "Market Penalty(시장감점)",
+                "Buy_Score": "Buy Score(매수점수)",
+                "Entry_Type": "Entry Type(진입유형)",
+                "Decision": "Decision(판단)",
+                "Confirm_Buy_Condition": "Confirm Condition(확인조건)",
+                "Market_Risk_Override": "Market Override(시장위험보정)"
+            })
+
+            show_df.index.name = "Date(날짜)"
+            st.dataframe(show_df, use_container_width=True)
+
+        with st.expander("시장 필터 보기"):
+            show_market_df = market_df.copy()
+
+            if not show_market_df.empty:
+                show_market_df["Close"] = show_market_df["Close"].apply(lambda x: None if pd.isna(x) else round(x, 2))
+                show_market_df["Current DD(%)"] = show_market_df["Current DD(%)"].apply(lambda x: None if pd.isna(x) else round(x, 2))
+                show_market_df["MA5"] = show_market_df["MA5"].apply(lambda x: None if pd.isna(x) else round(x, 2))
+                st.dataframe(show_market_df, use_container_width=True)
+
+        with st.expander("해석 기준 보기"):
+            guide_df = pd.DataFrame({
+                "항목": [
+                    "Current DD",
+                    "RSI",
+                    "MA5 상태",
+                    "Volume Ratio",
+                    "Event Risk",
+                    "Valuation Matrix",
+                    "P/E Band",
+                    "Price vs Fundamentals"
+                ],
+                "매매 활용": [
+                    "낙폭이 충분한지 확인",
+                    "과매도/과열 확인",
+                    "선진입과 확인매수 구분",
+                    "반등 신뢰도 확인",
+                    "추가매수 중단·현금확보 판단",
+                    "MDD와 밸류 부담 결합 판단",
+                    "현재 주가가 밸류 밴드상 어디인지 확인",
+                    "주가 상승이 실적 성장으로 정당화되는지 확인"
+                ],
+                "주의점": [
+                    "낙폭만으로 매수 금지",
+                    "RSI 과매도는 더 빠질 수 있음",
+                    "장중 회복보다 종가 확인 우선",
+                    "거래량 증가 음봉은 위험",
+                    "Buy Score에 직접 반영하지 않음",
+                    "밸류 데이터 없으면 판단 제한",
+                    "Forward P/E 기반 단순 환산",
+                    "yfinance 재무 데이터 누락 가능"
+                ]
+            })
+            st.table(guide_df)
 
         st.warning(
             "주의: 이 도구는 매수 판단 보조용입니다. "
-            "현금확보 경고등은 Buy Score를 바꾸지 않습니다. "
-            "다가오는 이벤트·수급 일정·매크로 리스크를 확인해 추가매수 중단 또는 현금확보 필요성을 참고하는 용도입니다."
+            "Valuation, P/E Band, 현금확보 경고등은 Buy Score를 바꾸지 않습니다. "
+            "주가가 올랐더라도 실적 성장으로 밸류가 낮아질 수 있고, 반대로 낙폭이 커도 밸류 부담이 여전히 클 수 있습니다."
         )
