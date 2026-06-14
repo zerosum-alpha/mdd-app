@@ -19,7 +19,7 @@ from auth import require_login, logout_button
 # + Valuation Summary
 # + P/E Band Chart
 # + KR Price vs PER/PBR/EPS Trend
-# + US Price vs estimated TTM P/E Trend
+# + US Price vs estimated TTM P/E Trend separated chart
 # + MDD + Valuation Matrix
 # + Target Price
 # + Cash Warning Light
@@ -710,9 +710,17 @@ def make_financial_trend_chart(fin_trend_df, ticker):
 
 def make_price_pe_trend_chart(fin_trend_df, valuation, ticker):
     """
-    Price + estimated TTM P/E chart.
-    - 주가와 PER을 같은 날짜축에서 같이 보여준다.
-    - 주가가 상승하는데 PER이 하락하는지 확인하는 목적.
+    US 종목용 Price vs Estimated TTM P/E 차트.
+
+    한국 종목의 Price vs PER 차트와 유사하게,
+    - 위 패널: Price
+    - 아래 패널: Estimated TTM P/E + 평균/±1SD/±2SD + 현재 Forward P/E 참고선
+    으로 분리해서 표시한다.
+
+    주의:
+    - 이 값은 FactSet식 12개월 Forward P/E 시계열이 아니다.
+    - yfinance 재무제표 기반 Estimated TTM P/E다.
+    - 하지만 "주가가 오르는데 P/E가 낮아지는지"는 판단 가능하다.
     """
     if fin_trend_df is None or fin_trend_df.empty:
         return None, pd.DataFrame()
@@ -727,50 +735,65 @@ def make_price_pe_trend_chart(fin_trend_df, valuation, ticker):
     chart_df["pe_ttm"] = pd.to_numeric(chart_df["pe_ttm"], errors="coerce")
 
     chart_df = chart_df.dropna(subset=["date", "price", "pe_ttm"]).copy()
-    chart_df = chart_df[(chart_df["price"] > 0) & (chart_df["pe_ttm"] > 0) & (chart_df["pe_ttm"] < 300)].copy()
+    chart_df = chart_df[
+        (chart_df["price"] > 0)
+        & (chart_df["pe_ttm"] > 0)
+        & (chart_df["pe_ttm"] < 300)
+    ].copy()
     chart_df = chart_df.sort_values("date")
 
     if chart_df.empty or len(chart_df) < 20:
         return None, chart_df
 
-    chart_df = make_monthly_view(chart_df)
+    # 보기 쉽게 월말 기준. 데이터가 부족하면 주간 기준으로 대체.
+    plot_df = make_monthly_view(chart_df)
+    if plot_df.empty or len(plot_df) < 6:
+        plot_df = chart_df.copy()
 
-    if chart_df.empty or len(chart_df) < 4:
-        return None, chart_df
+    if plot_df.empty or len(plot_df) < 4:
+        return None, plot_df
 
-    fig, ax_price = plt.subplots(figsize=(13, 5.8))
+    fig = plt.figure(figsize=(13.5, 7.2))
+    gs = fig.add_gridspec(4, 1, hspace=0.10)
 
-    ax_price.plot(chart_df["date"], chart_df["price"], marker="o", label="Price", linewidth=2)
+    ax_price = fig.add_subplot(gs[0:3, 0])
+    ax_pe = fig.add_subplot(gs[3, 0], sharex=ax_price)
+
+    # 상단: 주가
+    ax_price.plot(plot_df["date"], plot_df["price"], label="Price", linewidth=2)
+    ax_price.set_title(f"{ticker} Price vs Estimated TTM P/E")
     ax_price.set_ylabel("Price")
     ax_price.grid(True, alpha=0.3)
+    ax_price.legend(loc="upper left")
 
-    ax_pe = ax_price.twinx()
-    ax_pe.plot(chart_df["date"], chart_df["pe_ttm"], marker="o", linestyle="--", label="Estimated TTM P/E", linewidth=2)
-    ax_pe.set_ylabel("Estimated TTM P/E")
+    # 하단: P/E
+    ax_pe.plot(plot_df["date"], plot_df["pe_ttm"], label="Estimated TTM P/E", linewidth=2)
+    ax_pe.set_ylabel("P/E")
+    ax_pe.grid(True, alpha=0.3)
 
-    pe_mean = chart_df["pe_ttm"].mean()
-    pe_std = chart_df["pe_ttm"].std()
+    pe_mean = plot_df["pe_ttm"].mean()
+    pe_std = plot_df["pe_ttm"].std()
 
     if is_valid_number(pe_mean):
-        ax_pe.axhline(pe_mean, linestyle="-", alpha=0.35, label="P/E avg")
+        ax_pe.axhline(pe_mean, linestyle="-", alpha=0.45, label="P/E avg")
 
     if is_valid_number(pe_std) and pe_std > 0:
-        ax_pe.axhline(pe_mean + pe_std, linestyle=":", alpha=0.35, label="P/E +1SD")
-        ax_pe.axhline(max(pe_mean - pe_std, 0), linestyle=":", alpha=0.35, label="P/E -1SD")
+        ax_pe.axhline(pe_mean + pe_std, linestyle=":", alpha=0.45, label="P/E +1SD")
+        ax_pe.axhline(max(pe_mean - pe_std, 0), linestyle=":", alpha=0.45, label="P/E -1SD")
+        ax_pe.axhline(pe_mean + 2 * pe_std, linestyle="-.", alpha=0.28, label="P/E +2SD")
+        ax_pe.axhline(max(pe_mean - 2 * pe_std, 0), linestyle="-.", alpha=0.28, label="P/E -2SD")
 
     current_forward_pe = valuation.get("forward_pe") if isinstance(valuation, dict) else None
     if is_valid_number(current_forward_pe) and float(current_forward_pe) > 0:
-        ax_pe.axhline(float(current_forward_pe), linestyle="--", alpha=0.25, label="Current forward P/E")
+        ax_pe.axhline(float(current_forward_pe), linestyle="--", alpha=0.35, label="Current forward P/E")
 
-    ax_price.set_title(f"{ticker} Price vs Estimated TTM P/E")
+    ax_pe.legend(loc="upper left", fontsize=8)
 
-    lines1, labels1 = ax_price.get_legend_handles_labels()
-    lines2, labels2 = ax_pe.get_legend_handles_labels()
-    ax_price.legend(lines1 + lines2, labels1 + labels2, loc="best")
+    # 상단 x축 라벨 겹침 방지
+    plt.setp(ax_price.get_xticklabels(), visible=False)
 
     plt.tight_layout()
-    return fig, chart_df
-
+    return fig, plot_df
 
 def make_price_pe_comment(price_pe_df):
     if price_pe_df is None or price_pe_df.empty or not {"date", "price", "pe_ttm"}.issubset(set(price_pe_df.columns)):
@@ -2374,7 +2397,7 @@ if run:
                     st.dataframe(show_kr_df[cols].tail(120), use_container_width=True)
 
         elif market == "US":
-            st.caption("미국 종목은 yfinance 재무제표 기반 추정 TTM P/E를 사용합니다. FactSet식 12개월 Forward P/E 시계열은 아닙니다.")
+            st.caption("미국 종목은 yfinance 재무제표 기반 Estimated TTM P/E를 사용합니다. 한국 종목처럼 상단 Price / 하단 P/E로 분리 표시합니다. FactSet식 12개월 Forward P/E 시계열은 아닙니다.")
             if price_pe_chart is None:
                 st.warning(price_pe_comment)
                 if not price_pe_df.empty:
