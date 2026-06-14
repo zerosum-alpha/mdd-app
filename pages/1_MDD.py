@@ -4,6 +4,9 @@ warnings.filterwarnings("ignore")
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 import re
+import zipfile
+import io
+import xml.etree.ElementTree as ET
 
 import numpy as np
 import pandas as pd
@@ -545,6 +548,200 @@ def merge_actual_and_proxy_per(actual_df, proxy_df):
     out = out.loc[:, ~out.columns.duplicated()]
     return out.sort_index()
 
+
+# =========================================================
+# DART-based KR actual TTM PER
+# =========================================================
+def clean_amount(x):
+    try:
+        if x is None or pd.isna(x):
+            return None
+        s = str(x).replace(",", "").replace(" ", "").strip()
+        if s in ["", "-", "—"]:
+            return None
+        # Korean negative format may be (123)
+        if s.startswith("(") and s.endswith(")"):
+            s = "-" + s[1:-1]
+        return float(s)
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def dart_corp_code_map(api_key):
+    """Return stock_code -> corp_code mapping from OpenDART corpCode.xml."""
+    if not api_key or not REQ_OK:
+        return {}, "DART key 또는 requests 없음"
+    try:
+        url = "https://opendart.fss.or.kr/api/corpCode.xml"
+        r = requests.get(url, params={"crtfc_key": api_key}, timeout=12)
+        if r.status_code != 200:
+            return {}, f"corpCode HTTP {r.status_code}"
+        z = zipfile.ZipFile(io.BytesIO(r.content))
+        xml_name = z.namelist()[0]
+        root = ET.fromstring(z.read(xml_name))
+        mp = {}
+        for item in root.findall("list"):
+            corp_code = (item.findtext("corp_code") or "").strip()
+            stock_code = (item.findtext("stock_code") or "").strip()
+            if corp_code and stock_code:
+                mp[stock_code.zfill(6)] = corp_code
+        if not mp:
+            return {}, "corpCode mapping empty"
+        return mp, "OK"
+    except Exception as e:
+        return {}, f"corpCode error: {repr(e)}"
+
+
+def _pick_eps_from_dart_list(items):
+    """Pick EPS from DART account rows. Prefer basic EPS, then diluted EPS."""
+    if not items:
+        return None, "no list"
+    rows = []
+    for it in items:
+        acc_id = str(it.get("account_id", ""))
+        acc_nm = str(it.get("account_nm", ""))
+        sj_nm = str(it.get("sj_nm", ""))
+        amount = clean_amount(it.get("thstrm_amount"))
+        if amount is None:
+            continue
+        key = (acc_id + " " + acc_nm).lower()
+        score = 0
+        # Korean labels vary; keep broad but prefer exact EPS rows.
+        if "주당" in acc_nm and "이익" in acc_nm:
+            score += 10
+        if "기본" in acc_nm:
+            score += 5
+        if "희석" in acc_nm:
+            score += 3
+        if "basic" in key and "earnings" in key and "share" in key:
+            score += 8
+        if "diluted" in key and "earnings" in key and "share" in key:
+            score += 6
+        if "eps" in key:
+            score += 4
+        # Exclude continuing-operation-only EPS when possible.
+        if "계속" in acc_nm or "continuing" in key:
+            score -= 3
+        if score > 0:
+            rows.append((score, amount, acc_id, acc_nm, sj_nm))
+    if not rows:
+        return None, "EPS row not found"
+    rows.sort(key=lambda x: x[0], reverse=True)
+    score, amount, acc_id, acc_nm, sj_nm = rows[0]
+    return amount, f"{acc_nm} / {acc_id}"
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def dart_kr_ttm_pe_series(code, price_df, start_date, end_date, api_key):
+    """Build actual-style daily PER for KR stocks using DART quarterly cumulative EPS.
+
+    This is the correct way to see whether price rises while P/E falls when KRX PER series is unavailable.
+    It requires a DART API key. It is still historical trailing P/E, not 12M forward consensus P/E.
+    """
+    if not api_key:
+        return pd.DataFrame(), "DART key 없음: 실제 EPS 기반 한국 PER 계산 불가"
+    code = str(code).zfill(6)
+    mp, mp_status = dart_corp_code_map(api_key)
+    corp_code = mp.get(code)
+    if not corp_code:
+        return pd.DataFrame(), f"DART corp_code 없음: {mp_status}"
+
+    # Need at least previous fiscal year to calculate rolling 4 quarters.
+    start_y = pd.to_datetime(start_date).year - 1
+    end_y = pd.to_datetime(end_date).year
+    report_map = {
+        "11013": ("Q1", 1, "05-15"),
+        "11012": ("H1", 2, "08-15"),
+        "11014": ("Q3", 3, "11-15"),
+        "11011": ("A", 4, "03-31"),
+    }
+    cum_rows = []
+    errors = []
+    for year in range(start_y, end_y + 1):
+        for reprt_code, (label, q, md) in report_map.items():
+            try:
+                url = "https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json"
+                params = {
+                    "crtfc_key": api_key,
+                    "corp_code": corp_code,
+                    "bsns_year": str(year),
+                    "reprt_code": reprt_code,
+                    "fs_div": "CFS",
+                }
+                res = requests.get(url, params=params, timeout=10).json()
+                if res.get("status") != "000":
+                    # Try separate financial statements only if consolidated unavailable.
+                    params["fs_div"] = "OFS"
+                    res = requests.get(url, params=params, timeout=10).json()
+                if res.get("status") != "000":
+                    errors.append(f"{year}-{label}:{res.get('status')} {res.get('message','')[:40]}")
+                    continue
+                eps, eps_src = _pick_eps_from_dart_list(res.get("list", []))
+                if eps is None:
+                    errors.append(f"{year}-{label}:{eps_src}")
+                    continue
+                # Report availability date approximation; sufficient for chart alignment.
+                if label == "A":
+                    avail_date = pd.Timestamp(year=year + 1, month=3, day=31)
+                else:
+                    month, day = map(int, md.split("-"))
+                    avail_date = pd.Timestamp(year=year, month=month, day=day)
+                cum_rows.append({
+                    "year": year,
+                    "q": q,
+                    "label": label,
+                    "Date": avail_date,
+                    "EPS_CUM": eps,
+                    "EPS_SOURCE": eps_src,
+                })
+            except Exception as e:
+                errors.append(f"{year}-{label}:{type(e).__name__} {str(e)[:50]}")
+
+    if len(cum_rows) < 4:
+        return pd.DataFrame(), "DART EPS 데이터 부족: " + " / ".join(errors[:5])
+
+    cum = pd.DataFrame(cum_rows).sort_values(["year", "q"])
+    q_rows = []
+    for year, g in cum.groupby("year"):
+        g = g.set_index("q").sort_index()
+        prev_cum = 0.0
+        for q in [1, 2, 3, 4]:
+            if q not in g.index:
+                continue
+            eps_cum = safe_float(g.loc[q, "EPS_CUM"])
+            if eps_cum is None:
+                continue
+            q_eps = eps_cum - prev_cum
+            prev_cum = eps_cum
+            q_rows.append({
+                "Date": g.loc[q, "Date"],
+                "EPS_Q": q_eps,
+                "EPS_CUM": eps_cum,
+                "EPS_SOURCE": g.loc[q, "EPS_SOURCE"],
+            })
+    if len(q_rows) < 4:
+        return pd.DataFrame(), "DART quarterly EPS 계산 부족"
+
+    qdf = pd.DataFrame(q_rows).sort_values("Date")
+    qdf["EPS_TTM"] = qdf["EPS_Q"].rolling(4).sum()
+    qdf = qdf.dropna(subset=["EPS_TTM"])
+    qdf = qdf[qdf["EPS_TTM"] > 0]
+    if qdf.empty:
+        return pd.DataFrame(), "DART EPS_TTM empty"
+
+    daily = price_df[["Close"]].reset_index()
+    daily.columns = ["Date", "Close"]
+    daily["Date"] = to_dt_index(daily["Date"]).normalize()
+    qdf["Date"] = to_dt_index(qdf["Date"]).normalize()
+    merged = pd.merge_asof(daily.sort_values("Date"), qdf[["Date", "EPS_TTM"]].sort_values("Date"), on="Date", direction="backward")
+    merged["PER"] = merged["Close"] / merged["EPS_TTM"].replace(0, np.nan)
+    merged = merged[(merged["PER"] > 0) & (merged["PER"] < 500)].dropna(subset=["PER"])
+    if merged.empty:
+        return pd.DataFrame(), "DART PER 계산 결과 empty"
+    out = merged.set_index("Date")[["PER", "EPS_TTM"]]
+    return out, "OK: DART actual TTM P/E"
+
 # =========================================================
 # Market risk
 # =========================================================
@@ -836,6 +1033,14 @@ with c2:
 with c3:
     asset_type = st.selectbox("종목 유형", ["일반 주식/ETF", "나스닥형 ETF", "반도체/메모리 ETF", "전력/인프라 ETF", "우주/소형 테마"])
 
+try:
+    dart_secret = st.secrets.get("DART_API_KEY", "")
+except Exception:
+    dart_secret = ""
+with st.expander("한국 실제 PER 설정", expanded=False):
+    st.caption("한국 종목에서 pykrx PER 시계열이 안 잡힐 때, DART 분기 EPS로 TTM P/E를 계산합니다. Naver 현재 EPS proxy와 달리 EPS가 분기별로 변합니다.")
+    dart_key_input = st.text_input("DART API Key", value=dart_secret, type="password")
+
 run = st.button("분석 실행")
 
 if run:
@@ -866,17 +1071,28 @@ if run:
     else:
         val, val_status = naver_current_per(ticker)
         actual_per_df, actual_per_status = kr_per_series_nohang(ticker, start_date, last_price_date, timeout_sec=7)
-        # If KRX PER series returns EPS only, compute actual-style PER from that EPS.
+
+        # If pykrx returns EPS without PER, calculate PER from that historical EPS.
         if not actual_per_df.empty and "PER" not in actual_per_df.columns and "EPS" in actual_per_df.columns:
             tmp = df[["Close"]].join(actual_per_df[["EPS"]], how="left")
             tmp["EPS"] = tmp["EPS"].ffill()
             tmp["PER"] = tmp["Close"] / tmp["EPS"].replace(0, np.nan)
             actual_per_df = tmp[["PER", "EPS"]].dropna()
+
+        # If pykrx actual PER is unavailable, use DART quarterly EPS TTM.
+        dart_status = "DART not used"
+        if actual_per_df.empty or "PER" not in actual_per_df.columns or actual_per_df["PER"].dropna().empty:
+            dart_per_df, dart_status = dart_kr_ttm_pe_series(ticker, df, start_date, last_price_date, dart_key_input)
+            if dart_per_df is not None and not dart_per_df.empty:
+                actual_per_df = dart_per_df
+                actual_per_status = dart_status
+
+        # Current EPS proxy is only a fallback reference, not actual valuation trend.
         proxy_df, proxy_status = build_per_proxy_from_current(
             df, latest["Close"], current_pe=val.get("ttm_pe"), current_eps=val.get("eps"), label="KR current EPS-implied"
         )
         per_df = merge_actual_and_proxy_per(actual_per_df, proxy_df)
-        per_status = f"Actual: {actual_per_status} / Full-view proxy: {proxy_status}"
+        per_status = f"Actual: {actual_per_status} / DART: {dart_status} / Proxy: {proxy_status}"
 
     risk_df, risk_label = market_risk_series(market, ticker, start_date)
 
