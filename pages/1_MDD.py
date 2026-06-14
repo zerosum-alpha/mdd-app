@@ -2579,16 +2579,14 @@ if run:
             price_pe_comment = make_price_pe_comment(price_pe_df)
             financial_chart = make_financial_trend_chart(financial_trend, ticker)
 
-            # yfinance가 EPS TTM 원자료를 충분히 주지 않으면, 현재 Forward/Trailing P/E 기반 fallback 차트를 표시
+            # 중요: 현재 Forward/Trailing P/E로 EPS를 고정 역산한 Price-implied P/E는 표시하지 않는다.
+            # 그 방식은 주가를 그대로 따라가는 가짜 P/E라서 매매 판단을 왜곡한다.
             if price_pe_chart is None:
-                fallback_df, fallback_comment = make_us_price_implied_pe_series(df, current_price, valuation)
-                fallback_chart, fallback_plot_df = make_us_price_pe_like_kr_chart(fallback_df, ticker, "Price-implied P/E")
-                if fallback_chart is not None:
-                    price_pe_chart = fallback_chart
-                    price_pe_df = fallback_plot_df
-                    price_pe_comment = fallback_comment
-                elif fallback_comment:
-                    price_pe_comment = fallback_comment
+                price_pe_comment = (
+                    "미국 종목의 실제 TTM P/E 추세 차트를 만들 분기 EPS 데이터가 부족합니다. "
+                    "현재 Forward P/E, Trailing P/E, P/S 요약만 참고하세요. "
+                    "Price-implied P/E는 주가를 따라 움직이는 가짜 P/E라 표시하지 않습니다."
+                )
         elif market == "KR":
             kr_valuation_trend = make_kr_price_valuation_df(ticker, start_date, df)
             kr_price_per_chart, kr_price_per_plot_df = make_kr_price_per_chart(kr_valuation_trend, ticker)
@@ -2842,18 +2840,19 @@ if run:
                     st.dataframe(show_kr_df[cols].tail(120), use_container_width=True)
 
         elif market == "US":
-            st.caption("미국 종목은 주가와 P/E를 한 차트에 겹쳐 표시합니다. 왼쪽 축은 Price, 오른쪽 축은 P/E입니다. 우선 yfinance 재무제표 기반 Estimated TTM P/E를 사용하고, 데이터가 부족하면 현재 Forward/Trailing P/E로 역산한 Price-implied P/E를 표시합니다. FactSet식 12개월 Forward P/E 시계열은 아닙니다.")
+            st.caption("미국 종목은 실제 EPS TTM 데이터가 충분할 때만 Price + Estimated TTM P/E를 한 차트에 겹쳐 표시합니다. 왼쪽 축은 Price, 오른쪽 축은 P/E입니다. 현재 Forward/Trailing P/E를 고정 EPS로 역산한 Price-implied P/E는 주가를 따라 움직이는 가짜 P/E라 표시하지 않습니다. FactSet식 12개월 Forward P/E 시계열은 아닙니다.")
             if price_pe_chart is None:
                 st.warning(price_pe_comment)
                 if not price_pe_df.empty:
-                    st.caption("아래는 yfinance에서 계산 가능한 원자료입니다. 점이 너무 적으면 추세 차트로 쓰지 않습니다.")
+                    st.caption("아래는 yfinance에서 계산 가능한 원자료입니다. 데이터가 충분하지 않으면 P/E 추세 차트로 쓰지 않습니다.")
                     show_price_pe_df = price_pe_df.copy()
                     show_price_pe_df["date"] = pd.to_datetime(show_price_pe_df["date"]).dt.strftime("%Y-%m-%d")
                     for col in ["price", "eps_ttm", "pe_ttm"]:
                         if col in show_price_pe_df.columns:
                             show_price_pe_df[col] = show_price_pe_df[col].apply(lambda x: None if pd.isna(x) else round(float(x), 2))
                     with st.expander("Price + P/E 원자료 보기"):
-                        st.dataframe(show_price_pe_df[["date", "price", "eps_ttm", "pe_ttm"]], use_container_width=True)
+                        cols = [c for c in ["date", "price", "eps_ttm", "pe_ttm", "source"] if c in show_price_pe_df.columns]
+                        st.dataframe(show_price_pe_df[cols], use_container_width=True)
             else:
                 st.pyplot(price_pe_chart)
                 st.write(price_pe_comment)
@@ -2865,7 +2864,8 @@ if run:
                         show_price_pe_df[col] = show_price_pe_df[col].apply(lambda x: None if pd.isna(x) else round(float(x), 2))
 
                 with st.expander("Price + P/E 데이터 보기"):
-                    st.dataframe(show_price_pe_df[["date", "price", "eps_ttm", "pe_ttm"]], use_container_width=True)
+                    cols = [c for c in ["date", "price", "eps_ttm", "pe_ttm", "source"] if c in show_price_pe_df.columns]
+                    st.dataframe(show_price_pe_df[cols], use_container_width=True)
         else:
             st.info("P/E 추세 차트를 표시할 수 없습니다.")
 
