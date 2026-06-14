@@ -372,21 +372,40 @@ def load_vix(start_date):
 # =========================================================
 # Signals / Decision
 # =========================================================
+def _first_signal_with_gap(condition, min_gap=20):
+    """연속 신호가 차트를 뒤덮지 않도록 최소 간격을 둔다."""
+    result = pd.Series(False, index=condition.index)
+    last_idx = -10_000
+    values = condition.fillna(False).to_numpy()
+
+    for i, flag in enumerate(values):
+        if flag and i - last_idx >= min_gap:
+            result.iloc[i] = True
+            last_idx = i
+    return result
+
+
 def build_signals(df):
     sig = df.copy()
+
+    # 매수 후보: 깊은 MDD + 과매도 + 단기 추세 아래쪽. 신호는 참고 마커일 뿐 Buy Score를 바꾸지 않는다.
     sig["Buy_Signal"] = (
         (sig["Current_Drawdown"] <= -0.12) &
         (sig["RSI"] <= 40) &
-        (sig["Close"] <= sig["MA20"] * 1.03)
-    )
-    sig["Cash_Signal"] = (
-        ((sig["Current_Drawdown"] >= -0.03) & (sig["RSI"] >= 65)) |
-        ((sig["Close"] >= sig["Peak"] * 0.99) & (sig["RSI"] >= 60))
+        (sig["Close"] <= sig["MA20"] * 1.02)
     )
 
-    # 연속 신호 방지: 연속 구간 첫 날만 표시
-    sig["Buy_Display"] = sig["Close"].where(sig["Buy_Signal"] & ~sig["Buy_Signal"].shift(1).fillna(False))
-    sig["Cash_Display"] = sig["Close"].where(sig["Cash_Signal"] & ~sig["Cash_Signal"].shift(1).fillna(False))
+    # 현금확보 후보: 전고점 근처 + 과열. 너무 자주 찍히지 않도록 간격 필터를 적용한다.
+    sig["Cash_Signal"] = (
+        ((sig["Current_Drawdown"] >= -0.03) & (sig["RSI"] >= 70)) |
+        ((sig["Close"] >= sig["Peak"] * 0.99) & (sig["RSI"] >= 65))
+    )
+
+    buy_mark = _first_signal_with_gap(sig["Buy_Signal"], min_gap=20)
+    cash_mark = _first_signal_with_gap(sig["Cash_Signal"], min_gap=20)
+
+    sig["Buy_Display"] = sig["Close"].where(buy_mark)
+    sig["Cash_Display"] = sig["Close"].where(cash_mark)
     return sig[["Buy_Display", "Cash_Display"]]
 
 
@@ -412,7 +431,7 @@ def make_core_action(latest, per_available):
 # =========================================================
 # Chart
 # =========================================================
-def plot_core_dashboard(df, per_df, vix_df, signal_df, title):
+def plot_core_dashboard(df, per_df, vix_df, signal_df, title, valuation=None):
     df = df.copy()
     df.index = to_datetime_ns_index(df.index)
     chart = df[["Close", "MA20", "MA60", "MA200", "Current_Drawdown"]].copy()
@@ -457,7 +476,7 @@ def plot_core_dashboard(df, per_df, vix_df, signal_df, title):
     if "Buy_Display" in chart.columns:
         ax1.scatter(chart.index, chart["Buy_Display"] * 0.97, color="green", marker="^", s=110, zorder=5, label="BUY candidate")
     if "Cash_Display" in chart.columns:
-        ax1.scatter(chart.index, chart["Cash_Display"] * 1.03, color="red", marker="v", s=110, zorder=5, label="Cash / overheat")
+        ax1.scatter(chart.index, chart["Cash_Display"] * 1.03, color="red", marker="v", s=110, zorder=5, label="Cash candidate")
 
     ax2 = ax1.twinx()
     if chart["PER"].dropna().empty:
@@ -467,8 +486,21 @@ def plot_core_dashboard(df, per_df, vix_df, signal_df, title):
         per_valid = chart["PER"].dropna()
         if len(per_valid) >= 20:
             per_avg = per_valid.mean()
-            ax2.axhline(per_avg, color="crimson", linestyle="--", alpha=0.35, linewidth=1.0, label="P/E avg")
-    ax2.set_ylabel("P/E", color="crimson")
+            ax2.axhline(per_avg, color="crimson", linestyle="--", alpha=0.35, linewidth=1.0, label="TTM P/E avg")
+
+        # 현재 Forward P/E는 과거 시계열이 아니라 현재 기준선이다.
+        if valuation:
+            fpe = valuation.get("forward_pe")
+            tpe = valuation.get("trailing_pe")
+            try:
+                if fpe is not None and pd.notna(fpe) and float(fpe) > 0:
+                    ax2.axhline(float(fpe), color="black", linestyle="-.", alpha=0.65, linewidth=1.0, label="Current forward P/E")
+                if tpe is not None and pd.notna(tpe) and float(tpe) > 0:
+                    ax2.axhline(float(tpe), color="crimson", linestyle=":", alpha=0.55, linewidth=1.0, label="Current trailing P/E")
+            except Exception:
+                pass
+
+    ax2.set_ylabel("TTM P/E", color="crimson")
     ax2.tick_params(axis="y", labelcolor="crimson")
 
     ax1.set_title(title, fontsize=14, fontweight="bold")
@@ -564,17 +596,27 @@ if run:
     # Main chart
     # =====================================================
     st.markdown("## 핵심 차트: Price + P/E + MDD + VIX")
-    st.caption("상단: 주가·이평선·PER·매수/현금화 후보 / 하단: MDD·VIX")
+    st.caption("상단: 주가·이평선·추정 TTM P/E·현재 Forward P/E 기준선 / 하단: MDD·VIX")
 
     chart_title = f"{ticker} Price + P/E + MDD + VIX"
-    plot_core_dashboard(df, per_df, vix_df, signal_df, chart_title)
+    plot_core_dashboard(df, per_df, vix_df, signal_df, chart_title, valuation)
+
+    if market == "US":
+        st.caption(
+            "미국 종목 차트의 빨간 P/E 선은 과거 4분기 EPS로 계산한 Estimated TTM P/E입니다. "
+            "Forward P/E는 현재 컨센서스 기준값이라 과거 시계열이 아니며, 차트에서는 검은 점선 기준선으로만 표시합니다."
+        )
+    elif market == "KR":
+        st.caption(
+            "한국 종목 차트의 P/E는 pykrx/KRX 기반 과거 P/E입니다. 증권사 리포트의 12개월 예상 PER과는 다를 수 있습니다."
+        )
 
     # =====================================================
     # Current valuation
     # =====================================================
     st.markdown("## 현재 Valuation")
     v1, v2, v3, v4 = st.columns(4)
-    v1.metric("Trailing / KRX P/E", fmt_num(valuation.get("trailing_pe")))
+    v1.metric("TTM/KRX P/E", fmt_num(valuation.get("trailing_pe")))
     v2.metric("Forward P/E", fmt_num(valuation.get("forward_pe")))
     v3.metric("P/S", fmt_num(valuation.get("price_to_sales")))
     v4.metric("PEG", fmt_num(valuation.get("peg_ratio")))
