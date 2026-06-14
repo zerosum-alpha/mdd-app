@@ -529,16 +529,33 @@ def build_per_proxy_from_current(price_df, current_price, current_pe=None, curre
     return out[["PER_PROXY", "EPS_PROXY"]], f"OK: {label} P/E proxy using EPS {eps_ref:.4f}"
 
 
+def normalize_time_index(df):
+    """Return DataFrame with a clean datetime64[ns] index.
+    Handles both index-based Date and a real 'Date' column.
+    """
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    if "Date" in out.columns:
+        out["Date"] = to_dt_index(out["Date"])
+        out = out.set_index("Date")
+    else:
+        out.index = to_dt_index(out.index)
+    out = out[~out.index.isna()]
+    out = out.sort_index()
+    return out
+
+
 def merge_actual_and_proxy_per(actual_df, proxy_df):
     frames = []
     if actual_df is not None and not actual_df.empty:
-        a = actual_df.copy()
-        a.index = to_dt_index(a.index)
-        frames.append(a)
+        a = normalize_time_index(actual_df)
+        if not a.empty:
+            frames.append(a)
     if proxy_df is not None and not proxy_df.empty:
-        p = proxy_df.copy()
-        p.index = to_dt_index(p.index)
-        frames.append(p)
+        p = normalize_time_index(proxy_df)
+        if not p.empty:
+            frames.append(p)
     if not frames:
         return pd.DataFrame()
     out = pd.concat(frames, axis=1)
@@ -569,30 +586,41 @@ def market_risk_series(market, ticker, start_date):
 def plot_core_chart(df, per_df, risk_df, risk_label, ticker):
     chart = df[["Close", "MA20", "MA60", "MA200", "Current_Drawdown"]].copy()
     chart = chart.rename(columns={"Close": "Price", "Current_Drawdown": "DD"})
+    chart.index = to_dt_index(chart.index)
 
+    # P/E input can be actual PER or full-view PER_PROXY.
     if per_df is not None and not per_df.empty:
-        p = per_df.copy()
-        p.index = to_dt_index(p.index)
+        p = normalize_time_index(per_df)
         join_cols = [c for c in ["PER", "PER_PROXY", "EPS", "EPS_TTM", "EPS_PROXY"] if c in p.columns]
         if join_cols:
             chart = chart.join(p[join_cols], how="left")
-        if "PER" in chart.columns:
-            chart["PER"] = chart["PER"].ffill()
-        if "PER_PROXY" in chart.columns:
-            chart["PER_PROXY"] = chart["PER_PROXY"].ffill()
-        if "PER" not in chart.columns and "EPS" in chart.columns:
-            chart["EPS"] = chart["EPS"].ffill()
-            chart["PER"] = chart["Price"] / chart["EPS"].replace(0, np.nan)
+
+    # Forward-fill sparse or monthly PER values onto daily price dates.
+    for col in ["PER", "PER_PROXY", "EPS", "EPS_TTM", "EPS_PROXY"]:
+        if col in chart.columns:
+            chart[col] = pd.to_numeric(chart[col], errors="coerce").ffill()
+
+    # If only EPS exists, calculate PER from daily price.
+    if "PER" not in chart.columns and "EPS" in chart.columns:
+        chart["PER"] = chart["Price"] / chart["EPS"].replace(0, np.nan)
+
     if "PER" not in chart.columns:
         chart["PER"] = np.nan
     if "PER_PROXY" not in chart.columns:
         chart["PER_PROXY"] = np.nan
 
+    # Explicit display line: actual first, proxy second.
+    chart["PER_DISPLAY"] = chart["PER"]
+    proxy_mask = chart["PER_DISPLAY"].isna() & chart["PER_PROXY"].notna()
+    chart.loc[proxy_mask, "PER_DISPLAY"] = chart.loc[proxy_mask, "PER_PROXY"]
+
     if risk_df is not None and not risk_df.empty:
-        r = risk_df.copy()
-        r.index = to_dt_index(r.index)
-        chart = chart.join(r[["Risk"]], how="left")
-        chart["Risk"] = chart["Risk"].ffill()
+        r = normalize_time_index(risk_df)
+        if "Risk" in r.columns:
+            chart = chart.join(r[["Risk"]], how="left")
+            chart["Risk"] = pd.to_numeric(chart["Risk"], errors="coerce").ffill()
+        else:
+            chart["Risk"] = np.nan
     else:
         chart["Risk"] = np.nan
 
@@ -600,35 +628,43 @@ def plot_core_chart(df, per_df, risk_df, risk_label, ticker):
     chart = chart.join(sig, how="left")
 
     fig, (ax1, ax3) = plt.subplots(
-        2, 1, figsize=(18, 10), sharex=True,
-        gridspec_kw={"height_ratios": [3, 1]}
+        2, 1, figsize=(18.8, 10.8), sharex=True,
+        gridspec_kw={"height_ratios": [3.2, 1]}
     )
 
     # Upper: Price, MA, PER
-    ax1.plot(chart.index, chart["Price"], color="#0057B8", linewidth=2.4, label="Price")
-    ax1.plot(chart.index, chart["MA20"], color="#FF8C00", linewidth=1.4, label="MA20")
-    ax1.plot(chart.index, chart["MA60"], color="#2CA02C", linewidth=1.4, label="MA60")
-    ax1.plot(chart.index, chart["MA200"], color="#7B2CBF", linewidth=1.4, label="MA200")
+    ax1.plot(chart.index, chart["Price"], color="#0047AB", linewidth=2.6, label="Price")
+    ax1.plot(chart.index, chart["MA20"], color="#FF8C00", linewidth=1.55, label="MA20")
+    ax1.plot(chart.index, chart["MA60"], color="#228B22", linewidth=1.55, label="MA60")
+    ax1.plot(chart.index, chart["MA200"], color="#7B2CBF", linewidth=1.55, label="MA200")
 
     if chart["Buy"].notna().any():
-        ax1.scatter(chart.index, chart["Buy"] * 0.975, color="#008000", marker="^", s=95, label="BUY candidate", zorder=5)
+        ax1.scatter(chart.index, chart["Buy"] * 0.975, color="#00A000", marker="^", s=100, label="BUY candidate", zorder=5)
     if chart["Cash"].notna().any():
-        ax1.scatter(chart.index, chart["Cash"] * 1.025, color="#FF0000", marker="v", s=95, label="Cash / overheat", zorder=5)
+        ax1.scatter(chart.index, chart["Cash"] * 1.025, color="#E60000", marker="v", s=100, label="Cash / overheat", zorder=5)
 
-    ax1.set_ylabel("Price", color="#0057B8")
-    ax1.tick_params(axis="y", labelcolor="#0057B8")
-    ax1.grid(True, linestyle=":", alpha=0.35)
+    ax1.set_ylabel("Price", color="#0047AB")
+    ax1.tick_params(axis="y", labelcolor="#0047AB")
+    ax1.grid(True, linestyle=":", alpha=0.32)
 
     ax2 = ax1.twinx()
-    # Proxy line first, actual line on top.
-    if not chart["PER_PROXY"].dropna().empty:
-        ax2.plot(chart.index, chart["PER_PROXY"], color="#D62728", linewidth=1.25, linestyle=":", alpha=0.75, label="P/E proxy")
-    if not chart["PER"].dropna().empty:
-        ax2.plot(chart.index, chart["PER"], color="#D62728", linewidth=2.0, linestyle="-", label="P/E actual")
+    has_actual = chart["PER"].dropna().shape[0] > 0
+    has_proxy = chart["PER_PROXY"].dropna().shape[0] > 0
+
+    # Actual PER: solid red. Proxy: dashed red. If only proxy exists, draw it thick enough to be visible.
+    if has_actual:
+        ax2.plot(chart.index, chart["PER"], color="#D62728", linewidth=2.2, linestyle="-", label="P/E actual")
         per_avg = chart["PER"].dropna().mean()
-        ax2.axhline(per_avg, color="#D62728", linewidth=1.0, linestyle="--", alpha=0.35, label="P/E avg")
-    elif chart["PER_PROXY"].dropna().empty:
+        ax2.axhline(per_avg, color="#D62728", linewidth=1.1, linestyle="--", alpha=0.42, label="P/E actual avg")
+        if has_proxy:
+            ax2.plot(chart.index, chart["PER_PROXY"], color="#D62728", linewidth=1.35, linestyle=":", alpha=0.55, label="P/E proxy")
+    elif has_proxy:
+        ax2.plot(chart.index, chart["PER_PROXY"], color="#D62728", linewidth=2.2, linestyle="--", label="P/E proxy(current EPS)")
+        per_avg = chart["PER_PROXY"].dropna().mean()
+        ax2.axhline(per_avg, color="#D62728", linewidth=1.1, linestyle=":", alpha=0.45, label="P/E proxy avg")
+    else:
         ax2.text(0.99, 0.95, "P/E line: N/A", transform=ax2.transAxes, ha="right", va="top", color="#D62728")
+
     ax2.set_ylabel("P/E", color="#D62728")
     ax2.tick_params(axis="y", labelcolor="#D62728")
 
@@ -638,20 +674,20 @@ def plot_core_chart(df, per_df, risk_df, risk_label, ticker):
     ax1.set_title(f"{ticker} Price + P/E + MDD + Market Risk", fontweight="bold")
 
     # Lower: MDD + Risk
-    ax3.plot(chart.index, chart["DD"] * 100, color="#8B0000", linewidth=1.55, label="Current DD")
+    ax3.plot(chart.index, chart["DD"] * 100, color="#8B0000", linewidth=1.75, label="Current DD")
     for level, label in [(-8, "Watch -8%"), (-12, "Buy zone -12%"), (-15, "Deep -15%"), (-20, "Risk -20%")]:
-        ax3.axhline(level, color="#5DADE2", linestyle="--", linewidth=0.9, alpha=0.55, label=label)
+        ax3.axhline(level, color="#5DADE2", linestyle="--", linewidth=0.95, alpha=0.58, label=label)
     ax3.set_ylabel("MDD (%)", color="#8B0000")
     ax3.tick_params(axis="y", labelcolor="#8B0000")
-    ax3.grid(True, linestyle=":", alpha=0.35)
+    ax3.grid(True, linestyle=":", alpha=0.32)
 
     ax4 = ax3.twinx()
     if chart["Risk"].notna().any():
         if risk_label == "VIX":
-            ax4.plot(chart.index, chart["Risk"], color="#00A6A6", linewidth=1.2, linestyle="--", alpha=0.85, label="VIX")
+            ax4.plot(chart.index, chart["Risk"], color="#00A6A6", linewidth=1.35, linestyle="--", alpha=0.88, label="VIX")
             ax4.set_ylabel("VIX", color="#00A6A6")
         else:
-            ax4.plot(chart.index, chart["Risk"] * 100, color="#00A6A6", linewidth=1.2, linestyle="--", alpha=0.85, label=risk_label)
+            ax4.plot(chart.index, chart["Risk"] * 100, color="#00A6A6", linewidth=1.35, linestyle="--", alpha=0.88, label=risk_label)
             ax4.set_ylabel(risk_label + " (%)", color="#00A6A6")
         ax4.tick_params(axis="y", labelcolor="#00A6A6")
 
@@ -659,9 +695,8 @@ def plot_core_chart(df, per_df, risk_df, risk_label, ticker):
     lines4, labels4 = ax4.get_legend_handles_labels()
     ax3.legend(lines3 + lines4, labels3 + labels4, loc="lower left", fontsize=7)
 
-    fig.subplots_adjust(left=0.065, right=0.915, top=0.93, bottom=0.10, hspace=0.08)
+    fig.subplots_adjust(left=0.06, right=0.94, top=0.93, bottom=0.09, hspace=0.08)
     return fig, chart
-
 
 def make_comment(df, per_df, risk_label, risk_df):
     latest = df.iloc[-1]
