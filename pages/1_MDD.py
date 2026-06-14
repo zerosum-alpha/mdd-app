@@ -276,4 +276,46 @@ if run:
             v4.info("👉 차트의 PER 추이와 평균선을 비교하여 현재가 고평가인지 저평가인지 확인하세요.")
         else:
             v1.metric("Trailing P/E", f"{us_val.get('trailing_pe', 0):.2f}x" if us_val.get('trailing_pe') else "N/A")
-            v2.metric("Forward P/E (예상)", f"{us_val.get('forward_pe', 0):.2f}x" if us_val.get('forward_pe') else
+            v2.metric("Forward P/E (예상)", f"{us_val.get('forward_pe', 0):.2f}x" if us_val.get('forward_pe') else "N/A")
+            v3.metric("P/S (매출배수)", f"{us_val.get('price_to_sales', 0):.2f}x" if us_val.get('price_to_sales') else "N/A")
+            v4.metric("PEG Ratio", f"{us_val.get('peg_ratio', 0):.2f}" if us_val.get('peg_ratio') else "N/A")
+
+        # ---------------------------------------------------------
+        # 2. 실전 매매 타이밍 (Signal & MDD)
+        # ---------------------------------------------------------
+        st.markdown("## 🎯 2. 타이밍 및 시장 공포 상태")
+        
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("현재가", f"{latest['Close']:,.2f}")
+        s2.metric("최대 낙폭 (MDD)", f"{latest['Current_Drawdown'] * 100:.2f}%")
+        s3.metric("현재 RSI (과열/과매도)", f"{latest['RSI']:.1f}" if pd.notna(latest['RSI']) else "N/A")
+        
+        if market == "US" and 'VIX' in latest and pd.notna(latest['VIX']):
+            s4.metric("현재 VIX (공포지수)", f"{latest['VIX']:.1f}")
+        else:
+            s4.metric("시장 구분", "한국(KRX) - 개별 종목 수급 우선")
+
+        # ---------------------------------------------------------
+        # 3. 3단 통합 시각화 (Price + PER + MDD)
+        # ---------------------------------------------------------
+        st.markdown("## 📈 3. 통합 매매 시그널 차트")
+        st.caption("▲(매수): 깊은 낙폭(MDD -15% 이하) + 과매도/공포 구간 | ▼(매도): 전고점 회복 + 단기 과열(RSI 70 이상)")
+        
+        chart_fig = make_comprehensive_chart(df, ticker, market)
+        if chart_fig:
+            st.pyplot(chart_fig)
+            
+        # ---------------------------------------------------------
+        # 4. 최근 시그널 이력
+        # ---------------------------------------------------------
+        with st.expander("최근 30일 데이터 및 시그널 발생 내역 보기"):
+            view_cols = ["Close", "Current_Drawdown", "RSI", "Buy_Signal", "Sell_Signal"]
+            if market == "KR" and "PER" in df.columns: view_cols.insert(1, "PER")
+            if market == "US" and "VIX" in df.columns: view_cols.insert(3, "VIX")
+                
+            view_df = df[view_cols].tail(30).copy()
+            view_df["Current_Drawdown"] = (view_df["Current_Drawdown"] * 100).round(2)
+            view_df["RSI"] = view_df["RSI"].round(2)
+            view_df["Buy_Signal"] = view_df["Buy_Signal"].apply(lambda x: "🟢 BUY" if pd.notna(x) else "")
+            view_df["Sell_Signal"] = view_df["Sell_Signal"].apply(lambda x: "🔴 SELL" if pd.notna(x) else "")
+            st.dataframe(view_df.sort_index(ascending=False), use_container_width=True)
