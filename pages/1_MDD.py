@@ -4,6 +4,9 @@ warnings.filterwarnings("ignore")
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 import re
+import zipfile
+import io
+import xml.etree.ElementTree as ET
 
 import numpy as np
 import pandas as pd
@@ -545,6 +548,200 @@ def merge_actual_and_proxy_per(actual_df, proxy_df):
     out = out.loc[:, ~out.columns.duplicated()]
     return out.sort_index()
 
+
+# =========================================================
+# DART-based KR actual TTM PER
+# =========================================================
+def clean_amount(x):
+    try:
+        if x is None or pd.isna(x):
+            return None
+        s = str(x).replace(",", "").replace(" ", "").strip()
+        if s in ["", "-", "—"]:
+            return None
+        # Korean negative format may be (123)
+        if s.startswith("(") and s.endswith(")"):
+            s = "-" + s[1:-1]
+        return float(s)
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def dart_corp_code_map(api_key):
+    """Return stock_code -> corp_code mapping from OpenDART corpCode.xml."""
+    if not api_key or not REQ_OK:
+        return {}, "DART key 또는 requests 없음"
+    try:
+        url = "https://opendart.fss.or.kr/api/corpCode.xml"
+        r = requests.get(url, params={"crtfc_key": api_key}, timeout=12)
+        if r.status_code != 200:
+            return {}, f"corpCode HTTP {r.status_code}"
+        z = zipfile.ZipFile(io.BytesIO(r.content))
+        xml_name = z.namelist()[0]
+        root = ET.fromstring(z.read(xml_name))
+        mp = {}
+        for item in root.findall("list"):
+            corp_code = (item.findtext("corp_code") or "").strip()
+            stock_code = (item.findtext("stock_code") or "").strip()
+            if corp_code and stock_code:
+                mp[stock_code.zfill(6)] = corp_code
+        if not mp:
+            return {}, "corpCode mapping empty"
+        return mp, "OK"
+    except Exception as e:
+        return {}, f"corpCode error: {repr(e)}"
+
+
+def _pick_eps_from_dart_list(items):
+    """Pick EPS from DART account rows. Prefer basic EPS, then diluted EPS."""
+    if not items:
+        return None, "no list"
+    rows = []
+    for it in items:
+        acc_id = str(it.get("account_id", ""))
+        acc_nm = str(it.get("account_nm", ""))
+        sj_nm = str(it.get("sj_nm", ""))
+        amount = clean_amount(it.get("thstrm_amount"))
+        if amount is None:
+            continue
+        key = (acc_id + " " + acc_nm).lower()
+        score = 0
+        # Korean labels vary; keep broad but prefer exact EPS rows.
+        if "주당" in acc_nm and "이익" in acc_nm:
+            score += 10
+        if "기본" in acc_nm:
+            score += 5
+        if "희석" in acc_nm:
+            score += 3
+        if "basic" in key and "earnings" in key and "share" in key:
+            score += 8
+        if "diluted" in key and "earnings" in key and "share" in key:
+            score += 6
+        if "eps" in key:
+            score += 4
+        # Exclude continuing-operation-only EPS when possible.
+        if "계속" in acc_nm or "continuing" in key:
+            score -= 3
+        if score > 0:
+            rows.append((score, amount, acc_id, acc_nm, sj_nm))
+    if not rows:
+        return None, "EPS row not found"
+    rows.sort(key=lambda x: x[0], reverse=True)
+    score, amount, acc_id, acc_nm, sj_nm = rows[0]
+    return amount, f"{acc_nm} / {acc_id}"
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def dart_kr_ttm_pe_series(code, price_df, start_date, end_date, api_key):
+    """Build actual-style daily PER for KR stocks using DART quarterly cumulative EPS.
+
+    This is the correct way to see whether price rises while P/E falls when KRX PER series is unavailable.
+    It requires a DART API key. It is still historical trailing P/E, not 12M forward consensus P/E.
+    """
+    if not api_key:
+        return pd.DataFrame(), "DART key 없음: 실제 EPS 기반 한국 PER 계산 불가"
+    code = str(code).zfill(6)
+    mp, mp_status = dart_corp_code_map(api_key)
+    corp_code = mp.get(code)
+    if not corp_code:
+        return pd.DataFrame(), f"DART corp_code 없음: {mp_status}"
+
+    # Need at least previous fiscal year to calculate rolling 4 quarters.
+    start_y = pd.to_datetime(start_date).year - 1
+    end_y = pd.to_datetime(end_date).year
+    report_map = {
+        "11013": ("Q1", 1, "05-15"),
+        "11012": ("H1", 2, "08-15"),
+        "11014": ("Q3", 3, "11-15"),
+        "11011": ("A", 4, "03-31"),
+    }
+    cum_rows = []
+    errors = []
+    for year in range(start_y, end_y + 1):
+        for reprt_code, (label, q, md) in report_map.items():
+            try:
+                url = "https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json"
+                params = {
+                    "crtfc_key": api_key,
+                    "corp_code": corp_code,
+                    "bsns_year": str(year),
+                    "reprt_code": reprt_code,
+                    "fs_div": "CFS",
+                }
+                res = requests.get(url, params=params, timeout=10).json()
+                if res.get("status") != "000":
+                    # Try separate financial statements only if consolidated unavailable.
+                    params["fs_div"] = "OFS"
+                    res = requests.get(url, params=params, timeout=10).json()
+                if res.get("status") != "000":
+                    errors.append(f"{year}-{label}:{res.get('status')} {res.get('message','')[:40]}")
+                    continue
+                eps, eps_src = _pick_eps_from_dart_list(res.get("list", []))
+                if eps is None:
+                    errors.append(f"{year}-{label}:{eps_src}")
+                    continue
+                # Report availability date approximation; sufficient for chart alignment.
+                if label == "A":
+                    avail_date = pd.Timestamp(year=year + 1, month=3, day=31)
+                else:
+                    month, day = map(int, md.split("-"))
+                    avail_date = pd.Timestamp(year=year, month=month, day=day)
+                cum_rows.append({
+                    "year": year,
+                    "q": q,
+                    "label": label,
+                    "Date": avail_date,
+                    "EPS_CUM": eps,
+                    "EPS_SOURCE": eps_src,
+                })
+            except Exception as e:
+                errors.append(f"{year}-{label}:{type(e).__name__} {str(e)[:50]}")
+
+    if len(cum_rows) < 4:
+        return pd.DataFrame(), "DART EPS 데이터 부족: " + " / ".join(errors[:5])
+
+    cum = pd.DataFrame(cum_rows).sort_values(["year", "q"])
+    q_rows = []
+    for year, g in cum.groupby("year"):
+        g = g.set_index("q").sort_index()
+        prev_cum = 0.0
+        for q in [1, 2, 3, 4]:
+            if q not in g.index:
+                continue
+            eps_cum = safe_float(g.loc[q, "EPS_CUM"])
+            if eps_cum is None:
+                continue
+            q_eps = eps_cum - prev_cum
+            prev_cum = eps_cum
+            q_rows.append({
+                "Date": g.loc[q, "Date"],
+                "EPS_Q": q_eps,
+                "EPS_CUM": eps_cum,
+                "EPS_SOURCE": g.loc[q, "EPS_SOURCE"],
+            })
+    if len(q_rows) < 4:
+        return pd.DataFrame(), "DART quarterly EPS 계산 부족"
+
+    qdf = pd.DataFrame(q_rows).sort_values("Date")
+    qdf["EPS_TTM"] = qdf["EPS_Q"].rolling(4).sum()
+    qdf = qdf.dropna(subset=["EPS_TTM"])
+    qdf = qdf[qdf["EPS_TTM"] > 0]
+    if qdf.empty:
+        return pd.DataFrame(), "DART EPS_TTM empty"
+
+    daily = price_df[["Close"]].reset_index()
+    daily.columns = ["Date", "Close"]
+    daily["Date"] = to_dt_index(daily["Date"]).normalize()
+    qdf["Date"] = to_dt_index(qdf["Date"]).normalize()
+    merged = pd.merge_asof(daily.sort_values("Date"), qdf[["Date", "EPS_TTM"]].sort_values("Date"), on="Date", direction="backward")
+    merged["PER"] = merged["Close"] / merged["EPS_TTM"].replace(0, np.nan)
+    merged = merged[(merged["PER"] > 0) & (merged["PER"] < 500)].dropna(subset=["PER"])
+    if merged.empty:
+        return pd.DataFrame(), "DART PER 계산 결과 empty"
+    out = merged.set_index("Date")[["PER", "EPS_TTM"]]
+    return out, "OK: DART actual TTM P/E"
+
 # =========================================================
 # Market risk
 # =========================================================
@@ -745,42 +942,26 @@ def plot_core_chart(df, per_df, risk_df, risk_label, ticker):
     return fig, chart
 
 def make_comment(df, per_df, risk_label, risk_df):
-    """자동 해석 전용 함수.
-    데이터 로더/차트 계산은 건드리지 않고, 해석 문구만 정리한다.
-    핵심: 실제 PER과 proxy PER을 명확히 분리해서 오판을 줄인다.
-    """
     latest = df.iloc[-1]
     msg = []
     dd = latest["Current_Drawdown"]
     rsi = latest["RSI"]
     close = latest["Close"]
     ma20 = latest["MA20"]
-    ma60 = latest.get("MA60", np.nan)
     ma200 = latest["MA200"]
 
-    # 1) 가격/추세
-    if pd.notna(ma20) and close < ma20:
-        msg.append("가격: MA20 아래입니다. 반등 확인 전에는 추격보다 대기/소액 기준입니다.")
+    if close < ma20:
+        msg.append("가격: MA20 아래입니다. 반등 확인 전에는 추격보다 대기/소액이 적합합니다.")
     else:
         msg.append("가격: MA20 위입니다. 단기 추세는 유지 중입니다.")
-
-    if pd.notna(ma60):
-        if close >= ma60:
-            msg.append("중기추세: MA60 위입니다. 중기 흐름은 아직 유지됩니다.")
-        else:
-            msg.append("중기추세: MA60 아래입니다. 반등 강도 확인이 필요합니다.")
-
     if pd.notna(ma200):
         if close >= ma200:
             msg.append("장기추세: MA200 위라 장기 추세 훼손은 제한적입니다.")
         else:
             msg.append("장기추세: MA200 아래라 추세 훼손을 우선 확인해야 합니다.")
 
-    # 2) MDD
-    if dd <= -0.20:
-        msg.append(f"MDD: {dd*100:.1f}%로 위험 낙폭 구간입니다. 저점 이탈 여부가 우선입니다.")
-    elif dd <= -0.15:
-        msg.append(f"MDD: {dd*100:.1f}%로 깊은 조정권입니다. 분할 관찰 구간입니다.")
+    if dd <= -0.15:
+        msg.append(f"MDD: {dd*100:.1f}%로 깊은 조정권입니다.")
     elif dd <= -0.12:
         msg.append(f"MDD: {dd*100:.1f}%로 1차 관심 구간입니다.")
     elif dd <= -0.08:
@@ -788,7 +969,6 @@ def make_comment(df, per_df, risk_label, risk_df):
     else:
         msg.append(f"MDD: {dd*100:.1f}%로 낙폭 매력은 크지 않습니다.")
 
-    # 3) RSI
     if pd.notna(rsi):
         if rsi <= 35:
             msg.append(f"RSI: {rsi:.1f}. 과매도권입니다.")
@@ -797,43 +977,39 @@ def make_comment(df, per_df, risk_label, risk_df):
         else:
             msg.append(f"RSI: {rsi:.1f}. 중립권입니다.")
 
-    # 4) PER: actual과 proxy 분리
-    per_type = None
-    per_series = pd.Series(dtype="float64")
-
+    # PER 해석: 실제 PER과 proxy PER을 명확히 구분한다.
+    # - PER: pykrx 또는 DART EPS_TTM 기반. 실제 PER 방향 판단에 사용 가능.
+    # - PER_PROXY: 현재 EPS를 고정해 계산한 참고선. 실제 PER 변화 판단에는 사용 금지.
     if per_df is not None and not per_df.empty:
-        if "PER" in per_df.columns and pd.to_numeric(per_df["PER"], errors="coerce").dropna().shape[0] >= 20:
-            per_type = "actual"
-            per_series = pd.to_numeric(per_df["PER"], errors="coerce").dropna()
-        elif "PER_PROXY" in per_df.columns and pd.to_numeric(per_df["PER_PROXY"], errors="coerce").dropna().shape[0] >= 20:
-            per_type = "proxy"
-            per_series = pd.to_numeric(per_df["PER_PROXY"], errors="coerce").dropna()
+        has_actual = "PER" in per_df.columns and pd.to_numeric(per_df["PER"], errors="coerce").dropna().shape[0] >= 20
+        has_proxy = "PER_PROXY" in per_df.columns and pd.to_numeric(per_df["PER_PROXY"], errors="coerce").dropna().shape[0] >= 20
 
-    if per_type is not None and len(per_series) >= 2:
-        n = min(60, len(per_series) - 1)
-        recent_change = per_series.iloc[-1] / per_series.iloc[-n] - 1 if n > 0 and per_series.iloc[-n] != 0 else np.nan
-        current_per = per_series.iloc[-1]
-
-        if per_type == "actual":
-            if pd.notna(recent_change):
-                if recent_change < -0.10:
-                    msg.append(f"PER(actual): 최근 기준 {recent_change*100:.1f}% 하락. 주가 대비 이익 개선이 반영되어 밸류 부담이 낮아진 흐름입니다.")
-                elif recent_change > 0.10:
-                    msg.append(f"PER(actual): 최근 기준 {recent_change*100:.1f}% 상승. 주가가 이익보다 빠르게 반영되어 밸류 부담이 커진 구간입니다.")
+        if has_actual:
+            p = pd.to_numeric(per_df["PER"], errors="coerce").dropna()
+            n = min(60, len(p) - 1)
+            if n > 0:
+                chg = p.iloc[-1] / p.iloc[-n] - 1
+                if chg < -0.10:
+                    msg.append(f"PER actual: 최근 기준 {chg*100:.1f}% 하락. 실적 개선이 가격 상승을 일부 정당화하는 흐름입니다.")
+                elif chg > 0.10:
+                    msg.append(f"PER actual: 최근 기준 {chg*100:.1f}% 상승. 실제 밸류 부담 확대 구간입니다.")
                 else:
-                    msg.append(f"PER(actual): 최근 기준 {recent_change*100:.1f}% 변화. 밸류 방향성은 중립입니다.")
-        else:
-            # proxy는 현재 EPS 고정 기준이므로 실제 이익개선 판단에 쓰면 안 된다.
-            if pd.notna(recent_change):
+                    msg.append(f"PER actual: 최근 기준 {chg*100:.1f}% 변화. 실제 밸류 방향성은 크지 않습니다.")
+        elif has_proxy:
+            p = pd.to_numeric(per_df["PER_PROXY"], errors="coerce").dropna()
+            n = min(60, len(p) - 1)
+            if n > 0:
+                chg = p.iloc[-1] / p.iloc[-n] - 1
                 msg.append(
-                    f"PER(proxy): 현재 EPS 고정 기준 {current_per:.1f}배, 최근 {recent_change*100:.1f}% 변화입니다. "
-                    "실제 PER 시계열이 아니므로 '주가 상승에도 저평가' 판단에는 사용하지 말고, 현재 EPS 기준 가격 부담만 참고하세요."
+                    f"PER proxy: 최근 기준 {chg*100:.1f}% 변화. 현재 EPS 고정 기준 참고선입니다. "
+                    "실제 EPS 변화가 반영되지 않으므로 저평가 판단에는 사용하지 마세요."
                 )
+        else:
+            msg.append("PER: 실제 시계열은 제한적입니다. 현재 PER 카드와 가격/MDD를 우선 보세요.")
     else:
-        msg.append("PER: 표시 가능한 시계열이 제한적입니다. 현재 PER 카드와 가격/MDD를 우선 보세요.")
+        msg.append("PER: 실제 시계열은 제한적입니다. 현재 PER 카드와 가격/MDD를 우선 보세요.")
 
-    # 5) 시장위험
-    if risk_df is not None and not risk_df.empty and "Risk" in risk_df.columns and not risk_df["Risk"].dropna().empty:
+    if risk_df is not None and not risk_df.empty:
         rv = risk_df["Risk"].dropna().iloc[-1]
         if risk_label == "VIX":
             if rv >= 25:
@@ -845,20 +1021,11 @@ def make_comment(df, per_df, risk_label, risk_df):
         else:
             msg.append(f"시장위험: {risk_label} {rv*100:.1f}%. 한국 지수 낙폭을 참고하세요.")
 
-    # 6) 최종 문구: actual/proxy 여부 반영
-    has_actual_per = per_type == "actual"
-    has_proxy_only = per_type == "proxy"
-
-    if dd <= -0.12 and pd.notna(rsi) and rsi <= 42 and pd.notna(ma200) and close >= ma200:
-        if has_actual_per:
-            final = "최종: 1차 눌림 후보입니다. 단, MA20 회복 전에는 소액/분할 기준입니다."
-        else:
-            final = "최종: 1차 눌림 후보 가능성은 있지만, 실제 PER 확인이 부족해 소액/분할 기준입니다."
+    if dd <= -0.12 and pd.notna(rsi) and rsi <= 42 and close >= ma200:
+        final = "최종: 1차 눌림 후보입니다. 단, MA20 회복 전에는 소액/분할 기준입니다."
     elif dd > -0.08 and pd.notna(rsi) and rsi >= 65:
         final = "최종: 추격 금지 구간입니다. 현금확보 또는 대기 우선입니다."
-    elif has_proxy_only and close >= ma20 and dd > -0.12:
-        final = "최종: 가격 추세는 양호하지만 PER은 proxy 기준입니다. 실제 저평가 판단보다 눌림 대기가 우선입니다."
-    elif pd.notna(ma20) and close < ma20 and dd <= -0.12:
+    elif close < ma20 and dd <= -0.12:
         final = "최종: 낙폭은 있지만 반등 확인이 부족합니다. 대기 또는 소액만 적합합니다."
     else:
         final = "최종: 강한 진입 신호는 아닙니다. 가격·PER·MDD 조합을 더 확인하세요."
@@ -875,6 +1042,14 @@ with c2:
     start_date = st.date_input("기준 시작일", pd.to_datetime("2025-01-01"))
 with c3:
     asset_type = st.selectbox("종목 유형", ["일반 주식/ETF", "나스닥형 ETF", "반도체/메모리 ETF", "전력/인프라 ETF", "우주/소형 테마"])
+
+try:
+    dart_secret = st.secrets.get("DART_API_KEY", "")
+except Exception:
+    dart_secret = ""
+with st.expander("한국 실제 PER 설정", expanded=False):
+    st.caption("한국 종목에서 pykrx PER 시계열이 안 잡힐 때, DART 분기 EPS로 TTM P/E를 계산합니다. Naver 현재 EPS proxy와 달리 EPS가 분기별로 변합니다.")
+    dart_key_input = st.text_input("DART API Key", value=dart_secret, type="password")
 
 run = st.button("분석 실행")
 
@@ -906,17 +1081,28 @@ if run:
     else:
         val, val_status = naver_current_per(ticker)
         actual_per_df, actual_per_status = kr_per_series_nohang(ticker, start_date, last_price_date, timeout_sec=7)
-        # If KRX PER series returns EPS only, compute actual-style PER from that EPS.
+
+        # If pykrx returns EPS without PER, calculate PER from that historical EPS.
         if not actual_per_df.empty and "PER" not in actual_per_df.columns and "EPS" in actual_per_df.columns:
             tmp = df[["Close"]].join(actual_per_df[["EPS"]], how="left")
             tmp["EPS"] = tmp["EPS"].ffill()
             tmp["PER"] = tmp["Close"] / tmp["EPS"].replace(0, np.nan)
             actual_per_df = tmp[["PER", "EPS"]].dropna()
+
+        # If pykrx actual PER is unavailable, use DART quarterly EPS TTM.
+        dart_status = "DART not used"
+        if actual_per_df.empty or "PER" not in actual_per_df.columns or actual_per_df["PER"].dropna().empty:
+            dart_per_df, dart_status = dart_kr_ttm_pe_series(ticker, df, start_date, last_price_date, dart_key_input)
+            if dart_per_df is not None and not dart_per_df.empty:
+                actual_per_df = dart_per_df
+                actual_per_status = dart_status
+
+        # Current EPS proxy is only a fallback reference, not actual valuation trend.
         proxy_df, proxy_status = build_per_proxy_from_current(
             df, latest["Close"], current_pe=val.get("ttm_pe"), current_eps=val.get("eps"), label="KR current EPS-implied"
         )
         per_df = merge_actual_and_proxy_per(actual_per_df, proxy_df)
-        per_status = f"Actual: {actual_per_status} / Full-view proxy: {proxy_status}"
+        per_status = f"Actual: {actual_per_status} / DART: {dart_status} / Proxy: {proxy_status}"
 
     risk_df, risk_label = market_risk_series(market, ticker, start_date)
 
@@ -947,7 +1133,7 @@ if run:
         st.warning(f"PER 시계열 없음: {per_status}")
 
     st.markdown("## 2. 핵심 차트")
-    st.info("차트는 주가·PER·MDD·시장위험만 봅니다. Actual P/E는 실제 PER 판단용, P/E proxy는 현재 EPS 고정 기준의 참고선입니다.")
+    st.info("차트는 주가·PER·MDD·시장위험만 봅니다. 한국은 pykrx 실제 PER이 없으면 DART EPS_TTM PER을 우선 사용하고, 그래도 없을 때만 현재 EPS 기반 P/E proxy를 표시합니다.")
     fig, chart_df = plot_core_chart(df, per_df, risk_df, risk_label, ticker)
     st.pyplot(fig)
 
