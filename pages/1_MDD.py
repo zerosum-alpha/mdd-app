@@ -942,44 +942,148 @@ def make_price_pe_comment(price_pe_df):
 # Valuation charts
 # =========================================================
 def make_pe_band_data(current_price, valuation):
-    pe = valuation["forward_pe"]
+    """
+    PER 추세 데이터가 없어도 현재 Forward P/E 또는 Trailing P/E만 있으면
+    즉시 밴드 차트를 만들기 위한 데이터 생성.
 
-    if not is_valid_number(pe) or float(pe) <= 0 or current_price <= 0:
-        return pd.DataFrame()
+    핵심:
+    - Forward P/E가 있으면 우선 사용
+    - 없으면 Trailing P/E 사용
+    - 둘 다 없으면 빈 DF 반환
+    - 현재 주가에서 역산한 EPS를 기준으로 10~80배 밴드 가격 계산
+    """
+    pe_source = None
+    pe = None
 
-    pe = float(pe)
+    if is_valid_number(valuation.get("forward_pe")) and float(valuation.get("forward_pe")) > 0:
+        pe = float(valuation.get("forward_pe"))
+        pe_source = "Forward P/E"
+    elif is_valid_number(valuation.get("trailing_pe")) and float(valuation.get("trailing_pe")) > 0:
+        pe = float(valuation.get("trailing_pe"))
+        pe_source = "Trailing P/E"
+
+    if pe is None or current_price <= 0:
+        return pd.DataFrame(), None, None
+
     implied_eps = current_price / pe
 
-    bands = [
-        ("15x", implied_eps * 15),
-        ("30x", implied_eps * 30),
-        ("50x", implied_eps * 50),
-        ("Current", current_price)
-    ]
+    rows = []
+    for multiple in [10, 15, 20, 25, 30, 40, 50, 60, 80]:
+        band_price = implied_eps * multiple
+        gap_pct = (band_price / current_price - 1) * 100
+        rows.append({
+            "Band": f"{multiple}x",
+            "Multiple": multiple,
+            "Price": band_price,
+            "Current Gap(%)": gap_pct
+        })
 
-    return pd.DataFrame(bands, columns=["Band", "Price"])
+    rows.append({
+        "Band": "Current",
+        "Multiple": pe,
+        "Price": current_price,
+        "Current Gap(%)": 0.0
+    })
+
+    band_df = pd.DataFrame(rows)
+    return band_df, pe_source, implied_eps
+
+
+def make_ps_band_data(current_price, valuation):
+    """
+    PER 데이터가 없을 때 P/S로라도 밴드 표시.
+    현재 P/S에서 역산한 Sales per share를 기준으로 3/5/10/20/30배 가격을 계산한다.
+    """
+    ps = valuation.get("price_to_sales")
+
+    if not is_valid_number(ps) or float(ps) <= 0 or current_price <= 0:
+        return pd.DataFrame(), None
+
+    ps = float(ps)
+    sales_per_share = current_price / ps
+
+    rows = []
+    for multiple in [3, 5, 10, 15, 20, 30]:
+        band_price = sales_per_share * multiple
+        gap_pct = (band_price / current_price - 1) * 100
+        rows.append({
+            "Band": f"P/S {multiple}x",
+            "Multiple": multiple,
+            "Price": band_price,
+            "Current Gap(%)": gap_pct
+        })
+
+    rows.append({
+        "Band": "Current",
+        "Multiple": ps,
+        "Price": current_price,
+        "Current Gap(%)": 0.0
+    })
+
+    return pd.DataFrame(rows), sales_per_share
 
 
 def make_pe_band_chart(current_price, valuation, ticker):
-    band_df = make_pe_band_data(current_price, valuation)
+    """
+    PER/P/S 추세 차트가 안 나와도 기본 밴드는 반드시 시도해서 표시한다.
+    1순위: Forward P/E
+    2순위: Trailing P/E
+    3순위: P/S
+    """
+    band_df, pe_source, implied_eps = make_pe_band_data(current_price, valuation)
+    chart_type = "PER"
 
     if band_df.empty:
-        return None, band_df
+        band_df, sales_per_share = make_ps_band_data(current_price, valuation)
+        chart_type = "P/S"
+        pe_source = "P/S"
+        implied_eps = sales_per_share
 
-    fig, ax = plt.subplots(figsize=(10, 4))
+    if band_df.empty:
+        return None, band_df, "PER/P/S 데이터가 없어 밴드 차트를 표시할 수 없습니다."
 
-    ax.bar(band_df["Band"], band_df["Price"])
-    ax.axhline(y=current_price, linestyle="--", alpha=0.7, label="Current Price")
+    plot_df = band_df[band_df["Band"] != "Current"].copy()
+    current_row = band_df[band_df["Band"] == "Current"].iloc[0]
 
-    ax.set_title(f"{ticker} Forward P/E Band")
-    ax.set_ylabel("Price")
+    fig, ax = plt.subplots(figsize=(12, 4.8))
+
+    bars = ax.bar(plot_df["Band"], plot_df["Price"], alpha=0.75, label="Valuation band price")
+    ax.axhline(y=current_price, linestyle="--", linewidth=2, alpha=0.85, label="Current Price")
+
+    current_multiple = current_row["Multiple"]
+    ax.set_title(f"{ticker} {chart_type} Band - Current {pe_source}: {current_multiple:.2f}x")
+    ax.set_ylabel("Implied Price")
     ax.grid(True, axis="y", alpha=0.3)
-    ax.legend()
+    ax.legend(loc="upper left")
+
+    # 현재가에 가장 가까운 밴드에 라벨 표시
+    if not plot_df.empty:
+        closest_idx = (plot_df["Price"] - current_price).abs().idxmin()
+        closest_band = plot_df.loc[closest_idx, "Band"]
+        ax.text(
+            0.01,
+            0.95,
+            f"Nearest band: {closest_band}",
+            transform=ax.transAxes,
+            va="top",
+            ha="left"
+        )
 
     plt.tight_layout()
 
-    return fig, band_df
+    if chart_type == "PER":
+        comment = (
+            f"현재 {pe_source} {current_multiple:.2f}x 기준으로 역산한 EPS는 약 {implied_eps:.2f}입니다. "
+            "주가가 어느 PER 밴드에 가까운지 보는 참고 차트입니다. "
+            "과거 Forward PER 시계열이 아니라 현재 PER 기반 밴드입니다."
+        )
+    else:
+        comment = (
+            f"PER 데이터가 부족해 P/S 밴드로 대체했습니다. 현재 P/S {current_multiple:.2f}x 기준입니다. "
+            "성장주에서는 P/S가 과열 여부를 보는 보조 지표가 될 수 있습니다."
+        )
 
+    return fig, band_df, comment
 
 def make_valuation_zone(forward_pe, ps):
     if not is_valid_number(forward_pe) and not is_valid_number(ps):
@@ -2334,7 +2438,7 @@ if run:
 
         matrix_df, mdd_zone, valuation_zone, matrix_decision = make_mdd_valuation_matrix(current_dd, valuation)
 
-        pe_band_fig, pe_band_df = make_pe_band_chart(current_price, valuation, ticker)
+        pe_band_fig, pe_band_df, pe_band_comment = make_pe_band_chart(current_price, valuation, ticker)
 
         financial_trend = pd.DataFrame()
         financial_chart = None
@@ -2634,12 +2738,18 @@ if run:
         else:
             st.info("P/E 추세 차트를 표시할 수 없습니다.")
 
-        with st.expander("Forward P/E Band Chart 보기"):
-            if pe_band_fig is None:
-                st.info("Forward P/E 데이터가 없어 P/E Band Chart를 표시할 수 없습니다.")
-            else:
-                st.pyplot(pe_band_fig)
-                st.dataframe(pe_band_df, use_container_width=True)
+        st.markdown("### Valuation Band Chart")
+        if pe_band_fig is None:
+            st.warning(pe_band_comment)
+        else:
+            st.pyplot(pe_band_fig)
+            st.info(pe_band_comment)
+            with st.expander("Valuation Band 데이터 보기"):
+                show_band_df = pe_band_df.copy()
+                for col in ["Price", "Current Gap(%)", "Multiple"]:
+                    if col in show_band_df.columns:
+                        show_band_df[col] = show_band_df[col].apply(lambda x: None if pd.isna(x) else round(float(x), 2))
+                st.dataframe(show_band_df, use_container_width=True)
 
         # =================================================
         # 7. 차트
