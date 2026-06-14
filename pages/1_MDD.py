@@ -512,11 +512,17 @@ def add_price_to_financial_trend(financial_df, price_df):
         else:
             close_price = prior_prices["Close"].iloc[-1]
 
+        eps_ttm = row["eps_ttm"]
+        pe_ttm = None
+        if close_price is not None and is_valid_number(eps_ttm) and float(eps_ttm) > 0:
+            pe_ttm = close_price / float(eps_ttm)
+
         rows.append({
             "date": dt,
             "price": close_price,
             "revenue_ttm": row["revenue_ttm"],
-            "eps_ttm": row["eps_ttm"]
+            "eps_ttm": eps_ttm,
+            "pe_ttm": pe_ttm
         })
 
     result = pd.DataFrame(rows)
@@ -566,6 +572,84 @@ def make_financial_trend_chart(fin_trend_df, ticker):
 
     plt.tight_layout()
     return fig
+
+
+def make_price_pe_trend_chart(fin_trend_df, valuation, ticker):
+    chart_df = fin_trend_df.copy()
+
+    if chart_df.empty or "pe_ttm" not in chart_df.columns:
+        return None, pd.DataFrame()
+
+    chart_df = chart_df.dropna(subset=["price", "pe_ttm"])
+
+    if chart_df.empty or len(chart_df) < 2:
+        return None, chart_df
+
+    fig, ax_price = plt.subplots(figsize=(12, 5))
+
+    ax_price.plot(chart_df["date"], chart_df["price"], marker="o", label="Price", linewidth=2)
+    ax_price.set_ylabel("Price")
+    ax_price.grid(True, alpha=0.3)
+
+    ax_pe = ax_price.twinx()
+    ax_pe.plot(chart_df["date"], chart_df["pe_ttm"], marker="o", linestyle="--", label="TTM P/E", linewidth=2)
+    ax_pe.set_ylabel("TTM P/E")
+
+    pe_mean = chart_df["pe_ttm"].mean()
+    pe_std = chart_df["pe_ttm"].std()
+
+    if is_valid_number(pe_mean):
+        ax_pe.axhline(pe_mean, linestyle="-", alpha=0.35, label="P/E avg")
+
+    if is_valid_number(pe_std) and pe_std > 0:
+        ax_pe.axhline(pe_mean + pe_std, linestyle=":", alpha=0.35, label="P/E +1SD")
+        ax_pe.axhline(pe_mean - pe_std, linestyle=":", alpha=0.35, label="P/E -1SD")
+
+    current_forward_pe = valuation.get("forward_pe") if isinstance(valuation, dict) else None
+    if is_valid_number(current_forward_pe) and float(current_forward_pe) > 0:
+        ax_pe.axhline(float(current_forward_pe), linestyle="--", alpha=0.25, label="Current forward P/E")
+
+    ax_price.set_title(f"{ticker} Price vs P/E Trend")
+
+    lines1, labels1 = ax_price.get_legend_handles_labels()
+    lines2, labels2 = ax_pe.get_legend_handles_labels()
+    ax_price.legend(lines1 + lines2, labels1 + labels2, loc="best")
+
+    plt.tight_layout()
+
+    return fig, chart_df
+
+
+def make_price_pe_comment(price_pe_df):
+    if price_pe_df.empty or len(price_pe_df.dropna(subset=["price", "pe_ttm"])) < 2:
+        return "Price + P/E 추세를 계산할 데이터가 부족합니다."
+
+    df = price_pe_df.dropna(subset=["price", "pe_ttm"]).copy()
+
+    first_price = df["price"].iloc[0]
+    last_price = df["price"].iloc[-1]
+    first_pe = df["pe_ttm"].iloc[0]
+    last_pe = df["pe_ttm"].iloc[-1]
+
+    price_change = (last_price / first_price - 1) * 100 if first_price else None
+    pe_change = (last_pe / first_pe - 1) * 100 if first_pe else None
+
+    if price_change is None or pe_change is None:
+        return "Price + P/E 추세 해석이 불가능합니다."
+
+    if price_change > 0 and pe_change < 0:
+        return "주가는 상승했지만 P/E는 하락했습니다. 실적 개선이 주가 상승을 정당화하는 구간일 수 있습니다."
+
+    if price_change > 0 and pe_change > 0:
+        return "주가와 P/E가 함께 상승했습니다. 실적보다 기대감이 더 빠르게 반영되는 과열 구간인지 확인해야 합니다."
+
+    if price_change < 0 and pe_change < 0:
+        return "주가와 P/E가 함께 하락했습니다. 밸류 부담은 완화됐지만 업황 훼손 여부를 확인해야 합니다."
+
+    if price_change < 0 and pe_change > 0:
+        return "주가는 하락했지만 P/E는 상승했습니다. 이익 추정치가 더 빠르게 악화된 구간일 수 있어 저점매수 주의가 필요합니다."
+
+    return "주가와 P/E 변화가 뚜렷하지 않습니다. MDD, RSI, 이벤트 리스크를 함께 확인하세요."
 
 
 # =========================================================
@@ -1544,11 +1628,18 @@ if run:
 
         financial_trend = pd.DataFrame()
         financial_chart = None
+        price_pe_df = pd.DataFrame()
+        price_pe_chart = None
+        price_pe_comment = ""
 
         if market == "US":
             raw_financial_trend = load_financial_trend_data(ticker)
             financial_trend = add_price_to_financial_trend(raw_financial_trend, df)
+            price_pe_chart, price_pe_df = make_price_pe_trend_chart(financial_trend, valuation, ticker)
+            price_pe_comment = make_price_pe_comment(price_pe_df)
             financial_chart = make_financial_trend_chart(financial_trend, ticker)
+        else:
+            price_pe_comment = "한국 종목은 yfinance 재무제표 기반 P/E 추세 데이터가 제한적입니다."
 
         default_event_df = normalize_event_schedule(make_default_event_schedule())
 
@@ -1743,15 +1834,39 @@ if run:
         st.write(valuation_comment)
 
         # =================================================
-        # 6. P/E Band Chart
+        # 6. Price + P/E Trend
         # =================================================
-        st.markdown("## 6. P/E Band Chart")
+        st.markdown("## 6. Price + P/E Trend")
 
-        if pe_band_fig is None:
-            st.info("Forward P/E 데이터가 없어 P/E Band Chart를 표시할 수 없습니다.")
+        st.info(
+            "주가와 P/E를 같이 봅니다. "
+            "주가가 올라도 P/E가 낮아지면 실적 개선이 주가 상승을 정당화하는 구간일 수 있습니다. "
+            "반대로 주가가 빠졌는데 P/E가 높아지면 이익 악화 가능성을 확인해야 합니다."
+        )
+
+        if market != "US":
+            st.info("한국 종목은 yfinance 재무제표 기반 P/E 추세 데이터가 제한적이라 이 차트를 표시하지 않습니다.")
+        elif price_pe_chart is None:
+            st.info("P/E 추세 계산에 필요한 EPS TTM 데이터가 부족합니다.")
         else:
-            st.pyplot(pe_band_fig)
-            st.dataframe(pe_band_df, use_container_width=True)
+            st.pyplot(price_pe_chart)
+            st.write(price_pe_comment)
+
+            show_price_pe_df = price_pe_df.copy()
+            show_price_pe_df["date"] = pd.to_datetime(show_price_pe_df["date"]).dt.strftime("%Y-%m-%d")
+            for col in ["price", "eps_ttm", "pe_ttm"]:
+                if col in show_price_pe_df.columns:
+                    show_price_pe_df[col] = show_price_pe_df[col].apply(lambda x: None if pd.isna(x) else round(float(x), 2))
+
+            with st.expander("Price + P/E 데이터 보기"):
+                st.dataframe(show_price_pe_df[["date", "price", "eps_ttm", "pe_ttm"]], use_container_width=True)
+
+        with st.expander("Forward P/E Band Chart 보기"):
+            if pe_band_fig is None:
+                st.info("Forward P/E 데이터가 없어 P/E Band Chart를 표시할 수 없습니다.")
+            else:
+                st.pyplot(pe_band_fig)
+                st.dataframe(pe_band_df, use_container_width=True)
 
         # =================================================
         # 7. 차트
