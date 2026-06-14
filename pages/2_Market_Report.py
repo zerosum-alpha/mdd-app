@@ -325,6 +325,40 @@ def format_name_list(df: pd.DataFrame, max_n: int = 3) -> str:
         return "-"
     return ", ".join(format_row_name(r) for _, r in df.head(max_n).iterrows())
 
+def detect_market(raw_ticker: str, resolved_ticker: str = "") -> str:
+    """화면 표시용 시장 구분. 한국/미국/기타를 명확히 나눈다."""
+    raw = str(raw_ticker or "").strip().upper()
+    resolved = str(resolved_ticker or "").strip().upper()
+    candidates = [raw, resolved]
+    if raw in ["KOSPI", "KOSDAQ", "KOSPI200"] or resolved in ["^KS11", "^KQ11", "^KS200"]:
+        return "한국"
+    for t in candidates:
+        if re.fullmatch(r"\d{6}", t):
+            return "한국"
+        if re.search(r"\.(KS|KQ)$", t):
+            return "한국"
+    if raw.startswith("^") and raw not in ["^KS11", "^KQ11", "^KS200"]:
+        return "미국"
+    if resolved.startswith("^") and resolved not in ["^KS11", "^KQ11", "^KS200"]:
+        return "미국"
+    if raw or resolved:
+        return "미국"
+    return "기타"
+
+
+def market_badge(market: str) -> str:
+    if market == "한국":
+        return "🇰🇷 한국"
+    if market == "미국":
+        return "🇺🇸 미국"
+    return "기타"
+
+
+def filter_market(df: pd.DataFrame, market: str) -> pd.DataFrame:
+    if df is None or df.empty or "시장" not in df.columns:
+        return pd.DataFrame()
+    return df[df["시장"] == market].copy()
+
 
 def ticker_candidates(ticker: str) -> List[str]:
     raw = str(ticker).strip()
@@ -457,7 +491,7 @@ def universe_to_rows(universe: Dict[str, List[str]]) -> pd.DataFrame:
     rows = []
     for theme, tickers in universe.items():
         for i, ticker in enumerate(tickers):
-            rows.append({"테마": theme, "종목명": get_display_name(ticker), "티커": ticker, "대표순위": i + 1})
+            rows.append({"시장": detect_market(ticker), "테마": theme, "종목명": get_display_name(ticker), "티커": ticker, "대표순위": i + 1})
     return pd.DataFrame(rows)
 
 
@@ -556,7 +590,7 @@ def calc_ticker_metrics(ticker: str, period: str = "90d") -> Dict[str, Any]:
     df, resolved_ticker = load_price_single(ticker, period=period)
     if df.empty or "Close" not in df.columns:
         return {
-            "티커": ticker, "종목명": get_display_name(ticker, resolved_ticker), "표시명": format_name_ticker(ticker, resolved_ticker), "조회티커": resolved_ticker, "현재가": np.nan,
+            "시장": detect_market(ticker, resolved_ticker), "티커": ticker, "종목명": get_display_name(ticker, resolved_ticker), "표시명": format_name_ticker(ticker, resolved_ticker), "조회티커": resolved_ticker, "현재가": np.nan,
             "1일": np.nan, "3일": np.nan, "5일": np.nan, "20일": np.nan,
             "거래량비율": np.nan, "Current DD": np.nan, "RSI": np.nan,
             "20일고점근접": False, "흐름점수": np.nan, "상태": "데이터 없음",
@@ -564,7 +598,7 @@ def calc_ticker_metrics(ticker: str, period: str = "90d") -> Dict[str, Any]:
 
     close = pd.to_numeric(df["Close"], errors="coerce").dropna()
     if close.empty:
-        return {"티커": ticker, "종목명": get_display_name(ticker, resolved_ticker), "표시명": format_name_ticker(ticker, resolved_ticker), "조회티커": resolved_ticker, "상태": "데이터 없음"}
+        return {"시장": detect_market(ticker, resolved_ticker), "티커": ticker, "종목명": get_display_name(ticker, resolved_ticker), "표시명": format_name_ticker(ticker, resolved_ticker), "조회티커": resolved_ticker, "상태": "데이터 없음"}
     volume = pd.to_numeric(df.get("Volume", pd.Series(index=df.index, dtype=float)), errors="coerce")
     cur = close.iloc[-1]
 
@@ -597,6 +631,7 @@ def calc_ticker_metrics(ticker: str, period: str = "90d") -> Dict[str, Any]:
     score += math.log(vr) * 4.0
 
     return {
+        "시장": detect_market(ticker, resolved_ticker),
         "티커": ticker,
         "종목명": get_display_name(ticker, resolved_ticker),
         "표시명": format_name_ticker(ticker, resolved_ticker),
@@ -620,6 +655,7 @@ def scan_universe(universe_rows: pd.DataFrame, period: str = "90d") -> pd.DataFr
     rows = []
     for _, r in universe_rows.iterrows():
         m = calc_ticker_metrics(str(r["티커"]), period=period)
+        m["시장"] = m.get("시장", r.get("시장", detect_market(str(r["티커"]))))
         m["테마"] = r["테마"]
         m["대표순위"] = r.get("대표순위", 999)
         rows.append(m)
@@ -926,12 +962,82 @@ with st.spinner("뉴스와 자동 스캔 유니버스 데이터를 불러오는 
         news_df = news_df.drop_duplicates(subset=["제목", "링크"], keep="first")
 
     detail_df = scan_universe(universe_rows, period=lookback)
+    if "시장" not in detail_df.columns:
+        detail_df["시장"] = detail_df.apply(lambda r: detect_market(r.get("티커", ""), r.get("조회티커", "")), axis=1)
+
+    detail_us = filter_market(detail_df, "미국")
+    detail_kr = filter_market(detail_df, "한국")
+
     theme_flow_df = classify_theme_flow(detail_df)
+    theme_flow_us = classify_theme_flow(detail_us)
+    theme_flow_kr = classify_theme_flow(detail_kr)
+
     candidate_df = pick_theme_candidates(theme_flow_df, detail_df)
+    candidate_us = pick_theme_candidates(theme_flow_us, detail_us)
+    candidate_kr = pick_theme_candidates(theme_flow_kr, detail_kr)
+
     early_df = calc_news_early_signal(news_df, theme_flow_df, detail_df)
+    early_us = calc_news_early_signal(news_df, theme_flow_us, detail_us)
+    early_kr = calc_news_early_signal(news_df, theme_flow_kr, detail_kr)
+
     inflow_df, outflow_df, unusual_df = global_stock_rankings(detail_df)
+    inflow_us, outflow_us, unusual_us = global_stock_rankings(detail_us)
+    inflow_kr, outflow_kr, unusual_kr = global_stock_rankings(detail_kr)
 
 summary = make_top_summary(theme_flow_df, early_df)
+summary_us = make_top_summary(theme_flow_us, early_us)
+summary_kr = make_top_summary(theme_flow_kr, early_kr)
+
+
+def render_flow_summary(title: str, summary_obj: Dict[str, str]) -> None:
+    st.markdown(f"**{title}**")
+    st.markdown(
+        f"""
+- **강한 유입:** {summary_obj['강한 유입']}
+- **유입:** {summary_obj['유입']}
+- **유출:** {summary_obj['유출']}
+- **뉴스 초입 후보:** {summary_obj['뉴스 초입 후보']}
+- **추격 금지:** {summary_obj['추격 금지']}
+"""
+    )
+
+
+def render_rank_tables(in_df: pd.DataFrame, out_df: pd.DataFrame, vol_df: pd.DataFrame, n: int = 8) -> None:
+    cols = ["시장", "테마", "종목명", "티커", "1일", "3일", "5일", "거래량비율", "Current DD", "RSI", "흐름점수"]
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown("#### 수급 유입")
+        st.dataframe(display_pct_table(top_table(in_df, cols, n), ["1일", "3일", "5일"]), use_container_width=True, hide_index=True)
+    with c2:
+        st.markdown("#### 수급 유출")
+        st.dataframe(display_pct_table(top_table(out_df, cols, n), ["1일", "3일", "5일"]), use_container_width=True, hide_index=True)
+    with c3:
+        st.markdown("#### 거래량 급증")
+        vol_cols = ["시장", "테마", "종목명", "티커", "1일", "3일", "5일", "거래량비율", "Current DD", "RSI"]
+        st.dataframe(display_pct_table(top_table(vol_df, vol_cols, n), ["1일", "3일", "5일"]), use_container_width=True, hide_index=True)
+
+
+def render_theme_flow(df: pd.DataFrame) -> None:
+    flow_cols = ["테마", "상태", "1일 평균", "3일 평균", "5일 평균", "거래량비율", "대표 강세 종목", "대표 약세 종목", "판단 메모"]
+    if df is None or df.empty:
+        st.info("표시할 테마 흐름 데이터가 없습니다.")
+    else:
+        st.dataframe(display_pct_table(df[flow_cols], ["1일 평균", "3일 평균", "5일 평균"]), use_container_width=True, hide_index=True)
+
+
+def render_candidate_table(df: pd.DataFrame) -> None:
+    if df is None or df.empty:
+        st.info("표시할 후보 데이터가 없습니다.")
+    else:
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+
+def render_early_table(df: pd.DataFrame) -> None:
+    if df is None or df.empty:
+        st.info("뉴스 초입 신호 데이터가 없습니다.")
+    else:
+        st.dataframe(df[["테마", "뉴스 초입 가능성", "이유", "행동"]], use_container_width=True, hide_index=True)
+
 
 # 4. Today summary cards
 st.markdown("## 1. 오늘 시장 요약")
@@ -960,66 +1066,79 @@ c2.metric("위험도", risk)
 c3.metric("매수 판단", buy_judge)
 c4.metric("추격매수", chase)
 
-# 5. Objective flow summary
+# 5. Objective flow summary - market separated
 st.markdown("## 2. 돈의 흐름 요약")
-st.markdown(
-    f"""
-- **강한 유입:** {summary['강한 유입']}
-- **유입:** {summary['유입']}
-- **유출:** {summary['유출']}
-- **뉴스 초입 후보:** {summary['뉴스 초입 후보']}
-- **추격 금지:** {summary['추격 금지']}
-"""
-)
+sg1, sg2, sg3 = st.tabs(["전체", "미국", "한국"])
+with sg1:
+    render_flow_summary("전체", summary)
+with sg2:
+    render_flow_summary("미국", summary_us)
+with sg3:
+    render_flow_summary("한국", summary_kr)
 
-r1, r2, r3 = st.columns(3)
-with r1:
-    st.markdown("### 수급 유입 종목")
-    cols = ["테마", "종목명", "티커", "1일", "3일", "5일", "거래량비율", "Current DD", "RSI", "흐름점수"]
-    st.dataframe(display_pct_table(top_table(inflow_df, cols, 8), ["1일", "3일", "5일"]), use_container_width=True, hide_index=True)
-with r2:
-    st.markdown("### 수급 유출 종목")
-    cols = ["테마", "종목명", "티커", "1일", "3일", "5일", "거래량비율", "Current DD", "RSI", "흐름점수"]
-    st.dataframe(display_pct_table(top_table(outflow_df, cols, 8), ["1일", "3일", "5일"]), use_container_width=True, hide_index=True)
-with r3:
-    st.markdown("### 거래량 급증")
-    cols = ["테마", "종목명", "티커", "1일", "3일", "5일", "거래량비율", "Current DD", "RSI"]
-    st.dataframe(display_pct_table(top_table(unusual_df, cols, 8), ["1일", "3일", "5일"]), use_container_width=True, hide_index=True)
+st.markdown("## 3. 수급 유입/유출/거래량 급증")
+st.caption("미국과 한국을 섞지 않도록 표를 분리했습니다. 한국 종목은 종목명과 코드가 같이 표시됩니다.")
+tab_us, tab_kr, tab_all = st.tabs(["미국", "한국", "전체"])
+with tab_us:
+    render_rank_tables(inflow_us, outflow_us, unusual_us)
+with tab_kr:
+    render_rank_tables(inflow_kr, outflow_kr, unusual_kr)
+with tab_all:
+    render_rank_tables(inflow_df, outflow_df, unusual_df)
 
-# 6. Market indicators
-st.markdown("## 3. 주요 시장 지표")
-main_rows = [calc_ticker_metrics(t, period=lookback) for t in MAIN_INDICATORS]
-main_df = pd.DataFrame(main_rows)
-show_cols = ["종목명", "티커", "현재가", "1일", "3일", "5일", "20일", "거래량비율", "Current DD", "RSI"]
-st.dataframe(display_pct_table(main_df[show_cols], ["1일", "3일", "5일", "20일"]), use_container_width=True, hide_index=True)
-with st.expander("추가 시장 지표 보기", expanded=False):
-    extra_rows = [calc_ticker_metrics(t, period=lookback) for t in EXTRA_INDICATORS]
-    extra_df = pd.DataFrame(extra_rows)
-    st.dataframe(display_pct_table(extra_df[show_cols], ["1일", "3일", "5일", "20일"]), use_container_width=True, hide_index=True)
+# 6. Market indicators - separated
+st.markdown("## 4. 주요 시장 지표")
+us_indicator_list = ["QQQ", "SPY", "SOXX", "^VIX", "USO", "IWM", "^TNX", "UUP", "NVDA", "MU", "VRT", "GOOGL"]
+kr_indicator_list = ["EWY", "KOSPI", "KOSDAQ", "069500.KS", "102110.KS", "360750.KS", "379810.KS"]
+ind_cols = ["시장", "종목명", "티커", "현재가", "1일", "3일", "5일", "20일", "거래량비율", "Current DD", "RSI"]
+ind_us = pd.DataFrame([calc_ticker_metrics(t, period=lookback) for t in us_indicator_list])
+ind_kr = pd.DataFrame([calc_ticker_metrics(t, period=lookback) for t in kr_indicator_list])
+mi_us, mi_kr = st.tabs(["미국/글로벌 지표", "한국 지표·ETF"])
+with mi_us:
+    st.dataframe(display_pct_table(ind_us[ind_cols], ["1일", "3일", "5일", "20일"]), use_container_width=True, hide_index=True)
+with mi_kr:
+    st.dataframe(display_pct_table(ind_kr[ind_cols], ["1일", "3일", "5일", "20일"]), use_container_width=True, hide_index=True)
 
 # 7. News top 5
-st.markdown("## 4. 최근 뉴스 TOP 5")
+st.markdown("## 5. 최근 뉴스 TOP 5")
 if news_df.empty:
     st.warning("뉴스를 불러오지 못했습니다. RSS URL 또는 수동 입력을 확인하세요.")
 else:
     st.dataframe(news_df.head(5)[["시간", "제목", "출처", "관련 테마", "영향", "신뢰도", "요약 메모", "링크"]], use_container_width=True, hide_index=True)
 
-# 8. Theme flow ranking
-st.markdown("## 5. 돈의 흐름 테마 순위")
-flow_cols = ["테마", "상태", "1일 평균", "3일 평균", "5일 평균", "거래량비율", "대표 강세 종목", "대표 약세 종목", "판단 메모"]
-st.dataframe(display_pct_table(theme_flow_df[flow_cols], ["1일 평균", "3일 평균", "5일 평균"]), use_container_width=True, hide_index=True)
+# 8. Theme flow ranking - separated
+st.markdown("## 6. 돈의 흐름 테마 순위")
+tf_us, tf_kr, tf_all = st.tabs(["미국", "한국", "전체"])
+with tf_us:
+    render_theme_flow(theme_flow_us)
+with tf_kr:
+    render_theme_flow(theme_flow_kr)
+with tf_all:
+    render_theme_flow(theme_flow_df)
 
-# 9. Leaders / laggards / hidden
-st.markdown("## 6. 테마별 대장주 / 후발주 / 숨은 후보")
-st.caption("자동 스캔 결과입니다. 숨은 후보는 추천이 아니라 관찰 후보입니다.")
-st.dataframe(candidate_df, use_container_width=True, hide_index=True)
+# 9. Leaders / laggards / hidden - separated
+st.markdown("## 7. 테마별 대장주 / 후발주 / 숨은 후보")
+st.caption("자동 스캔 결과입니다. 숨은 후보는 추천이 아니라 관찰 후보입니다. 미국/한국을 분리했습니다.")
+ca_us, ca_kr, ca_all = st.tabs(["미국", "한국", "전체"])
+with ca_us:
+    render_candidate_table(candidate_us)
+with ca_kr:
+    render_candidate_table(candidate_kr)
+with ca_all:
+    render_candidate_table(candidate_df)
 
-# 10. Early news signal
-st.markdown("## 7. 뉴스 초입 가능성")
-st.dataframe(early_df[["테마", "뉴스 초입 가능성", "이유", "행동"]], use_container_width=True, hide_index=True)
+# 10. Early news signal - separated
+st.markdown("## 8. 뉴스 초입 가능성")
+es_us, es_kr, es_all = st.tabs(["미국", "한국", "전체"])
+with es_us:
+    render_early_table(early_us)
+with es_kr:
+    render_early_table(early_kr)
+with es_all:
+    render_early_table(early_df)
 
 # 11. Risks
-st.markdown("## 8. 주요 리스크")
+st.markdown("## 9. 주요 리스크")
 risk_news = news_df[(news_df["관련 테마"] == "매크로 리스크") | (news_df["영향"].isin(["부정", "혼재"]))].head(5) if not news_df.empty else pd.DataFrame()
 if risk_news.empty:
     st.success("상단 뉴스 기준 주요 리스크 신호는 제한적입니다.")
@@ -1038,12 +1157,30 @@ with st.expander("상세 뉴스 전체 보기", expanded=False):
         )
 
 with st.expander("상세 종목 데이터 전체 보기", expanded=False):
-    st.dataframe(display_pct_table(detail_df, ["1일", "3일", "5일", "20일"]), use_container_width=True, hide_index=True)
-    st.download_button(
-        "종목 데이터 CSV 다운로드",
-        data=detail_df.to_csv(index=False).encode("utf-8-sig"),
-        file_name="theme_flow_detail.csv",
-        mime="text/csv",
-    )
+    d_us, d_kr, d_all = st.tabs(["미국", "한국", "전체"])
+    with d_us:
+        st.dataframe(display_pct_table(detail_us, ["1일", "3일", "5일", "20일"]), use_container_width=True, hide_index=True)
+        st.download_button(
+            "미국 종목 데이터 CSV 다운로드",
+            data=detail_us.to_csv(index=False).encode("utf-8-sig"),
+            file_name="theme_flow_detail_us.csv",
+            mime="text/csv",
+        )
+    with d_kr:
+        st.dataframe(display_pct_table(detail_kr, ["1일", "3일", "5일", "20일"]), use_container_width=True, hide_index=True)
+        st.download_button(
+            "한국 종목 데이터 CSV 다운로드",
+            data=detail_kr.to_csv(index=False).encode("utf-8-sig"),
+            file_name="theme_flow_detail_kr.csv",
+            mime="text/csv",
+        )
+    with d_all:
+        st.dataframe(display_pct_table(detail_df, ["1일", "3일", "5일", "20일"]), use_container_width=True, hide_index=True)
+        st.download_button(
+            "전체 종목 데이터 CSV 다운로드",
+            data=detail_df.to_csv(index=False).encode("utf-8-sig"),
+            file_name="theme_flow_detail_all.csv",
+            mime="text/csv",
+        )
 
-st.caption("주의: 자동 스캔은 기본 유니버스 안에서의 객관적 가격·거래량 변화입니다. 전체 상장종목 전체검색은 별도 KRX/Nasdaq screener API가 필요합니다. 루머성 정보는 사실로 확정하지 말고 공시·거래대금으로 재확인하세요.")
+st.caption("주의: 자동 스캔은 기본 유니버스 안에서의 객관적 가격·거래량 변화입니다. 전체 상장종목 전수검색은 별도 KRX/Nasdaq screener API가 필요합니다. 루머성 정보는 사실로 확정하지 말고 공시·거래대금으로 재확인하세요.")
