@@ -1170,11 +1170,13 @@ def make_cash_mdd_comment(current_dd, rsi, recovery_needed, total_score):
 @st.cache_data(ttl=86400)
 def load_kr_fundamental_by_date(ticker, start_date):
     """
-    pykrx에서 한국 종목의 일별 PER/PBR/EPS를 가져온다.
-    주의:
-    - 이 PER은 Dataguide/FnGuide의 12개월 예상 PER이 아니다.
-    - KRX 제공 실적 기반 PER/PBR/EPS다.
-    - 그래도 '주가와 PER이 같이 어떻게 움직이는지'를 보는 용도로는 유용하다.
+    pykrx에서 한국 종목의 PER/PBR/EPS를 가져온다.
+
+    중요:
+    - pykrx 공식 사용 함수는 get_market_fundamental(start, end, ticker, freq="m")다.
+    - get_market_fundamental_by_date()는 환경에 따라 없어서 Streamlit Cloud에서 실패할 수 있다.
+    - 월말 기준 PER/PBR/EPS를 가져와 주가와 날짜 기준으로 병합한다.
+    - Dataguide/FnGuide의 12개월 예상 PER은 아니고 KRX 실적 기반 PER이다.
     """
     if krx_stock is None:
         return pd.DataFrame()
@@ -1183,15 +1185,24 @@ def load_kr_fundamental_by_date(ticker, start_date):
         start = pd.Timestamp(start_date).strftime("%Y%m%d")
         end = datetime.today().strftime("%Y%m%d")
 
-        f = krx_stock.get_market_fundamental_by_date(start, end, ticker)
+        # pykrx 공식 방식: 특정 종목 기간별 PER/PBR/EPS
+        try:
+            f = krx_stock.get_market_fundamental(start, end, ticker, freq="m")
+        except TypeError:
+            # 구버전 호환: freq 파라미터가 없으면 일별로 시도
+            f = krx_stock.get_market_fundamental(start, end, ticker)
+
         if f is None or f.empty:
             return pd.DataFrame()
 
         f = f.copy()
         f.index = pd.to_datetime(f.index)
-        f = f.reset_index().rename(columns={"날짜": "date", "index": "date"})
+        f = f.reset_index()
 
-        # pykrx 버전에 따라 컬럼명이 한글/영문일 수 있어 정규화
+        # 첫 컬럼명을 date로 통일
+        first_col = f.columns[0]
+        f = f.rename(columns={first_col: "date"})
+
         rename_map = {
             "PER": "per",
             "PBR": "pbr",
@@ -1205,9 +1216,18 @@ def load_kr_fundamental_by_date(ticker, start_date):
         keep_cols = [c for c in ["date", "per", "pbr", "eps", "bps", "div", "dps"] if c in f.columns]
         f = f[keep_cols].copy()
 
+        f["date"] = pd.to_datetime(f["date"], errors="coerce")
+        f = f.dropna(subset=["date"])
+
         for col in ["per", "pbr", "eps", "bps", "div", "dps"]:
             if col in f.columns:
                 f[col] = pd.to_numeric(f[col], errors="coerce")
+
+        # 의미 없는 0 또는 극단값 제거
+        if "per" in f.columns:
+            f.loc[(f["per"] <= 0) | (f["per"] > 300), "per"] = pd.NA
+        if "pbr" in f.columns:
+            f.loc[(f["pbr"] <= 0) | (f["pbr"] > 30), "pbr"] = pd.NA
 
         return f.sort_values("date")
 
@@ -2315,7 +2335,7 @@ if run:
         )
 
         if market == "KR":
-            st.caption("한국 종목은 pykrx의 KRX 일별 PER/PBR/EPS 데이터를 사용합니다. Dataguide식 12개월 예상 PER은 아니지만, 주가와 PER 방향성을 함께 보는 용도입니다.")
+            st.caption("한국 종목은 pykrx의 KRX 월말 PER/PBR/EPS 데이터를 사용합니다. Dataguide식 12개월 예상 PER은 아니지만, 주가와 PER 방향성을 함께 보는 용도입니다.")
             if krx_stock is None:
                 st.error("pykrx가 설치되지 않았습니다. requirements.txt에 pykrx를 추가해야 합니다.")
             elif kr_price_per_chart is None:
