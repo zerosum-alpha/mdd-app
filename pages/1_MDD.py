@@ -725,8 +725,11 @@ def make_monthly_view(df, date_col="date"):
 
     temp = temp.set_index(date_col)
 
-    # 월말 기준. pandas 버전 호환을 위해 M 사용.
-    monthly = temp.resample("M").last().dropna(how="all").reset_index()
+    # pandas 3.x에서는 월말 리샘플링 별칭 M이 제거/비권장될 수 있어 ME를 우선 사용한다.
+    try:
+        monthly = temp.resample("ME").last().dropna(how="all").reset_index()
+    except Exception:
+        monthly = temp.resample("M").last().dropna(how="all").reset_index()
 
     if len(monthly) < 6:
         weekly = temp.resample("W-FRI").last().dropna(how="all").reset_index()
