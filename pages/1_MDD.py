@@ -1694,6 +1694,122 @@ def make_kr_price_per_comment(kr_plot_df):
 
     return f"최근 약 6개월 주가 변화 {price_change:.2f}%, PER 변화 {per_change:.2f}%. {direction_msg} {band_msg}"
 
+
+
+def make_us_price_implied_pe_series(price_df, current_price, valuation):
+    """
+    US fallback: yfinance가 과거 EPS TTM을 충분히 주지 않을 때,
+    현재 Forward/Trailing P/E로 역산한 EPS를 고정하고 일별 주가에 적용한다.
+
+    주의: 이 값은 과거 실제 P/E가 아니다.
+    - 주가가 어느 P/E 밴드로 이동했는지 보는 보조 차트
+    - Forward P/E 과거 시계열 대체용 아님
+    """
+    if price_df is None or price_df.empty or not is_valid_number(current_price):
+        return pd.DataFrame(), "P/E fallback 데이터를 만들 수 없습니다."
+
+    pe_source = None
+    pe_value = None
+
+    if isinstance(valuation, dict):
+        if is_valid_number(valuation.get("forward_pe")) and float(valuation.get("forward_pe")) > 0:
+            pe_source = "Current Forward P/E anchor"
+            pe_value = float(valuation.get("forward_pe"))
+        elif is_valid_number(valuation.get("trailing_pe")) and float(valuation.get("trailing_pe")) > 0:
+            pe_source = "Current Trailing P/E anchor"
+            pe_value = float(valuation.get("trailing_pe"))
+
+    if pe_value is None:
+        return pd.DataFrame(), "Forward P/E와 Trailing P/E가 없어 fallback P/E 차트를 만들 수 없습니다."
+
+    implied_eps = float(current_price) / pe_value
+    if implied_eps <= 0:
+        return pd.DataFrame(), "역산 EPS가 0 이하라 fallback P/E 차트를 만들 수 없습니다."
+
+    temp = price_df.copy().reset_index()
+    date_col = temp.columns[0]
+    temp = temp.rename(columns={date_col: "date", "Close": "price"})
+    temp["date"] = pd.to_datetime(temp["date"], errors="coerce")
+    try:
+        temp["date"] = temp["date"].dt.tz_localize(None)
+    except Exception:
+        pass
+    temp["price"] = pd.to_numeric(temp["price"], errors="coerce")
+    temp = temp.dropna(subset=["date", "price"]).copy()
+    temp = temp[temp["price"] > 0].sort_values("date")
+
+    if temp.empty:
+        return pd.DataFrame(), "주가 데이터가 없어 fallback P/E 차트를 만들 수 없습니다."
+
+    temp["eps_ttm"] = implied_eps
+    temp["pe_ttm"] = temp["price"] / implied_eps
+    temp["source"] = pe_source
+    temp["fiscal_date"] = pd.NaT
+    temp["report_date"] = pd.NaT
+    temp["revenue_ttm"] = pd.NA
+
+    return temp[["date", "price", "pe_ttm", "eps_ttm", "revenue_ttm", "fiscal_date", "report_date", "source"]], (
+        f"미국 종목 P/E 원자료가 부족해 {pe_source} 방식으로 일별 P/E를 표시합니다. "
+        f"이 차트는 과거 실제 Forward P/E가 아니라 현재 P/E로 역산한 EPS를 고정한 참고용 밴드입니다."
+    )
+
+
+def make_us_price_pe_like_kr_chart(price_pe_df, ticker, title_suffix="Estimated P/E"):
+    """
+    미국 종목도 한국 종목처럼 상단 Price / 하단 P/E 분리 차트로 표시한다.
+    """
+    if price_pe_df is None or price_pe_df.empty:
+        return None, pd.DataFrame()
+    if not {"date", "price", "pe_ttm"}.issubset(set(price_pe_df.columns)):
+        return None, pd.DataFrame()
+
+    chart_df = price_pe_df.copy()
+    chart_df["date"] = pd.to_datetime(chart_df["date"], errors="coerce")
+    chart_df["price"] = pd.to_numeric(chart_df["price"], errors="coerce")
+    chart_df["pe_ttm"] = pd.to_numeric(chart_df["pe_ttm"], errors="coerce")
+    chart_df = chart_df.dropna(subset=["date", "price", "pe_ttm"]).copy()
+    chart_df = chart_df[(chart_df["price"] > 0) & (chart_df["pe_ttm"] > 0) & (chart_df["pe_ttm"] < 300)].copy()
+    chart_df = chart_df.sort_values("date")
+
+    if chart_df.empty or len(chart_df) < 20:
+        return None, chart_df
+
+    plot_df = make_monthly_view(chart_df)
+    if plot_df.empty or len(plot_df) < 6:
+        plot_df = chart_df.copy()
+
+    fig = plt.figure(figsize=(13.5, 7.2))
+    gs = fig.add_gridspec(4, 1, hspace=0.10)
+    ax_price = fig.add_subplot(gs[0:3, 0])
+    ax_pe = fig.add_subplot(gs[3, 0], sharex=ax_price)
+
+    ax_price.plot(plot_df["date"], plot_df["price"], label="Price", linewidth=2)
+    ax_price.set_title(f"{ticker} Price vs {title_suffix}")
+    ax_price.set_ylabel("Price")
+    ax_price.grid(True, alpha=0.3)
+    ax_price.legend(loc="upper left")
+
+    ax_pe.plot(plot_df["date"], plot_df["pe_ttm"], label=title_suffix, linewidth=2)
+    ax_pe.set_ylabel("P/E")
+    ax_pe.grid(True, alpha=0.3)
+
+    pe_mean = plot_df["pe_ttm"].mean()
+    pe_std = plot_df["pe_ttm"].std()
+
+    if is_valid_number(pe_mean):
+        ax_pe.axhline(pe_mean, linestyle="-", alpha=0.45, label="P/E avg")
+    if is_valid_number(pe_std) and pe_std > 0:
+        ax_pe.axhline(pe_mean + pe_std, linestyle=":", alpha=0.45, label="P/E +1SD")
+        ax_pe.axhline(max(pe_mean - pe_std, 0), linestyle=":", alpha=0.45, label="P/E -1SD")
+        ax_pe.axhline(pe_mean + 2 * pe_std, linestyle="-.", alpha=0.28, label="P/E +2SD")
+        ax_pe.axhline(max(pe_mean - 2 * pe_std, 0), linestyle="-.", alpha=0.28, label="P/E -2SD")
+
+    ax_pe.legend(loc="upper left", fontsize=8)
+    plt.setp(ax_price.get_xticklabels(), visible=False)
+    plt.tight_layout()
+    return fig, plot_df
+
+
 # =========================================================
 # Target Price
 # =========================================================
@@ -2455,9 +2571,20 @@ if run:
         if market == "US":
             raw_financial_trend = load_financial_trend_data(ticker)
             financial_trend = add_price_to_financial_trend(raw_financial_trend, df)
-            price_pe_chart, price_pe_df = make_price_pe_trend_chart(financial_trend, valuation, ticker)
+            price_pe_chart, price_pe_df = make_us_price_pe_like_kr_chart(financial_trend, ticker, "Estimated TTM P/E")
             price_pe_comment = make_price_pe_comment(price_pe_df)
             financial_chart = make_financial_trend_chart(financial_trend, ticker)
+
+            # yfinance가 EPS TTM 원자료를 충분히 주지 않으면, 현재 Forward/Trailing P/E 기반 fallback 차트를 표시
+            if price_pe_chart is None:
+                fallback_df, fallback_comment = make_us_price_implied_pe_series(df, current_price, valuation)
+                fallback_chart, fallback_plot_df = make_us_price_pe_like_kr_chart(fallback_df, ticker, "Price-implied P/E")
+                if fallback_chart is not None:
+                    price_pe_chart = fallback_chart
+                    price_pe_df = fallback_plot_df
+                    price_pe_comment = fallback_comment
+                elif fallback_comment:
+                    price_pe_comment = fallback_comment
         elif market == "KR":
             kr_valuation_trend = make_kr_price_valuation_df(ticker, start_date, df)
             kr_price_per_chart, kr_price_per_plot_df = make_kr_price_per_chart(kr_valuation_trend, ticker)
@@ -2711,7 +2838,7 @@ if run:
                     st.dataframe(show_kr_df[cols].tail(120), use_container_width=True)
 
         elif market == "US":
-            st.caption("미국 종목은 yfinance 재무제표 기반 Estimated TTM P/E를 사용합니다. 한국 종목처럼 상단 Price / 하단 P/E로 분리 표시합니다. FactSet식 12개월 Forward P/E 시계열은 아닙니다.")
+            st.caption("미국 종목은 한국 종목처럼 상단 Price / 하단 P/E로 분리 표시합니다. 우선 yfinance 재무제표 기반 Estimated TTM P/E를 사용하고, 데이터가 부족하면 현재 Forward/Trailing P/E로 역산한 Price-implied P/E를 표시합니다. FactSet식 12개월 Forward P/E 시계열은 아닙니다.")
             if price_pe_chart is None:
                 st.warning(price_pe_comment)
                 if not price_pe_df.empty:
