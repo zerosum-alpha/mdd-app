@@ -2,67 +2,47 @@ import warnings
 warnings.filterwarnings("ignore")
 
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 import re
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 
-# =========================================================
-# MDD Core Dashboard - Stable Final
-# 핵심만 표시:
-# - Price + MA20/60/200
-# - P/E, Current valuation
-# - MDD
-# - Market risk: US=VIX, KR=KOSPI/KOSDAQ drawdown
-# - BUY / CASH markers
-# =========================================================
-
-# ---------- Optional imports ----------
 try:
     import yfinance as yf
-    YF_AVAILABLE = True
-    YF_IMPORT_ERROR = ""
+    YF_OK = True
+    YF_ERR = ""
 except Exception as e:
     yf = None
-    YF_AVAILABLE = False
-    YF_IMPORT_ERROR = repr(e)
+    YF_OK = False
+    YF_ERR = repr(e)
 
 try:
     import FinanceDataReader as fdr
-    FDR_AVAILABLE = True
-    FDR_IMPORT_ERROR = ""
+    FDR_OK = True
+    FDR_ERR = ""
 except Exception as e:
     fdr = None
-    FDR_AVAILABLE = False
-    FDR_IMPORT_ERROR = repr(e)
+    FDR_OK = False
+    FDR_ERR = repr(e)
 
 try:
     from pykrx import stock as pkstock
-    PYKRX_AVAILABLE = True
-    PYKRX_IMPORT_ERROR = ""
+    PYKRX_OK = True
+    PYKRX_ERR = ""
 except Exception as e:
     pkstock = None
-    PYKRX_AVAILABLE = False
-    PYKRX_IMPORT_ERROR = repr(e)
+    PYKRX_OK = False
+    PYKRX_ERR = repr(e)
 
 try:
     import requests
-    REQUESTS_AVAILABLE = True
-    REQUESTS_IMPORT_ERROR = ""
+    REQ_OK = True
 except Exception as e:
     requests = None
-    REQUESTS_AVAILABLE = False
-    REQUESTS_IMPORT_ERROR = repr(e)
-
-try:
-    from bs4 import BeautifulSoup
-    BS4_AVAILABLE = True
-    BS4_IMPORT_ERROR = ""
-except Exception as e:
-    BeautifulSoup = None
-    BS4_AVAILABLE = False
-    BS4_IMPORT_ERROR = repr(e)
+    REQ_OK = False
 
 try:
     from auth import require_login, logout_button
@@ -72,18 +52,20 @@ except Exception:
     def logout_button():
         return None
 
-# ---------- Page ----------
-st.set_page_config(page_title="MDD 분석기", layout="wide")
+# =========================================================
+# Page
+# =========================================================
+st.set_page_config(page_title="MDD 핵심 분석기", layout="wide")
 require_login()
 logout_button()
 
-st.title("📈 MDD 저점매수 분석기 | Core Stable")
-st.caption("주가 / PER / MDD / 시장위험 / 이평선만 봅니다.")
+st.title("📈 MDD 저점매수 분석기 | Core No-Hang")
+st.caption("주가 / PER / MDD / 시장위험 / 이평선만 표시합니다. PER 조회가 실패해도 앱은 멈추지 않습니다.")
 
 # =========================================================
-# Utility
+# Utilities
 # =========================================================
-def normalize_dt_index(idx):
+def to_dt_index(idx):
     out = pd.to_datetime(idx, errors="coerce")
     try:
         out = out.tz_localize(None)
@@ -95,7 +77,7 @@ def normalize_dt_index(idx):
     return pd.DatetimeIndex(out).astype("datetime64[ns]")
 
 
-def yyyymmdd(x):
+def ymd(x):
     return pd.to_datetime(x).strftime("%Y%m%d")
 
 
@@ -115,22 +97,31 @@ def fmt_num(x, digits=2):
     return f"{v:,.{digits}f}"
 
 
-def fmt_pct(x, digits=2):
+def fmt_pct_ratio(x, digits=2):
     v = safe_float(x)
     if v is None:
         return "N/A"
-    return f"{v:.{digits}f}%"
+    return f"{v * 100:.{digits}f}%"
 
 
-def is_korean_text(text):
+def is_korean(text):
     return any("가" <= ch <= "힣" for ch in str(text))
 
 
-def compact_status(text, max_len=160):
-    text = str(text)
-    if len(text) <= max_len:
-        return text
-    return text[:max_len] + " ..."
+def run_with_timeout(fn, timeout_sec=8):
+    """Prevent pykrx/remote calls from freezing Streamlit."""
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(fn)
+    try:
+        result = future.result(timeout=timeout_sec)
+        executor.shutdown(wait=False, cancel_futures=True)
+        return result, "OK"
+    except TimeoutError:
+        executor.shutdown(wait=False, cancel_futures=True)
+        return None, f"timeout {timeout_sec}s"
+    except Exception as e:
+        executor.shutdown(wait=False, cancel_futures=True)
+        return None, repr(e)
 
 
 KR_FALLBACK_MAP = {
@@ -158,8 +149,8 @@ KR_FALLBACK_MAP = {
 # Ticker lookup
 # =========================================================
 @st.cache_data(ttl=86400)
-def get_krx_stock_list():
-    if not FDR_AVAILABLE:
+def kr_stock_list():
+    if not FDR_OK:
         return pd.DataFrame()
     try:
         df = fdr.StockListing("KRX")
@@ -175,29 +166,26 @@ def get_krx_stock_list():
         return pd.DataFrame()
 
 
-def find_ticker(query):
-    q = str(query).strip()
+def find_ticker(q):
+    q = str(q).strip()
     if not q:
         return None, None, None
-
     if q.isdigit() and len(q) == 6:
         return "KR", q, q
-
     if q in KR_FALLBACK_MAP:
         return "KR", KR_FALLBACK_MAP[q], q
 
-    stock_list = get_krx_stock_list()
-    if not stock_list.empty and {"Name", "Code"}.issubset(stock_list.columns):
-        exact = stock_list[stock_list["Name"] == q]
+    sl = kr_stock_list()
+    if not sl.empty and {"Name", "Code"}.issubset(sl.columns):
+        exact = sl[sl["Name"] == q]
         if not exact.empty:
             return "KR", exact.iloc[0]["Code"], exact.iloc[0]["Name"]
-        partial = stock_list[stock_list["Name"].str.contains(q, case=False, na=False)]
+        partial = sl[sl["Name"].str.contains(q, case=False, na=False)]
         if not partial.empty:
             return "KR", partial.iloc[0]["Code"], partial.iloc[0]["Name"]
 
-    if is_korean_text(q):
+    if is_korean(q):
         return None, None, None
-
     return "US", q.upper(), q.upper()
 
 # =========================================================
@@ -208,39 +196,34 @@ def load_price_data(market, ticker, start_date):
     start = pd.to_datetime(start_date).strftime("%Y-%m-%d")
     try:
         if market == "KR":
-            if not FDR_AVAILABLE:
-                return pd.DataFrame(), f"FinanceDataReader import 실패: {FDR_IMPORT_ERROR}"
+            if not FDR_OK:
+                return pd.DataFrame(), f"FinanceDataReader import 실패: {FDR_ERR}"
             df = fdr.DataReader(str(ticker).zfill(6), start)
-            if df is None or df.empty:
-                return pd.DataFrame(), "FinanceDataReader 가격 데이터 empty"
-            df = df.copy()
-            df.index = normalize_dt_index(df.index)
-            return df, "OK"
-
-        if market == "US":
-            if not YF_AVAILABLE:
-                return pd.DataFrame(), f"yfinance import 실패: {YF_IMPORT_ERROR}"
+        else:
+            if not YF_OK:
+                return pd.DataFrame(), f"yfinance import 실패: {YF_ERR}"
             df = yf.Ticker(ticker).history(start=start, auto_adjust=True)
-            if df is None or df.empty:
-                return pd.DataFrame(), "yfinance 가격 데이터 empty"
-            df = df.copy()
-            df.index = normalize_dt_index(df.index)
-            return df, "OK"
+        if df is None or df.empty:
+            return pd.DataFrame(), "가격 데이터 empty"
+        df = df.copy()
+        df.index = to_dt_index(df.index)
+        if "Volume" not in df.columns:
+            df["Volume"] = 0
+        return df[[c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]], "OK"
     except Exception as e:
         return pd.DataFrame(), repr(e)
-    return pd.DataFrame(), "unknown market"
 
 
 @st.cache_data(ttl=1800)
-def load_yf_close(ticker, start_date):
-    if not YF_AVAILABLE:
+def load_us_close(ticker, start_date):
+    if not YF_OK:
         return pd.DataFrame()
     try:
         df = yf.Ticker(ticker).history(start=pd.to_datetime(start_date).strftime("%Y-%m-%d"), auto_adjust=True)
         if df is None or df.empty:
             return pd.DataFrame()
         df = df.copy()
-        df.index = normalize_dt_index(df.index)
+        df.index = to_dt_index(df.index)
         return df[["Close"]].rename(columns={"Close": ticker})
     except Exception:
         return pd.DataFrame()
@@ -248,14 +231,14 @@ def load_yf_close(ticker, start_date):
 
 @st.cache_data(ttl=1800)
 def load_fdr_close(symbol, start_date):
-    if not FDR_AVAILABLE:
+    if not FDR_OK:
         return pd.DataFrame()
     try:
         df = fdr.DataReader(symbol, pd.to_datetime(start_date).strftime("%Y-%m-%d"))
         if df is None or df.empty:
             return pd.DataFrame()
         df = df.copy()
-        df.index = normalize_dt_index(df.index)
+        df.index = to_dt_index(df.index)
         return df[["Close"]].rename(columns={"Close": symbol})
     except Exception:
         return pd.DataFrame()
@@ -263,7 +246,7 @@ def load_fdr_close(symbol, start_date):
 # =========================================================
 # Indicators
 # =========================================================
-def calculate_rsi(close, period=14):
+def calc_rsi(close, period=14):
     delta = close.diff()
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
@@ -273,386 +256,239 @@ def calculate_rsi(close, period=14):
     return 100 - (100 / (1 + rs))
 
 
-def calculate_indicators(df):
-    df = df.copy()
-    if "Volume" not in df.columns:
-        df["Volume"] = 0
-    df["Peak"] = df["Close"].cummax()
-    df["Current_Drawdown"] = df["Close"] / df["Peak"] - 1
-    df["Max_Drawdown"] = df["Current_Drawdown"].cummin()
-    df["MA20"] = df["Close"].rolling(20).mean()
-    df["MA60"] = df["Close"].rolling(60).mean()
-    df["MA200"] = df["Close"].rolling(200).mean()
-    df["RSI"] = calculate_rsi(df["Close"], 14)
-    df["Volume_MA20"] = df["Volume"].rolling(20).mean()
-    df["Volume_Ratio"] = df["Volume"] / df["Volume_MA20"].replace(0, np.nan)
-    return df
+def add_indicators(df):
+    out = df.copy()
+    out["Peak"] = out["Close"].cummax()
+    out["Current_Drawdown"] = out["Close"] / out["Peak"] - 1
+    out["Max_Drawdown"] = out["Current_Drawdown"].cummin()
+    out["MA20"] = out["Close"].rolling(20).mean()
+    out["MA60"] = out["Close"].rolling(60).mean()
+    out["MA200"] = out["Close"].rolling(200).mean()
+    out["RSI"] = calc_rsi(out["Close"])
+    out["Volume_MA20"] = out["Volume"].rolling(20).mean()
+    out["Volume_Ratio"] = out["Volume"] / out["Volume_MA20"].replace(0, np.nan)
+    return out
 
 
-def de_dupe_signal(mask, min_gap=20):
+def spaced_signal(mask, min_gap=25):
     out = pd.Series(False, index=mask.index)
-    last_i = -10**9
+    last = -999999
     vals = mask.fillna(False).values
     for i, v in enumerate(vals):
-        if v and i - last_i >= min_gap:
+        if v and i - last >= min_gap:
             out.iloc[i] = True
-            last_i = i
+            last = i
     return out
 
 
 def build_signals(df):
+    buy = (df["Current_Drawdown"] <= -0.12) & (df["RSI"] <= 42)
+    cash = ((df["Current_Drawdown"] >= -0.03) & (df["RSI"] >= 68)) | ((df["Close"] > df["MA20"] * 1.08) & (df["RSI"] >= 65))
     sig = pd.DataFrame(index=df.index)
-    buy_raw = (df["Current_Drawdown"] <= -0.12) & (df["RSI"] <= 42)
-    cash_raw = ((df["Current_Drawdown"] >= -0.03) & (df["RSI"] >= 68)) | (
-        (df["Close"] > df["MA20"] * 1.08) & (df["RSI"] >= 65)
-    )
-    sig["Buy_Display"] = df["Close"].where(de_dupe_signal(buy_raw, min_gap=25))
-    sig["Cash_Display"] = df["Close"].where(de_dupe_signal(cash_raw, min_gap=35))
+    sig["Buy"] = df["Close"].where(spaced_signal(buy, 30))
+    sig["Cash"] = df["Close"].where(spaced_signal(cash, 45))
     return sig
 
 # =========================================================
-# Valuation - Current
+# Valuation
 # =========================================================
 @st.cache_data(ttl=3600)
-def load_us_current_valuation(ticker):
-    data = {"trailing_pe": None, "forward_pe": None, "price_to_sales": None, "peg_ratio": None}
-    if not YF_AVAILABLE:
-        return data, f"yfinance import 실패: {YF_IMPORT_ERROR}"
+def us_current_valuation(ticker):
+    data = {"ttm_pe": None, "fwd_pe": None, "ps": None, "peg": None}
+    if not YF_OK:
+        return data, f"yfinance import 실패: {YF_ERR}"
     try:
         info = yf.Ticker(ticker).info
-        data["trailing_pe"] = info.get("trailingPE")
-        data["forward_pe"] = info.get("forwardPE")
-        data["price_to_sales"] = info.get("priceToSalesTrailing12Months")
-        data["peg_ratio"] = info.get("pegRatio")
+        data["ttm_pe"] = info.get("trailingPE")
+        data["fwd_pe"] = info.get("forwardPE")
+        data["ps"] = info.get("priceToSalesTrailing12Months")
+        data["peg"] = info.get("pegRatio")
         return data, "OK"
     except Exception as e:
         return data, repr(e)
 
 
 @st.cache_data(ttl=3600)
-def load_kr_naver_current_valuation(code):
-    """Fallback: Naver current valuation snapshot only. Not historical."""
-    data = {"trailing_pe": None, "forward_pe": None, "price_to_sales": None, "peg_ratio": None, "eps": None}
-    if not REQUESTS_AVAILABLE:
-        return data, f"requests import 실패: {REQUESTS_IMPORT_ERROR}"
-
-    url = f"https://finance.naver.com/item/main.naver?code={str(code).zfill(6)}"
+def naver_current_per(code):
+    data = {"ttm_pe": None, "fwd_pe": None, "ps": None, "peg": None, "eps": None}
+    if not REQ_OK:
+        return data, "requests 없음"
     try:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        r = requests.get(url, headers=headers, timeout=8)
+        url = f"https://finance.naver.com/item/main.naver?code={str(code).zfill(6)}"
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
         r.raise_for_status()
         html = r.text
 
-        def _extract_id(id_name):
-            # Naver often uses ids like _per, _eps, _pbr
-            m = re.search(rf'id=["\']{re.escape(id_name)}["\'][^>]*>\s*([^<]+)\s*<', html)
-            if m:
-                return safe_float(m.group(1))
-            return None
+        def pick(_id):
+            m = re.search(rf'id=["\']{re.escape(_id)}["\'][^>]*>\s*([^<]+)\s*<', html)
+            return safe_float(m.group(1)) if m else None
 
-        data["trailing_pe"] = _extract_id("_per")
-        data["eps"] = _extract_id("_eps")
-        # keep PBR inside status only; main cards are P/E, Fwd P/E, P/S, PEG
-        pbr = _extract_id("_pbr")
-        status = "OK: Naver current snapshot"
+        data["ttm_pe"] = pick("_per")
+        data["eps"] = pick("_eps")
+        pbr = pick("_pbr")
+        status = "OK: Naver current PER" if data["ttm_pe"] is not None else "Naver current PER 없음"
         if pbr is not None:
-            status += f" / PBR={pbr:.2f}"
-        if data["trailing_pe"] is None:
-            status = "Naver current PER not found"
+            status += f" / PBR {pbr:.2f}"
         return data, status
     except Exception as e:
-        return data, f"Naver current valuation error: {repr(e)}"
-
-# =========================================================
-# KR historical P/E with robust pykrx loaders
-# =========================================================
-FUND_ALIASES = {
-    "BPS": ["BPS", "bps", "주당순자산", "주당순자산가치"],
-    "PER": ["PER", "per", "P/E", "PE", "주가수익비율"],
-    "PBR": ["PBR", "pbr", "P/B", "PB", "주가순자산비율"],
-    "EPS": ["EPS", "eps", "주당순이익"],
-    "DIV": ["DIV", "div", "배당수익률"],
-    "DPS": ["DPS", "dps", "주당배당금"],
-}
+        return data, f"Naver PER error: {repr(e)}"
 
 
-def flatten_columns(df):
-    out = df.copy()
-    if isinstance(out.columns, pd.MultiIndex):
-        out.columns = ["_".join([str(x) for x in tup if str(x) != ""]).strip() for tup in out.columns]
+def canonical_fundamental(raw):
+    if raw is None or not isinstance(raw, pd.DataFrame) or raw.empty:
+        return pd.DataFrame()
+    df = raw.copy()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = ["_".join(map(str, c)).strip() for c in df.columns]
     else:
-        out.columns = [str(c).strip() for c in out.columns]
-    return out
-
-
-def canonical_fundamental_df(raw):
-    if raw is None or not isinstance(raw, pd.DataFrame) or raw.empty:
+        df.columns = [str(c).strip().upper() for c in df.columns]
+    cols = {}
+    for c in df.columns:
+        cc = str(c).upper().strip()
+        if cc in ["PER", "PBR", "EPS", "BPS", "DIV", "DPS"]:
+            cols[c] = cc
+    df = df.rename(columns=cols)
+    keep = [c for c in ["PER", "PBR", "EPS", "BPS", "DIV", "DPS"] if c in df.columns]
+    if not keep:
         return pd.DataFrame()
-
-    candidates = []
-    candidates.append(flatten_columns(raw))
-    try:
-        candidates.append(flatten_columns(raw.T))
-    except Exception:
-        pass
-
-    for cand in candidates:
-        if cand is None or cand.empty:
-            continue
-
-        rename = {}
-        for canonical, aliases in FUND_ALIASES.items():
-            for c in cand.columns:
-                cs = str(c).strip()
-                if cs in aliases or cs.upper() == canonical:
-                    rename[c] = canonical
-                    break
-        temp = cand.rename(columns=rename)
-        keep = [c for c in ["BPS", "PER", "PBR", "EPS", "DIV", "DPS"] if c in temp.columns]
-        if "PER" in keep or "EPS" in keep:
-            out = temp[keep].copy()
-            for c in keep:
-                out[c] = pd.to_numeric(out[c], errors="coerce")
-            return out.dropna(how="all")
-
-    return pd.DataFrame()
-
-
-def extract_ticker_row(raw, ticker):
-    if raw is None or not isinstance(raw, pd.DataFrame) or raw.empty:
-        return pd.DataFrame()
-    ticker = str(ticker).zfill(6)
-    raw = raw.copy()
-    idx = raw.index.astype(str).str.zfill(6)
-    if ticker in set(idx):
-        return raw.loc[idx == ticker]
-    for col in ["티커", "Ticker", "Code", "종목코드"]:
-        if col in raw.columns:
-            mask = raw[col].astype(str).str.zfill(6) == ticker
-            if mask.any():
-                return raw.loc[mask]
-    return pd.DataFrame()
-
-
-def clean_per_out(out, price_df=None):
-    if out is None or out.empty:
-        return pd.DataFrame()
-    out = out.copy()
-    # date index
-    try:
-        out.index = normalize_dt_index(out.index)
-    except Exception:
-        pass
-    for c in out.columns:
+    out = df[keep].copy()
+    for c in keep:
         out[c] = pd.to_numeric(out[c], errors="coerce")
-
-    # If PER is missing but EPS exists, calculate Price/EPS after join later.
-    if "PER" in out.columns:
-        out["PER"] = pd.to_numeric(out["PER"], errors="coerce")
-        out = out[(out["PER"] > 0) & (out["PER"] < 500)]
     return out.dropna(how="all")
 
 
-@st.cache_data(ttl=3600)
-def load_kr_per_series(code, start_date, end_date):
-    if not PYKRX_AVAILABLE:
-        return pd.DataFrame(), f"pykrx import 실패: {PYKRX_IMPORT_ERROR}", PYKRX_IMPORT_ERROR
+@st.cache_data(ttl=3600, show_spinner=False)
+def kr_per_series_nohang(code, start_date, end_date, timeout_sec=7):
+    if not PYKRX_OK:
+        return pd.DataFrame(), f"pykrx import 실패: {PYKRX_ERR}"
 
-    code = str(code).strip().zfill(6)
-    start = yyyymmdd(start_date)
-    end = yyyymmdd(end_date)
-    debug = []
+    code = str(code).zfill(6)
+    start = ymd(start_date)
+    end = ymd(end_date)
 
-    # 1. Official period APIs. Support multiple versions.
-    calls = []
-    if hasattr(pkstock, "get_market_fundamental"):
-        calls.extend([
-            ("period get_market_fundamental", lambda: pkstock.get_market_fundamental(start, end, code)),
-            ("period get_market_fundamental freq=d", lambda: pkstock.get_market_fundamental(start, end, code, freq="d")),
-            ("period get_market_fundamental freq=m", lambda: pkstock.get_market_fundamental(start, end, code, freq="m")),
-        ])
-    if hasattr(pkstock, "get_market_fundamental_by_date"):
-        calls.append(("period get_market_fundamental_by_date", lambda: pkstock.get_market_fundamental_by_date(start, end, code)))
-
-    for name, fn in calls:
-        try:
-            raw = fn()
-            debug.append(f"{name}: shape={getattr(raw, 'shape', None)} cols={list(getattr(raw, 'columns', []))[:6]}")
-            out = canonical_fundamental_df(raw)
-            if not out.empty:
-                # preserve date index when possible
-                try:
-                    if len(out) == len(raw):
-                        out.index = normalize_dt_index(raw.index)
-                except Exception:
-                    pass
-                out = clean_per_out(out)
-                if not out.empty and ("PER" in out.columns or "EPS" in out.columns):
-                    return out.sort_index(), f"OK: {name}", " / ".join(debug[-6:])
-        except Exception as e:
-            debug.append(f"{name}: {type(e).__name__}: {repr(e)[:180]}")
-
-    # 2. Market-wide sample fallback: KOSPI/KOSDAQ/KONEX by ticker.
-    try:
-        start_dt = pd.to_datetime(start_date)
-        end_dt = pd.to_datetime(end_date)
-        # month-end + recent business days: enough for chart without over-calling KRX
-        try:
-            month_ends = list(pd.date_range(start=start_dt, end=end_dt, freq="ME"))
-        except Exception:
-            month_ends = list(pd.date_range(start=start_dt, end=end_dt, freq="M"))
-        recent_bdays = list(pd.bdate_range(end=end_dt, periods=min(45, max(1, len(pd.bdate_range(start_dt, end_dt))))))
-        samples = sorted(set(month_ends + recent_bdays))
-    except Exception:
-        samples = []
-
-    rows = []
-    markets = ["KOSPI", "KOSDAQ", "KONEX", "ALL"]
-
-    for d in samples:
-        got = False
-        # if holiday, search back 7 days
-        for back in range(0, 8):
-            ds = (pd.to_datetime(d) - pd.Timedelta(days=back)).strftime("%Y%m%d")
-            for mkt in markets:
-                if not hasattr(pkstock, "get_market_fundamental_by_ticker"):
-                    continue
-                try:
-                    raw = pkstock.get_market_fundamental_by_ticker(ds, market=mkt)
-                    row = extract_ticker_row(raw, code)
-                    if row.empty:
-                        continue
-                    out = canonical_fundamental_df(row)
-                    out = clean_per_out(out)
+    def fetch_period():
+        errors = []
+        for label, kwargs in [
+            ("daily", {}),
+            ("monthly", {"freq": "m"}),
+        ]:
+            try:
+                raw = pkstock.get_market_fundamental(start, end, code, **kwargs)
+                out = canonical_fundamental(raw)
+                if not out.empty:
+                    out.index = to_dt_index(raw.index)
+                    if "PER" in out.columns:
+                        out = out[(out["PER"] > 0) & (out["PER"] < 500)]
                     if not out.empty:
-                        out = out.iloc[[0]].copy()
-                        out.index = pd.DatetimeIndex([pd.to_datetime(ds)]).astype("datetime64[ns]")
-                        rows.append(out)
-                        got = True
-                        if len(debug) < 12:
-                            debug.append(f"OK sample {ds} {mkt}")
-                        break
-                except Exception as e:
-                    if len(debug) < 12:
-                        debug.append(f"sample {ds} {mkt}: {type(e).__name__}: {repr(e)[:120]}")
-            if got:
-                break
+                        return out.sort_index(), f"OK: pykrx {label}"
+                errors.append(f"{label}: empty/no usable cols")
+            except Exception as e:
+                errors.append(f"{label}: {type(e).__name__} {str(e)[:120]}")
+        return pd.DataFrame(), " / ".join(errors)
 
-    if rows:
-        out = pd.concat(rows).sort_index()
-        out = out[~out.index.duplicated(keep="last")]
-        out = clean_per_out(out)
-        if not out.empty and ("PER" in out.columns or "EPS" in out.columns):
-            return out, "OK: sampled get_market_fundamental_by_ticker", " / ".join(debug[-10:])
+    result, status = run_with_timeout(fetch_period, timeout_sec=timeout_sec)
+    if result is not None:
+        return result
 
-    return pd.DataFrame(), "PER 데이터 없음: pykrx 기간조회/샘플조회 모두 실패", " / ".join(debug[-12:])
-
-# =========================================================
-# US Estimated TTM P/E
-# =========================================================
-def find_row_by_keywords(df, keywords):
-    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-        return None
-    for idx in df.index:
-        s = str(idx).lower().replace(" ", "")
-        if all(k.lower().replace(" ", "") in s for k in keywords):
-            return idx
-    return None
+    return pd.DataFrame(), f"pykrx 조회 제한: {status}"
 
 
-@st.cache_data(ttl=3600)
-def load_us_ttm_pe_series(ticker, price_df):
-    if not YF_AVAILABLE:
-        return pd.DataFrame(), f"yfinance import 실패: {YF_IMPORT_ERROR}"
+@st.cache_data(ttl=3600, show_spinner=False)
+def us_ttm_pe_series(ticker, price_df):
+    if not YF_OK:
+        return pd.DataFrame(), f"yfinance import 실패: {YF_ERR}"
     try:
         tk = yf.Ticker(ticker)
-        frames = []
-        for attr in ["quarterly_income_stmt", "quarterly_financials"]:
-            obj = getattr(tk, attr, None)
-            if obj is not None and isinstance(obj, pd.DataFrame) and not obj.empty:
-                frames.append(obj.copy())
+        eps = None
+        source = ""
 
-        eps_q = None
-        status = []
-        for stmt in frames:
-            stmt.columns = pd.to_datetime(stmt.columns, errors="coerce")
-            for keys in [["diluted", "eps"], ["basic", "eps"], ["normalized", "eps"]]:
-                row = find_row_by_keywords(stmt, keys)
-                if row is not None:
-                    eps_q = pd.to_numeric(stmt.loc[row], errors="coerce").dropna().sort_index()
-                    status.append(f"EPS row={row}")
-                    break
-            if eps_q is not None and len(eps_q) >= 4:
-                break
+        # 1) Earnings dates: often extends longer than financial statements
+        try:
+            ed = tk.get_earnings_dates(limit=40)
+            if ed is not None and not ed.empty and "Reported EPS" in ed.columns:
+                s = pd.to_numeric(ed["Reported EPS"], errors="coerce").dropna()
+                s.index = to_dt_index(s.index)
+                s = s.sort_index()
+                if len(s) >= 4:
+                    eps = s
+                    source = "Reported EPS"
+        except Exception:
+            pass
 
-            ni_row = find_row_by_keywords(stmt, ["net", "income"])
-            sh_row = find_row_by_keywords(stmt, ["diluted", "average", "shares"])
-            if ni_row is not None and sh_row is not None:
-                ni = pd.to_numeric(stmt.loc[ni_row], errors="coerce")
-                sh = pd.to_numeric(stmt.loc[sh_row], errors="coerce")
-                eps_q = (ni / sh).dropna().sort_index()
-                status.append(f"EPS=NetIncome/Shares {ni_row}/{sh_row}")
-                if len(eps_q) >= 4:
-                    break
+        # 2) Financial statements fallback
+        if eps is None or len(eps) < 4:
+            for attr in ["quarterly_income_stmt", "quarterly_financials"]:
+                stmt = getattr(tk, attr, None)
+                if stmt is None or not isinstance(stmt, pd.DataFrame) or stmt.empty:
+                    continue
+                stmt = stmt.copy()
+                stmt.columns = pd.to_datetime(stmt.columns, errors="coerce")
+                found = None
+                for idx in stmt.index:
+                    t = str(idx).lower().replace(" ", "")
+                    if ("diluted" in t and "eps" in t) or ("basic" in t and "eps" in t):
+                        found = idx
+                        break
+                if found is not None:
+                    s = pd.to_numeric(stmt.loc[found], errors="coerce").dropna().sort_index()
+                    if len(s) >= 4:
+                        eps = s
+                        source = str(found)
+                        break
 
-        if eps_q is None or len(eps_q) < 4:
+        if eps is None or len(eps) < 4:
             return pd.DataFrame(), "분기 EPS 데이터 부족"
 
-        eps_ttm = eps_q.rolling(4).sum().dropna()
+        eps_ttm = eps.rolling(4).sum().dropna()
         if eps_ttm.empty:
             return pd.DataFrame(), "EPS TTM 계산 불가"
 
         eps_df = pd.DataFrame({
-            "Date": normalize_dt_index(pd.to_datetime(eps_ttm.index) + pd.Timedelta(days=45)),
+            "Date": to_dt_index(pd.to_datetime(eps_ttm.index) + pd.Timedelta(days=1)),
             "EPS_TTM": eps_ttm.values,
-        }).dropna().sort_values("Date")
+        }).sort_values("Date")
 
-        daily = price_df[["Close"]].copy().reset_index()
+        daily = price_df[["Close"]].reset_index()
         daily.columns = ["Date", "Close"]
-        daily["Date"] = normalize_dt_index(daily["Date"])
-        daily = daily.dropna().sort_values("Date")
-
+        daily["Date"] = to_dt_index(daily["Date"])
+        daily = daily.sort_values("Date")
         merged = pd.merge_asof(daily, eps_df, on="Date", direction="backward")
-        merged["PER"] = merged["Close"] / merged["EPS_TTM"]
-        merged["PER"] = pd.to_numeric(merged["PER"], errors="coerce")
-        merged = merged[(merged["PER"] > 0) & (merged["PER"] < 500)]
+        merged["PER"] = merged["Close"] / merged["EPS_TTM"].replace(0, np.nan)
+        merged = merged[(merged["PER"] > 0) & (merged["PER"] < 500)].dropna(subset=["PER"])
         if merged.empty:
             return pd.DataFrame(), "PER 계산 결과 empty"
         out = merged.set_index("Date")[["PER", "EPS_TTM"]]
-        return out, "OK: yfinance EPS TTM / " + " / ".join(status[:2])
+        return out, f"OK: US Estimated TTM P/E ({source})"
     except Exception as e:
         return pd.DataFrame(), repr(e)
 
 # =========================================================
-# Market Risk
+# Market risk
 # =========================================================
-def make_market_risk_series(market, start_date, asset_type):
+def market_risk_series(market, ticker, start_date):
     if market == "US":
-        vix = load_yf_close("^VIX", start_date)
-        if vix.empty:
-            return pd.DataFrame(), "VIX 없음", "VIX"
-        return vix.rename(columns={"^VIX": "Risk"}), "OK: VIX", "VIX"
+        vix = load_us_close("^VIX", start_date)
+        if not vix.empty:
+            return vix.rename(columns={"^VIX": "Risk"}), "VIX"
+        return pd.DataFrame(), "VIX 없음"
 
-    symbol = "KQ11" if "코스닥" in str(asset_type) else "KS11"
-    idx = load_fdr_close(symbol, start_date)
-    if idx.empty:
-        return pd.DataFrame(), f"{symbol} 지수 없음", "KR Index DD"
-    risk = pd.DataFrame(index=idx.index)
-    risk["Risk"] = (idx.iloc[:, 0] / idx.iloc[:, 0].cummax() - 1) * 100
-    return risk, f"OK: {symbol} DD", "KR Index DD(%)"
+    # KR: use KOSPI drawdown as default market risk
+    kospi = load_fdr_close("KS11", start_date)
+    if kospi.empty:
+        return pd.DataFrame(), "KOSPI 위험지표 없음"
+    s = kospi.iloc[:, 0]
+    dd = s / s.cummax() - 1
+    return pd.DataFrame({"Risk": dd}, index=kospi.index), "KOSPI DD"
 
 # =========================================================
-# Plot and comment
+# Chart and comment
 # =========================================================
-def merge_chart_df(df, per_df, risk_df, signal_df):
+def plot_core_chart(df, per_df, risk_df, risk_label, ticker):
     chart = df[["Close", "MA20", "MA60", "MA200", "Current_Drawdown"]].copy()
-    chart = chart.rename(columns={"Close": "Price"})
-    chart.index = normalize_dt_index(chart.index)
-
+    chart = chart.rename(columns={"Close": "Price", "Current_Drawdown": "DD"})
     if per_df is not None and not per_df.empty:
         p = per_df.copy()
-        p.index = normalize_dt_index(p.index)
-        # If PER missing but EPS exists, calculate after joining price.
+        p.index = to_dt_index(p.index)
         if "PER" in p.columns:
             chart = chart.join(p[["PER"]], how="left")
             chart["PER"] = chart["PER"].ffill()
@@ -666,271 +502,241 @@ def merge_chart_df(df, per_df, risk_df, signal_df):
         chart["PER"] = np.nan
 
     if risk_df is not None and not risk_df.empty:
-        r = risk_df[["Risk"]].copy()
-        r.index = normalize_dt_index(r.index)
-        chart = chart.join(r, how="left")
+        r = risk_df.copy()
+        r.index = to_dt_index(r.index)
+        chart = chart.join(r[["Risk"]], how="left")
         chart["Risk"] = chart["Risk"].ffill()
     else:
         chart["Risk"] = np.nan
 
-    if signal_df is not None and not signal_df.empty:
-        s = signal_df.copy()
-        s.index = normalize_dt_index(s.index)
-        chart = chart.join(s[["Buy_Display", "Cash_Display"]], how="left")
-
-    return chart
-
-
-def plot_core_dashboard(df, per_df, risk_df, signal_df, title, risk_label):
-    chart = merge_chart_df(df, per_df, risk_df, signal_df)
+    sig = build_signals(df)
+    chart = chart.join(sig, how="left")
 
     fig, (ax1, ax3) = plt.subplots(
-        2,
-        1,
-        figsize=(15, 8.2),
-        sharex=True,
+        2, 1, figsize=(16, 9), sharex=True,
         gridspec_kw={"height_ratios": [3, 1]}
     )
-    fig.subplots_adjust(left=0.075, right=0.89, top=0.92, bottom=0.09, hspace=0.08)
 
-    # Upper price axis
-    ax1.plot(chart.index, chart["Price"], color="#0057B8", linewidth=2.1, label="Price")
+    # Upper: Price, MA, PER
+    ax1.plot(chart.index, chart["Price"], color="#0057B8", linewidth=2.2, label="Price")
     ax1.plot(chart.index, chart["MA20"], color="#FF8C00", linewidth=1.35, label="MA20")
     ax1.plot(chart.index, chart["MA60"], color="#2CA02C", linewidth=1.35, label="MA60")
-    ax1.plot(chart.index, chart["MA200"], color="#7E57C2", linewidth=1.35, label="MA200")
+    ax1.plot(chart.index, chart["MA200"], color="#7B2CBF", linewidth=1.35, label="MA200")
+
+    if chart["Buy"].notna().any():
+        ax1.scatter(chart.index, chart["Buy"] * 0.975, color="#008000", marker="^", s=95, label="BUY candidate", zorder=5)
+    if chart["Cash"].notna().any():
+        ax1.scatter(chart.index, chart["Cash"] * 1.025, color="#FF0000", marker="v", s=95, label="Cash / overheat", zorder=5)
+
     ax1.set_ylabel("Price", color="#0057B8")
     ax1.tick_params(axis="y", labelcolor="#0057B8")
-    ax1.grid(True, linestyle=":", alpha=0.42)
+    ax1.grid(True, linestyle=":", alpha=0.35)
 
-    if "Buy_Display" in chart.columns:
-        ax1.scatter(chart.index, chart["Buy_Display"] * 0.97, color="#008000", marker="^", s=88, zorder=5, label="BUY candidate")
-    if "Cash_Display" in chart.columns:
-        ax1.scatter(chart.index, chart["Cash_Display"] * 1.03, color="#E60000", marker="v", s=88, zorder=5, label="Cash / overheat")
-
-    # Upper PER axis
     ax2 = ax1.twinx()
     if chart["PER"].dropna().empty:
-        ax2.text(0.02, 0.05, "P/E series unavailable", transform=ax2.transAxes, color="#D62728", fontsize=10)
+        ax2.text(0.99, 0.95, "P/E line: N/A", transform=ax2.transAxes, ha="right", va="top", color="#D62728")
     else:
-        ax2.plot(chart.index, chart["PER"], color="#D62728", linewidth=1.75, label="P/E")
+        ax2.plot(chart.index, chart["PER"], color="#D62728", linewidth=1.7, label="P/E")
         per_avg = chart["PER"].dropna().mean()
-        ax2.axhline(per_avg, color="#D62728", linestyle="--", linewidth=1.0, alpha=0.45, label="P/E avg")
+        ax2.axhline(per_avg, color="#D62728", linewidth=1.0, linestyle="--", alpha=0.35, label="P/E avg")
     ax2.set_ylabel("P/E", color="#D62728")
     ax2.tick_params(axis="y", labelcolor="#D62728")
 
-    ax1.set_title(title, fontsize=13.5, fontweight="bold")
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left", fontsize=8.2, framealpha=0.88)
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left", fontsize=8)
+    ax1.set_title(f"{ticker} Price + P/E + MDD + Market Risk", fontweight="bold")
 
-    # Lower MDD axis
-    dd_pct = chart["Current_Drawdown"] * 100
-    ax3.plot(chart.index, dd_pct, color="#8B0000", linewidth=1.75, label="Current DD")
-    for level, lab in [(-8, "Watch -8%"), (-12, "Buy zone -12%"), (-15, "Deep -15%"), (-20, "Risk -20%")]:
-        ax3.axhline(level, color="#1E90FF", linestyle="--", linewidth=0.95, alpha=0.42, label=lab)
+    # Lower: MDD + Risk
+    ax3.plot(chart.index, chart["DD"] * 100, color="#8B0000", linewidth=1.5, label="Current DD")
+    for level, label in [(-8, "Watch -8%"), (-12, "Buy zone -12%"), (-15, "Deep -15%"), (-20, "Risk -20%")]:
+        ax3.axhline(level, color="#5DADE2", linestyle="--", linewidth=0.9, alpha=0.55, label=label)
     ax3.set_ylabel("MDD (%)", color="#8B0000")
     ax3.tick_params(axis="y", labelcolor="#8B0000")
-    ax3.grid(True, linestyle=":", alpha=0.42)
+    ax3.grid(True, linestyle=":", alpha=0.35)
 
     ax4 = ax3.twinx()
-    if not chart["Risk"].dropna().empty:
-        ax4.plot(chart.index, chart["Risk"], color="#00A6A6", linestyle="--", linewidth=1.25, alpha=0.85, label=risk_label)
-    ax4.set_ylabel(risk_label, color="#00A6A6")
-    ax4.tick_params(axis="y", labelcolor="#00A6A6")
+    if chart["Risk"].notna().any():
+        if risk_label == "VIX":
+            ax4.plot(chart.index, chart["Risk"], color="#00A6A6", linewidth=1.1, linestyle="--", alpha=0.85, label="VIX")
+            ax4.set_ylabel("VIX", color="#00A6A6")
+        else:
+            ax4.plot(chart.index, chart["Risk"] * 100, color="#00A6A6", linewidth=1.1, linestyle="--", alpha=0.85, label=risk_label)
+            ax4.set_ylabel(risk_label + " (%)", color="#00A6A6")
+        ax4.tick_params(axis="y", labelcolor="#00A6A6")
 
     lines3, labels3 = ax3.get_legend_handles_labels()
     lines4, labels4 = ax4.get_legend_handles_labels()
-    ax3.legend(lines3 + lines4, labels3 + labels4, loc="lower left", fontsize=7.3, ncol=2, framealpha=0.88)
+    ax3.legend(lines3 + lines4, labels3 + labels4, loc="lower left", fontsize=7)
 
-    st.pyplot(fig, clear_figure=True, use_container_width=True)
+    fig.subplots_adjust(left=0.07, right=0.90, top=0.92, bottom=0.10, hspace=0.08)
+    return fig, chart
 
 
-def make_comment(latest, per_df, risk_df, risk_label):
-    msgs = []
-    close = latest.get("Close", np.nan)
-    ma20 = latest.get("MA20", np.nan)
-    ma200 = latest.get("MA200", np.nan)
-    dd = latest.get("Current_Drawdown", np.nan) * 100
-    rsi = latest.get("RSI", np.nan)
+def make_comment(df, per_df, risk_label, risk_df):
+    latest = df.iloc[-1]
+    msg = []
+    dd = latest["Current_Drawdown"]
+    rsi = latest["RSI"]
+    close = latest["Close"]
+    ma20 = latest["MA20"]
+    ma200 = latest["MA200"]
 
-    if pd.notna(ma20):
-        msgs.append("가격: MA20 위라 단기 추세 유지." if close >= ma20 else "가격: MA20 아래라 반등 확인 전 추격 금지.")
+    if close < ma20:
+        msg.append("가격: MA20 아래입니다. 반등 확인 전에는 추격보다 대기/소액이 적합합니다.")
+    else:
+        msg.append("가격: MA20 위입니다. 단기 추세는 유지 중입니다.")
     if pd.notna(ma200):
-        msgs.append("장기추세: MA200 위라 장기 추세 훼손은 제한적." if close >= ma200 else "장기추세: MA200 아래라 추세 훼손 우선 확인.")
-
-    if pd.notna(dd):
-        if dd <= -15:
-            msgs.append(f"MDD: {dd:.1f}%로 깊은 조정 구간.")
-        elif dd <= -12:
-            msgs.append(f"MDD: {dd:.1f}%로 1차 관심 구간.")
-        elif dd <= -8:
-            msgs.append(f"MDD: {dd:.1f}%로 관심 초입.")
+        if close >= ma200:
+            msg.append("장기추세: MA200 위라 장기 추세 훼손은 제한적입니다.")
         else:
-            msgs.append(f"MDD: {dd:.1f}%로 낙폭 매력은 제한적.")
+            msg.append("장기추세: MA200 아래라 추세 훼손을 우선 확인해야 합니다.")
+
+    if dd <= -0.15:
+        msg.append(f"MDD: {dd*100:.1f}%로 깊은 조정권입니다.")
+    elif dd <= -0.12:
+        msg.append(f"MDD: {dd*100:.1f}%로 1차 관심 구간입니다.")
+    elif dd <= -0.08:
+        msg.append(f"MDD: {dd*100:.1f}%로 관찰 구간입니다.")
+    else:
+        msg.append(f"MDD: {dd*100:.1f}%로 낙폭 매력은 크지 않습니다.")
 
     if pd.notna(rsi):
         if rsi <= 35:
-            msgs.append(f"RSI: {rsi:.1f}, 과매도권.")
+            msg.append(f"RSI: {rsi:.1f}. 과매도권입니다.")
         elif rsi >= 68:
-            msgs.append(f"RSI: {rsi:.1f}, 과열 주의.")
+            msg.append(f"RSI: {rsi:.1f}. 단기 과열권입니다.")
         else:
-            msgs.append(f"RSI: {rsi:.1f}, 중립권.")
+            msg.append(f"RSI: {rsi:.1f}. 중립권입니다.")
 
-    if per_df is not None and not per_df.empty and "PER" in per_df.columns:
-        s = per_df["PER"].dropna()
-        if len(s) >= 30:
-            recent = s.iloc[-1]
-            past = s.iloc[max(0, len(s) - 60)]
-            per_chg = (recent / past - 1) * 100 if past != 0 else np.nan
-            if pd.notna(per_chg):
-                if per_chg < -5:
-                    msgs.append(f"PER: 최근 약 60개 관측치 기준 {per_chg:.1f}% 하락, 밸류 부담 완화.")
-                elif per_chg > 5:
-                    msgs.append(f"PER: 최근 약 60개 관측치 기준 {per_chg:.1f}% 상승, 밸류 부담 확대.")
-                else:
-                    msgs.append(f"PER: 최근 변화 {per_chg:.1f}%, 큰 변화 없음.")
+    if per_df is not None and not per_df.empty and "PER" in per_df.columns and per_df["PER"].dropna().shape[0] >= 20:
+        p = per_df["PER"].dropna()
+        n = min(60, len(p)-1)
+        if n > 0:
+            chg = p.iloc[-1] / p.iloc[-n] - 1
+            if chg < -0.10:
+                msg.append(f"PER: 최근 기준 {chg*100:.1f}% 하락. 밸류 부담이 낮아진 흐름입니다.")
+            elif chg > 0.10:
+                msg.append(f"PER: 최근 기준 {chg*100:.1f}% 상승. 밸류 부담 확대 구간입니다.")
+            else:
+                msg.append(f"PER: 최근 기준 {chg*100:.1f}% 변화. 큰 방향성은 약합니다.")
     else:
-        msgs.append("PER: 시계열 없음. 현재 PER 카드만 참고.")
+        msg.append("PER: 시계열은 제한적입니다. 현재 PER 카드와 가격/MDD를 우선 보세요.")
 
-    if risk_df is not None and not risk_df.empty and "Risk" in risk_df.columns and not risk_df["Risk"].dropna().empty:
+    if risk_df is not None and not risk_df.empty:
         rv = risk_df["Risk"].dropna().iloc[-1]
         if risk_label == "VIX":
             if rv >= 25:
-                msgs.append(f"시장위험: VIX {rv:.1f}, 공포 구간.")
+                msg.append(f"시장위험: VIX {rv:.1f}. 공포 구간입니다.")
             elif rv <= 15:
-                msgs.append(f"시장위험: VIX {rv:.1f}, 공포 낮음.")
+                msg.append(f"시장위험: VIX {rv:.1f}. 공포는 낮습니다.")
             else:
-                msgs.append(f"시장위험: VIX {rv:.1f}, 보통.")
+                msg.append(f"시장위험: VIX {rv:.1f}. 보통 수준입니다.")
         else:
-            msgs.append(f"시장위험: 한국 지수 MDD {rv:.1f}%.")
+            msg.append(f"시장위험: {risk_label} {rv*100:.1f}%. 한국 지수 낙폭을 참고하세요.")
 
-    if pd.notna(dd) and dd <= -12 and pd.notna(rsi) and rsi <= 42 and pd.notna(ma20) and close >= ma20:
-        final = "최종: 1차 소액 후보. DD가 깊고 MA20 회복이 동반됨."
-    elif pd.notna(dd) and dd <= -12 and pd.notna(rsi) and rsi <= 42:
-        final = "최종: 관심/소액 후보. MA20 회복 전에는 대기 또는 아주 소액만."
-    elif pd.notna(dd) and dd > -8 and pd.notna(rsi) and rsi >= 65:
-        final = "최종: 추격 금지. 낙폭 얕고 과열 신호."
+    if dd <= -0.12 and pd.notna(rsi) and rsi <= 42 and close >= ma200:
+        final = "최종: 1차 눌림 후보입니다. 단, MA20 회복 전에는 소액/분할 기준입니다."
+    elif dd > -0.08 and pd.notna(rsi) and rsi >= 65:
+        final = "최종: 추격 금지 구간입니다. 현금확보 또는 대기 우선입니다."
+    elif close < ma20 and dd <= -0.12:
+        final = "최종: 낙폭은 있지만 반등 확인이 부족합니다. 대기 또는 소액만 적합합니다."
     else:
-        final = "최종: 판단 보류. 가격·PER·MDD 조합이 강한 진입 신호는 아님."
+        final = "최종: 강한 진입 신호는 아닙니다. 가격·PER·MDD 조합을 더 확인하세요."
 
-    return final, msgs
+    return final, msg
 
 # =========================================================
 # Inputs
 # =========================================================
-col_a, col_b, col_c = st.columns(3)
-with col_a:
+c1, c2, c3 = st.columns(3)
+with c1:
     user_input = st.text_input("종목명 / 종목코드 / 미국 티커", value="삼성전자")
-with col_b:
-    start_date = st.date_input("기준 시작일", pd.to_datetime("2024-01-01"))
-with col_c:
-    asset_type = st.selectbox(
-        "종목 유형",
-        ["일반 주식/ETF", "나스닥형 ETF", "반도체/메모리 ETF", "전력/인프라 ETF", "우주/소형 테마", "코스닥/중소형"],
-        index=0,
-    )
+with c2:
+    start_date = st.date_input("기준 시작일", pd.to_datetime("2025-01-01"))
+with c3:
+    asset_type = st.selectbox("종목 유형", ["일반 주식/ETF", "나스닥형 ETF", "반도체/메모리 ETF", "전력/인프라 ETF", "우주/소형 테마"])
 
 run = st.button("분석 실행")
 
-# =========================================================
-# Main
-# =========================================================
 if run:
     market, ticker, display_name = find_ticker(user_input)
     if ticker is None:
-        st.error("종목을 찾을 수 없습니다. 한국 종목은 종목명 또는 6자리 코드로 입력하세요. 예: 삼성전자 / 005930")
+        st.error("종목을 찾지 못했습니다. 예: 삼성전자, 005930, NVDA")
         st.stop()
 
-    df_raw, price_status = load_price_data(market, ticker, start_date)
-    if df_raw.empty:
-        st.error(f"가격 데이터를 가져오지 못했습니다. 원인: {price_status}")
+    price_df, price_status = load_price_data(market, ticker, start_date)
+    if price_df.empty:
+        st.error(f"가격 데이터를 가져오지 못했습니다: {price_status}")
         st.stop()
 
-    df = calculate_indicators(df_raw)
+    df = add_indicators(price_df)
     latest = df.iloc[-1]
     last_price_date = df.index.max()
 
-    if market == "KR":
-        per_df, per_status, per_debug = load_kr_per_series(ticker, start_date, last_price_date)
-        naver_val, naver_status = load_kr_naver_current_valuation(ticker)
-        if not per_df.empty and "PER" in per_df.columns and not per_df["PER"].dropna().empty:
-            current_pe = per_df["PER"].dropna().iloc[-1]
-        else:
-            current_pe = naver_val.get("trailing_pe")
-        valuation = {
-            "trailing_pe": current_pe,
-            "forward_pe": None,
-            "price_to_sales": None,
-            "peg_ratio": None,
-        }
-        valuation_status = f"{per_status} / {naver_status}"
+    # Valuation and P/E series
+    if market == "US":
+        val, val_status = us_current_valuation(ticker)
+        per_df, per_status = us_ttm_pe_series(ticker, df)
     else:
-        valuation, valuation_status = load_us_current_valuation(ticker)
-        per_df, per_status = load_us_ttm_pe_series(ticker, df)
-        per_debug = per_status
+        val, val_status = naver_current_per(ticker)
+        per_df, per_status = kr_per_series_nohang(ticker, start_date, last_price_date, timeout_sec=7)
+        # If KRX PER series fails but EPS is present, plot no series; current card still from Naver.
+        if not per_df.empty and "PER" not in per_df.columns and "EPS" in per_df.columns:
+            tmp = df[["Close"]].join(per_df[["EPS"]], how="left")
+            tmp["EPS"] = tmp["EPS"].ffill()
+            tmp["PER"] = tmp["Close"] / tmp["EPS"].replace(0, np.nan)
+            per_df = tmp[["PER", "EPS"]].dropna()
 
-    risk_df, risk_status, risk_label = make_market_risk_series(market, start_date, asset_type)
-    signal_df = build_signals(df)
+    risk_df, risk_label = market_risk_series(market, ticker, start_date)
 
-    st.markdown(f"## 분석 대상: {display_name} / {ticker} / {market}")
+    st.subheader(f"분석 대상: {display_name} / {ticker} / {market}")
 
-    c1, c2, c3, c4, c5, c6 = st.columns([1.4, 1, 1, 1, 0.8, 0.9])
-    c1.metric("현재가", fmt_num(latest["Close"]))
-    c2.metric("Current DD", fmt_pct(latest["Current_Drawdown"] * 100))
-    c3.metric("Max DD", fmt_pct(df["Max_Drawdown"].min() * 100))
-    c4.metric("RSI", fmt_num(latest["RSI"]))
-    ma20_status = "위" if pd.notna(latest["MA20"]) and latest["Close"] >= latest["MA20"] else "아래"
-    c5.metric("MA20", ma20_status)
-    c6.metric("Vol Ratio", fmt_num(latest["Volume_Ratio"]))
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("현재가", fmt_num(latest["Close"]))
+    m2.metric("Current DD", fmt_pct_ratio(latest["Current_Drawdown"]))
+    m3.metric("Max DD", fmt_pct_ratio(df["Max_Drawdown"].min()))
+    m4.metric("RSI", fmt_num(latest["RSI"]))
+    m5.metric("MA20", "위" if latest["Close"] >= latest["MA20"] else "아래")
+    m6.metric("Vol Ratio", fmt_num(latest["Volume_Ratio"]))
 
     st.markdown("## 1. 현재 Valuation")
     v1, v2, v3, v4 = st.columns(4)
-    v1.metric("TTM / KRX P/E", fmt_num(valuation.get("trailing_pe")))
-    v2.metric("Forward P/E", fmt_num(valuation.get("forward_pe")))
-    v3.metric("P/S", fmt_num(valuation.get("price_to_sales")))
-    v4.metric("PEG", fmt_num(valuation.get("peg_ratio")))
+    v1.metric("TTM / KRX P/E", fmt_num(val.get("ttm_pe")))
+    v2.metric("Forward P/E", fmt_num(val.get("fwd_pe")))
+    v3.metric("P/S", fmt_num(val.get("ps")))
+    v4.metric("PEG", fmt_num(val.get("peg")))
 
-    if per_df.empty:
-        st.warning(f"PER 시계열 없음: {compact_status(per_status)}")
+    if per_df is None or per_df.empty or "PER" not in per_df.columns or per_df["PER"].dropna().empty:
+        st.warning(f"PER 시계열 없음: {per_status}")
+    else:
+        st.success(f"PER 시계열: {per_status}")
 
     st.markdown("## 2. 핵심 차트")
-    st.info("주가, PER, MDD, 시장위험만 봅니다. 주가 상승 중 PER 하락은 이익 개선이 주가 상승을 정당화하는 흐름일 수 있습니다.")
+    st.info("차트는 주가·PER·MDD·시장위험만 봅니다. PER 조회가 실패해도 주가/MDD 차트는 계속 표시됩니다.")
+    fig, chart_df = plot_core_chart(df, per_df, risk_df, risk_label, ticker)
+    st.pyplot(fig)
 
-    plot_core_dashboard(
-        df,
-        per_df,
-        risk_df,
-        signal_df,
-        f"{ticker} Price + P/E + MDD + {risk_label}",
-        risk_label,
-    )
-
-    final, comments = make_comment(latest, per_df, risk_df, risk_label)
     st.markdown("## 3. 자동 해석")
-    if "추격 금지" in final:
-        st.error(final)
-    elif "소액" in final or "후보" in final:
+    final, comments = make_comment(df, per_df, risk_label, risk_df)
+    if "추격 금지" in final or "대기" in final:
         st.warning(final)
+    elif "후보" in final:
+        st.success(final)
     else:
         st.info(final)
-    for m in comments:
-        st.write(f"- {m}")
+    for msg in comments:
+        st.write(f"- {msg}")
 
     with st.expander("PER 원자료 / 상태"):
+        st.write(f"Current valuation status: {val_status}")
         st.write(f"PER status: {per_status}")
-        st.write(f"Valuation status: {valuation_status}")
-        st.write(f"PER debug: {per_debug}")
-        st.write(f"Risk status: {risk_status}")
-        if market == "KR":
-            st.write(f"PYKRX_AVAILABLE: {PYKRX_AVAILABLE}")
-            if not PYKRX_AVAILABLE:
-                st.code(PYKRX_IMPORT_ERROR)
         if per_df is not None and not per_df.empty:
-            st.dataframe(per_df.tail(40), use_container_width=True)
+            st.dataframe(per_df.tail(30), use_container_width=True)
         else:
             st.write("PER DataFrame empty")
 
-    with st.expander("최근 20거래일 데이터"):
+    with st.expander("최근 20거래일"):
         show = df[["Close", "Current_Drawdown", "RSI", "MA20", "MA60", "MA200", "Volume_Ratio"]].tail(20).copy()
         show["Current_Drawdown"] = show["Current_Drawdown"] * 100
         st.dataframe(show, use_container_width=True)
