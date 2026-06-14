@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-시장 리포트 탭 - 뉴스/테마/돈의 흐름/대장주·후발주·숨은 후보
-MDD 계산 로직과 분리된 독립 Streamlit page 코드입니다.
-requirements.txt 변경 없음: streamlit, pandas, numpy, yfinance, feedparser 사용
+시장 리포트 탭 v3 - 객관적 자동 스캔형
+목적: 최근 뉴스 → 테마 변화 → 돈의 흐름 → 대장주/후발주/숨은 후보를 한 화면에서 확인.
+MDD/PER 분석기와 분리된 독립 Streamlit page 코드.
+requirements.txt 변경 없음: streamlit, pandas, numpy, yfinance, feedparser 사용.
 """
 
 from __future__ import annotations
@@ -10,7 +11,7 @@ from __future__ import annotations
 import re
 import math
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Optional
 
 import numpy as np
 import pandas as pd
@@ -20,16 +21,14 @@ import feedparser
 
 
 # =========================
-# 기본 설정
+# Page setup
 # =========================
 st.set_page_config(page_title="시장 리포트", page_icon="📰", layout="wide")
-
-TODAY = pd.Timestamp.today().normalize()
 KST = timezone(timedelta(hours=9))
 
 
 # =========================
-# 기본 데이터
+# RSS / Keywords
 # =========================
 DEFAULT_RSS = {
     "Reuters Markets": "https://feeds.reuters.com/reuters/marketsNews",
@@ -42,58 +41,86 @@ DEFAULT_RSS = {
 THEME_KEYWORDS = {
     "AI 반도체": [
         "nvidia", "gpu", "ai chip", "semiconductor", "tsmc", "broadcom", "amd",
-        "asic", "hbm", "micron", "sk hynix", "samsung memory", "chip"
+        "asic", "hbm", "micron", "sk hynix", "samsung memory", "chip", "wafer",
     ],
     "메모리/HBM": [
-        "hbm", "dram", "nand", "micron", "sk hynix", "samsung", "wdc", "storage", "memory"
+        "hbm", "dram", "nand", "micron", "sk hynix", "samsung", "wdc", "storage", "memory",
     ],
     "AI 서버/데이터센터": [
         "data center", "datacenter", "ai server", "hyperscaler", "cloud capex",
         "server rack", "liquid cooling", "oracle", "microsoft", "amazon", "google cloud",
-        "server", "rack"
+        "server", "rack", "networking", "ethernet",
     ],
     "전력/인프라": [
         "power grid", "electricity", "transformer", "nuclear", "utility", "vrt",
-        "eaton", "vertiv", "data center power", "grid bottleneck", "power", "grid"
+        "eaton", "vertiv", "data center power", "grid bottleneck", "power", "grid",
     ],
     "구글/플랫폼 AI": [
-        "google", "alphabet", "gemini", "tpu", "waymo", "youtube", "search ai", "google cloud"
+        "google", "alphabet", "gemini", "tpu", "waymo", "youtube", "search ai", "google cloud",
     ],
     "테슬라/로봇·자율주행": [
         "tesla", "robotaxi", "fsd", "optimus", "humanoid", "autonomous",
-        "energy storage", "megapack", "xai", "robot"
+        "energy storage", "megapack", "xai", "robot",
     ],
     "우주/SpaceX": [
-        "spacex", "starlink", "rocket", "satellite", "launch", "space ipo", "rklb", "asts", "rdw", "space"
+        "spacex", "starlink", "rocket", "satellite", "launch", "space ipo", "rklb", "asts", "rdw", "space",
+    ],
+    "사이버보안/AI SW": [
+        "cyber", "security", "hack", "cloud security", "ai agent", "software", "saas", "snowflake", "palantir",
     ],
     "매크로 리스크": [
         "cpi", "ppi", "fed", "fomc", "treasury yield", "oil", "iran", "war",
-        "tariff", "sanctions", "dollar", "vix", "yield", "inflation", "rate"
+        "tariff", "sanctions", "dollar", "vix", "yield", "inflation", "rate",
     ],
 }
 
 POSITIVE_WORDS = [
     "surge", "rally", "gain", "beat", "raise", "upgrade", "record", "growth", "strong",
     "partnership", "contract", "approval", "launch", "expansion", "bullish", "outperform",
-    "상승", "급등", "호조", "상향", "수주", "계약", "성장", "개선", "강세", "돌파"
+    "상승", "급등", "호조", "상향", "수주", "계약", "성장", "개선", "강세", "돌파",
 ]
 NEGATIVE_WORDS = [
     "fall", "drop", "slump", "miss", "cut", "downgrade", "weak", "loss", "delay",
     "probe", "ban", "sanction", "risk", "war", "tariff", "recall", "bearish",
-    "하락", "급락", "부진", "하향", "제재", "관세", "전쟁", "리스크", "약세", "연기"
+    "하락", "급락", "부진", "하향", "제재", "관세", "전쟁", "리스크", "약세", "연기",
 ]
 OFFICIAL_WORDS = ["sec", "fomc", "fed", "company announces", "press release", "earnings", "guidance", "공시", "실적", "발표"]
 RUMOR_WORDS = ["rumor", "reportedly", "sources", "unconfirmed", "leak", "찌라시", "루머", "미확인", "소식통"]
 
-DEFAULT_THEME_TICKERS = {
-    "AI 반도체": "SOXX, SMH, NVDA, AVGO, AMD",
-    "메모리/HBM": "MU, WDC, 000660.KS, 005930.KS",
-    "AI 서버/데이터센터": "VRT, DELL, HPE, SMCI",
-    "전력/인프라": "ETN, PWR, VRT, NEE",
-    "구글/플랫폼 AI": "GOOGL",
-    "테슬라/로봇·자율주행": "TSLA, BOTZ, ROBO",
-    "우주/SpaceX": "RKLB, ASTS, RDW, ARKX, XOVR",
-    "한국장": "EWY, KOSPI, KOSDAQ",
+
+# =========================
+# Objective scan universe
+# =========================
+# 사용자가 고르는 종목이 아니라, 앱이 이 기본 유니버스를 자동 스캔한다.
+# 사용자는 expander에서 보조로 추가만 가능하다.
+AUTO_UNIVERSE = {
+    "AI 반도체": [
+        "SOXX", "SMH", "NVDA", "AVGO", "AMD", "TSM", "ASML", "ARM", "MRVL", "QCOM", "AMAT", "LRCX", "KLAC",
+    ],
+    "메모리/HBM": [
+        "MU", "WDC", "STX", "000660.KS", "005930.KS", "042700.KS", "095340.KQ", "039030.KQ", "089030.KQ",
+    ],
+    "AI 서버/데이터센터": [
+        "VRT", "DELL", "HPE", "SMCI", "ORCL", "MSFT", "AMZN", "ANET", "CLS", "NTAP", "PSTG",
+    ],
+    "전력/인프라": [
+        "ETN", "PWR", "VRT", "GEV", "NEE", "CEG", "AEP", "SO", "XLU", "010120.KS", "267260.KS",
+    ],
+    "구글/플랫폼 AI": [
+        "GOOGL", "GOOG", "META", "MSFT", "AMZN",
+    ],
+    "테슬라/로봇·자율주행": [
+        "TSLA", "BOTZ", "ROBO", "ISRG", "TER", "SYM", "277810.KQ", "108490.KQ", "090360.KQ",
+    ],
+    "우주/SpaceX": [
+        "RKLB", "ASTS", "RDW", "LUNR", "PL", "IRDM", "ARKX", "BA", "LMT", "047810.KS",
+    ],
+    "사이버보안/AI SW": [
+        "CIBR", "HACK", "CRWD", "PANW", "ZS", "FTNT", "PLTR", "SNOW", "NOW", "DDOG", "AIQ", "IGV",
+    ],
+    "한국장/국내 ETF": [
+        "EWY", "KOSPI", "KOSDAQ", "069500.KS", "102110.KS", "360750.KS", "379810.KS", "453850.KS",
+    ],
 }
 
 MARKET_TICKER_MAP = {
@@ -102,50 +129,52 @@ MARKET_TICKER_MAP = {
     "KOSPI200": "^KS200",
 }
 
-MAIN_INDICATORS = "QQQ, SPY, SOXX, EWY, ^VIX, USO"
-EXTRA_INDICATORS = "IWM, ^TNX, UUP, KOSPI, KOSDAQ, NVDA, MU, VRT, GOOGL"
+MAIN_INDICATORS = ["QQQ", "SPY", "SOXX", "EWY", "^VIX", "USO"]
+EXTRA_INDICATORS = ["IWM", "^TNX", "UUP", "KOSPI", "KOSDAQ", "NVDA", "MU", "VRT", "GOOGL"]
 
 
 # =========================
-# 유틸 함수
+# Utility
 # =========================
 def normalize_ticker(ticker: str) -> str:
-    """대표 표기용 티커 정규화. 실제 조회는 ticker_candidates()에서 fallback 처리."""
     t = str(ticker).strip().upper()
     return MARKET_TICKER_MAP.get(t, t)
 
 
 def ticker_candidates(ticker: str) -> List[str]:
-    """
-    yfinance 조회 후보 생성.
-    - 미국 티커: NVDA 그대로
-    - 한국 지수 별칭: KOSPI -> ^KS11
-    - 한국 6자리 코드: 005930 -> 005930.KS, 005930.KQ 순서로 시도
-    - 사용자가 .KS/.KQ를 붙이면 그대로 우선 사용
-    """
     raw = str(ticker).strip()
     if not raw:
         return []
-
     t = raw.upper()
     if t in MARKET_TICKER_MAP:
         return [MARKET_TICKER_MAP[t]]
-
     if re.fullmatch(r"\d{6}", t):
         return [f"{t}.KS", f"{t}.KQ"]
-
-    if re.fullmatch(r"\d{6}\.(KS|KQ)", t):
-        return [t]
-
     return [t]
 
 
-def split_tickers(text: str) -> List[str]:
+def parse_ticker_list(text: str) -> List[str]:
     out = []
     for x in str(text).replace("\n", ",").split(","):
         x = x.strip()
         if x:
             out.append(x)
+    return out
+
+
+def parse_extra_universe(text: str) -> Dict[str, List[str]]:
+    """형식: 테마명|티커1, 티커2"""
+    out: Dict[str, List[str]] = {}
+    for line in str(text).splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "|" not in line:
+            continue
+        theme, tickers = line.split("|", 1)
+        theme = theme.strip()
+        items = parse_ticker_list(tickers)
+        if theme and items:
+            out.setdefault(theme, [])
+            out[theme].extend(items)
     return out
 
 
@@ -168,6 +197,7 @@ def safe_num(x: Any, digit: int = 2) -> str:
 
 
 def calc_rsi(close: pd.Series, window: int = 14) -> pd.Series:
+    close = pd.to_numeric(close, errors="coerce")
     delta = close.diff()
     gain = delta.clip(lower=0).rolling(window).mean()
     loss = (-delta.clip(upper=0)).rolling(window).mean()
@@ -180,11 +210,7 @@ def classify_theme(text: str) -> str:
     text_l = str(text).lower()
     scores = {}
     for theme, keywords in THEME_KEYWORDS.items():
-        score = 0
-        for kw in keywords:
-            if kw.lower() in text_l:
-                score += 1
-        scores[theme] = score
+        scores[theme] = sum(1 for kw in keywords if kw.lower() in text_l)
     best = max(scores, key=scores.get)
     return best if scores[best] > 0 else "기타"
 
@@ -224,8 +250,34 @@ def parse_entry_time(entry: Any) -> pd.Timestamp:
     return pd.Timestamp.now()
 
 
+def merge_universe(base: Dict[str, List[str]], extra: Dict[str, List[str]]) -> Dict[str, List[str]]:
+    merged = {k: list(v) for k, v in base.items()}
+    for theme, items in extra.items():
+        merged.setdefault(theme, [])
+        merged[theme].extend(items)
+    # de-duplicate within theme preserving order
+    for theme, items in merged.items():
+        seen = set()
+        clean = []
+        for t in items:
+            tu = str(t).strip().upper()
+            if tu and tu not in seen:
+                seen.add(tu)
+                clean.append(str(t).strip())
+        merged[theme] = clean
+    return merged
+
+
+def universe_to_rows(universe: Dict[str, List[str]]) -> pd.DataFrame:
+    rows = []
+    for theme, tickers in universe.items():
+        for i, ticker in enumerate(tickers):
+            rows.append({"테마": theme, "티커": ticker, "대표순위": i + 1})
+    return pd.DataFrame(rows)
+
+
 # =========================
-# 뉴스 로더
+# RSS news
 # =========================
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_rss_items(rss_map: Dict[str, str], max_items_per_feed: int = 15) -> pd.DataFrame:
@@ -296,11 +348,10 @@ def build_manual_news_df(manual_df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =========================
-# 가격/수급 데이터
+# Price / flow metrics
 # =========================
 @st.cache_data(ttl=900, show_spinner=False)
-def load_price(ticker: str, period: str = "90d") -> Tuple[pd.DataFrame, str]:
-    """여러 후보 티커를 순차 조회. 한국 6자리 코드는 .KS/.KQ를 자동 시도."""
+def load_price_single(ticker: str, period: str = "90d") -> Tuple[pd.DataFrame, str]:
     tried = []
     for yf_ticker in ticker_candidates(ticker):
         tried.append(yf_ticker)
@@ -317,24 +368,19 @@ def load_price(ticker: str, period: str = "90d") -> Tuple[pd.DataFrame, str]:
 
 
 def calc_ticker_metrics(ticker: str, period: str = "90d") -> Dict[str, Any]:
-    df, resolved_ticker = load_price(ticker, period=period)
+    df, resolved_ticker = load_price_single(ticker, period=period)
     if df.empty or "Close" not in df.columns:
         return {
-            "티커": ticker,
-            "조회티커": resolved_ticker,
-            "1일": np.nan,
-            "3일": np.nan,
-            "5일": np.nan,
-            "20일": np.nan,
-            "거래량비율": np.nan,
-            "Current DD": np.nan,
-            "RSI": np.nan,
-            "20일고점근접": False,
-            "현재가": np.nan,
-            "상태": "데이터 없음",
+            "티커": ticker, "조회티커": resolved_ticker, "현재가": np.nan,
+            "1일": np.nan, "3일": np.nan, "5일": np.nan, "20일": np.nan,
+            "거래량비율": np.nan, "Current DD": np.nan, "RSI": np.nan,
+            "20일고점근접": False, "흐름점수": np.nan, "상태": "데이터 없음",
         }
-    close = df["Close"].dropna()
-    volume = df["Volume"] if "Volume" in df.columns else pd.Series(index=df.index, dtype=float)
+
+    close = pd.to_numeric(df["Close"], errors="coerce").dropna()
+    if close.empty:
+        return {"티커": ticker, "조회티커": resolved_ticker, "상태": "데이터 없음"}
+    volume = pd.to_numeric(df.get("Volume", pd.Series(index=df.index, dtype=float)), errors="coerce")
     cur = close.iloc[-1]
 
     def ret(n: int) -> float:
@@ -342,10 +388,11 @@ def calc_ticker_metrics(ticker: str, period: str = "90d") -> Dict[str, Any]:
             return np.nan
         return (cur / close.iloc[-n - 1] - 1) * 100
 
+    r1, r3, r5, r20 = ret(1), ret(3), ret(5), ret(20)
     vol_ratio = np.nan
     try:
         vol20 = volume.rolling(20).mean().iloc[-1]
-        if vol20 and not pd.isna(vol20):
+        if pd.notna(vol20) and vol20 > 0:
             vol_ratio = volume.iloc[-1] / vol20
     except Exception:
         pass
@@ -356,57 +403,65 @@ def calc_ticker_metrics(ticker: str, period: str = "90d") -> Dict[str, Any]:
     high20 = close.tail(20).max()
     near_high20 = bool(cur >= high20 * 0.97)
 
+    # 객관적 흐름점수: 단기 수익률 + 거래량 + 중기 추세. 과열은 후보 분류에서 별도 처리.
+    vr = 1.0 if pd.isna(vol_ratio) else max(float(vol_ratio), 0.1)
+    score = 0.0
+    for val, weight in [(r1, 0.15), (r3, 0.30), (r5, 0.30), (r20, 0.15)]:
+        if pd.notna(val):
+            score += float(val) * weight
+    score += math.log(vr) * 4.0
+
     return {
         "티커": ticker,
         "조회티커": resolved_ticker,
         "현재가": cur,
-        "1일": ret(1),
-        "3일": ret(3),
-        "5일": ret(5),
-        "20일": ret(20),
+        "1일": r1,
+        "3일": r3,
+        "5일": r5,
+        "20일": r20,
         "거래량비율": vol_ratio,
         "Current DD": cur_dd,
         "RSI": rsi,
         "20일고점근접": near_high20,
+        "흐름점수": score,
         "상태": "OK",
     }
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def calc_all_metrics(theme_tickers: Dict[str, str], period: str = "90d") -> Tuple[pd.DataFrame, pd.DataFrame]:
+def scan_universe(universe_rows: pd.DataFrame, period: str = "90d") -> pd.DataFrame:
     rows = []
-    for theme, ticker_text in theme_tickers.items():
-        for ticker in split_tickers(ticker_text):
-            m = calc_ticker_metrics(ticker, period=period)
-            m["테마"] = theme
-            rows.append(m)
-    detail = pd.DataFrame(rows)
-    if detail.empty:
-        return pd.DataFrame(), pd.DataFrame()
+    for _, r in universe_rows.iterrows():
+        m = calc_ticker_metrics(str(r["티커"]), period=period)
+        m["테마"] = r["테마"]
+        m["대표순위"] = r.get("대표순위", 999)
+        rows.append(m)
+    df = pd.DataFrame(rows)
+    # same ticker may belong to multiple themes; keep theme duplicate intentionally
+    return df.reset_index(drop=True)
 
-    theme_rows = []
-    for theme, g in detail.groupby("테마"):
+
+def classify_theme_flow(detail_df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    if detail_df.empty:
+        return pd.DataFrame()
+
+    for theme, g in detail_df.groupby("테마"):
         ok = g[g["상태"] == "OK"].copy()
         if ok.empty:
-            theme_rows.append({
-                "테마": theme,
-                "상태": "데이터 없음",
-                "1일 평균": np.nan,
-                "3일 평균": np.nan,
-                "5일 평균": np.nan,
-                "20일 평균": np.nan,
-                "거래량비율": np.nan,
-                "대표 강세 종목": "-",
-                "대표 약세 종목": "-",
-                "판단 메모": "티커 데이터 조회 실패",
+            rows.append({
+                "테마": theme, "상태": "데이터 없음", "1일 평균": np.nan, "3일 평균": np.nan,
+                "5일 평균": np.nan, "20일 평균": np.nan, "거래량비율": np.nan,
+                "대표 강세 종목": "-", "대표 약세 종목": "-", "판단 메모": "가격 데이터 조회 실패",
+                "테마점수": np.nan,
             })
             continue
-
         avg1 = ok["1일"].mean()
         avg3 = ok["3일"].mean()
         avg5 = ok["5일"].mean()
         avg20 = ok["20일"].mean()
         vol = ok["거래량비율"].replace([np.inf, -np.inf], np.nan).mean()
+        theme_score = ok["흐름점수"].replace([np.inf, -np.inf], np.nan).mean()
 
         if pd.notna(avg5) and pd.notna(vol) and avg5 >= 5 and vol >= 1.5:
             state = "강한 유입"
@@ -419,13 +474,10 @@ def calc_all_metrics(theme_tickers: Dict[str, str], period: str = "90d") -> Tupl
         else:
             state = "중립"
 
-        strong = ok.sort_values("5일", ascending=False).head(1)
-        weak = ok.sort_values("5일", ascending=True).head(1)
-        strong_name = strong["티커"].iloc[0] if not strong.empty else "-"
-        weak_name = weak["티커"].iloc[0] if not weak.empty else "-"
-
+        strong = ok.sort_values("흐름점수", ascending=False).head(1)
+        weak = ok.sort_values("흐름점수", ascending=True).head(1)
         memo = f"3일 {safe_pct(avg3)}, 5일 {safe_pct(avg5)}, 거래량 {safe_num(vol)}배"
-        theme_rows.append({
+        rows.append({
             "테마": theme,
             "상태": state,
             "1일 평균": avg1,
@@ -433,85 +485,101 @@ def calc_all_metrics(theme_tickers: Dict[str, str], period: str = "90d") -> Tupl
             "5일 평균": avg5,
             "20일 평균": avg20,
             "거래량비율": vol,
-            "대표 강세 종목": strong_name,
-            "대표 약세 종목": weak_name,
+            "대표 강세 종목": strong["티커"].iloc[0] if not strong.empty else "-",
+            "대표 약세 종목": weak["티커"].iloc[0] if not weak.empty else "-",
             "판단 메모": memo,
+            "테마점수": theme_score,
         })
-    theme_df = pd.DataFrame(theme_rows)
+    out = pd.DataFrame(rows)
     order = {"강한 유입": 0, "유입": 1, "중립": 2, "유출": 3, "강한 유출": 4, "데이터 없음": 5}
-    theme_df["_order"] = theme_df["상태"].map(order).fillna(9)
-    theme_df = theme_df.sort_values(["_order", "5일 평균"], ascending=[True, False]).drop(columns=["_order"])
-    return theme_df.reset_index(drop=True), detail.reset_index(drop=True)
+    out["_order"] = out["상태"].map(order).fillna(9)
+    out = out.sort_values(["_order", "테마점수"], ascending=[True, False]).drop(columns=["_order"])
+    return out.reset_index(drop=True)
+
+
+def global_stock_rankings(detail_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    ok = detail_df[detail_df["상태"] == "OK"].copy()
+    if ok.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    # 동일 티커가 여러 테마에 중복될 수 있으므로 티커별 최고 점수 행만 표시
+    ok = ok.sort_values("흐름점수", ascending=False).drop_duplicates("티커", keep="first")
+
+    inflow = ok[(ok["3일"].fillna(0) > 0) & (ok["거래량비율"].fillna(0) >= 1.15)].sort_values("흐름점수", ascending=False).head(15)
+    outflow = ok[(ok["3일"].fillna(0) < 0) & (ok["거래량비율"].fillna(0) >= 1.15)].sort_values("흐름점수", ascending=True).head(15)
+    unusual = ok[(ok["거래량비율"].fillna(0) >= 1.5)].sort_values("거래량비율", ascending=False).head(15)
+    return inflow, outflow, unusual
 
 
 # =========================
-# 테마 내부 후보 분류
+# Theme candidate classification
 # =========================
 def pick_theme_candidates(theme_df: pd.DataFrame, detail_df: pd.DataFrame) -> pd.DataFrame:
     rows = []
     if detail_df.empty:
         return pd.DataFrame()
+
     for theme, g in detail_df.groupby("테마"):
         ok = g[g["상태"] == "OK"].copy()
         if ok.empty:
             rows.append({"테마": theme, "대장주": "-", "후발주": "-", "숨은 후보": "-", "제외/주의 종목": "-", "이유": "데이터 없음"})
             continue
 
-        leaders = ok[(ok["거래량비율"] >= 1.5) & (ok["20일고점근접"] == True)].sort_values("5일", ascending=False)
-        if leaders.empty:
-            leaders = ok.sort_values("5일", ascending=False).head(1)
-        leader = ", ".join(leaders.head(2)["티커"].tolist())
-
         theme_state = "중립"
         if not theme_df.empty and theme in theme_df["테마"].values:
             theme_state = theme_df.loc[theme_df["테마"] == theme, "상태"].iloc[0]
 
+        # 대장주: 테마 내 흐름점수 상위 + 거래량 + 20일 고점 근처 우선
+        leaders = ok[(ok["거래량비율"].fillna(0) >= 1.3) & (ok["20일고점근접"] == True)].sort_values("흐름점수", ascending=False)
+        if leaders.empty:
+            leaders = ok.sort_values("흐름점수", ascending=False).head(3)
+
+        # 후발주: 테마 상태가 강할 때, 아직 수익률이 낮고 거래량이 증가하기 시작한 종목
+        theme_is_hot = theme_state in ["강한 유입", "유입"]
         laggards = ok[
-            (ok["거래량비율"] >= 1.05) &
-            (ok["5일"].fillna(0) < 3) &
-            (ok["Current DD"].fillna(0) <= -5) &
-            (ok["RSI"].between(40, 60, inclusive="both"))
+            theme_is_hot
+            & (ok["거래량비율"].fillna(0) >= 1.05)
+            & (ok["5일"].fillna(0).between(-3, 4, inclusive="both"))
+            & (ok["Current DD"].fillna(0).between(-20, -3, inclusive="both"))
+            & (ok["RSI"].fillna(100).between(38, 65, inclusive="both"))
         ].sort_values("거래량비율", ascending=False)
 
+        # 숨은 후보: 추천 아님. 거래량 증가 + DD 깊음 + 과열 전
         hidden = ok[
-            (ok["거래량비율"].between(1.1, 1.5, inclusive="both")) &
-            (ok["Current DD"].between(-15, -8, inclusive="both")) &
-            (ok["RSI"].fillna(100) < 70)
-        ].sort_values("거래량비율", ascending=False)
+            (ok["거래량비율"].fillna(0).between(1.1, 1.6, inclusive="both"))
+            & (ok["Current DD"].fillna(0).between(-18, -8, inclusive="both"))
+            & (ok["RSI"].fillna(100) < 70)
+            & (ok["5일"].fillna(0) < 6)
+        ].sort_values(["거래량비율", "흐름점수"], ascending=[False, False])
 
-        caution = ok[(ok["RSI"].fillna(0) >= 72) | (ok["5일"].fillna(0) >= 10)].sort_values("5일", ascending=False)
+        caution = ok[
+            (ok["RSI"].fillna(0) >= 72) | (ok["5일"].fillna(0) >= 10)
+        ].sort_values("5일", ascending=False)
 
         rows.append({
             "테마": theme,
-            "대장주": leader if leader else "-",
-            "후발주": ", ".join(laggards.head(2)["티커"].tolist()) if not laggards.empty else "-",
-            "숨은 후보": ", ".join(hidden.head(2)["티커"].tolist()) if not hidden.empty else "-",
-            "제외/주의 종목": ", ".join(caution.head(2)["티커"].tolist()) if not caution.empty else "-",
+            "대장주": ", ".join(leaders.head(3)["티커"].tolist()) if not leaders.empty else "-",
+            "후발주": ", ".join(laggards.head(3)["티커"].tolist()) if not laggards.empty else "-",
+            "숨은 후보": ", ".join(hidden.head(3)["티커"].tolist()) if not hidden.empty else "-",
+            "제외/주의 종목": ", ".join(caution.head(3)["티커"].tolist()) if not caution.empty else "-",
             "이유": f"테마 상태 {theme_state}. 숨은 후보는 추천이 아니라 관찰 후보.",
         })
     return pd.DataFrame(rows)
 
 
-# =========================
-# 뉴스 초입 가능성
-# =========================
 def calc_news_early_signal(news_df: pd.DataFrame, theme_df: pd.DataFrame, detail_df: pd.DataFrame) -> pd.DataFrame:
     rows = []
     now = pd.Timestamp.now()
-    if news_df is None or news_df.empty:
-        themes = theme_df["테마"].tolist() if not theme_df.empty else list(DEFAULT_THEME_TICKERS.keys())
-        for theme in themes:
-            rows.append({"테마": theme, "뉴스 초입 가능성": "낮음", "이유": "뉴스 데이터 없음", "행동": "관망"})
-        return pd.DataFrame(rows)
+    all_themes = list(AUTO_UNIVERSE.keys())
+    if news_df is not None and not news_df.empty and "관련 테마" in news_df.columns:
+        all_themes = sorted(set(all_themes + news_df["관련 테마"].dropna().tolist()))
 
-    df = news_df.copy()
-    if "_dt" not in df.columns:
-        df["_dt"] = pd.Timestamp.now()
-    df["_dt"] = pd.to_datetime(df["_dt"], errors="coerce").fillna(now)
-
-    for theme in sorted(set(list(DEFAULT_THEME_TICKERS.keys()) + df["관련 테마"].dropna().tolist())):
-        recent_news = df[(df["관련 테마"] == theme) & (df["_dt"] >= now - pd.Timedelta(hours=72))]
-        news_count = len(recent_news)
+    for theme in all_themes:
+        if news_df is None or news_df.empty:
+            news_count = 0
+        else:
+            df = news_df.copy()
+            df["_dt"] = pd.to_datetime(df.get("_dt", now), errors="coerce").fillna(now)
+            news_count = len(df[(df["관련 테마"] == theme) & (df["_dt"] >= now - pd.Timedelta(hours=72))])
 
         theme_row = theme_df[theme_df["테마"] == theme] if theme_df is not None and not theme_df.empty else pd.DataFrame()
         avg5 = theme_row["5일 평균"].iloc[0] if not theme_row.empty else np.nan
@@ -519,7 +587,7 @@ def calc_news_early_signal(news_df: pd.DataFrame, theme_df: pd.DataFrame, detail
 
         d = detail_df[detail_df["테마"] == theme].copy() if detail_df is not None and not detail_df.empty else pd.DataFrame()
         rsi_ok = bool(d["RSI"].dropna().mean() < 70) if not d.empty and d["RSI"].notna().any() else False
-        laggard_vol = bool(((d["거래량비율"] >= 1.1) & (d["5일"].fillna(0) < 5)).any()) if not d.empty else False
+        laggard_vol = bool(((d["거래량비율"].fillna(0) >= 1.1) & (d["5일"].fillna(0) < 5)).any()) if not d.empty else False
 
         score = 0
         reasons = []
@@ -540,57 +608,55 @@ def calc_news_early_signal(news_df: pd.DataFrame, theme_df: pd.DataFrame, detail
             reasons.append("후발주 거래량 증가")
 
         if score >= 4:
-            level = "높음"
-            action = "관심"
+            level, action = "높음", "관심"
         elif score >= 3:
-            level = "보통"
-            action = "눌림 대기"
+            level, action = "보통", "눌림 대기"
         elif pd.notna(avg5) and avg5 >= 8:
-            level = "낮음"
-            action = "추격 금지"
+            level, action = "낮음", "추격 금지"
             reasons.append("단기 과열 가능")
         else:
-            level = "낮음"
-            action = "관망"
+            level, action = "낮음", "관망"
 
         if theme == "우주/SpaceX" and pd.notna(avg5) and avg5 <= -5:
             action = "재료소멸 주의"
             reasons.append("우주주 약세")
 
-        rows.append({
-            "테마": theme,
-            "뉴스 초입 가능성": level,
-            "이유": ", ".join(reasons) if reasons else "신호 부족",
-            "행동": action,
-        })
-    return pd.DataFrame(rows)
+        rows.append({"테마": theme, "뉴스 초입 가능성": level, "이유": ", ".join(reasons) if reasons else "신호 부족", "행동": action})
+    out = pd.DataFrame(rows)
+    order = {"높음": 0, "보통": 1, "낮음": 2}
+    out["_order"] = out["뉴스 초입 가능성"].map(order).fillna(9)
+    return out.sort_values(["_order", "테마"]).drop(columns=["_order"]).reset_index(drop=True)
 
 
 # =========================
-# UI 출력 보조
+# Display helpers
 # =========================
-def display_pct_table(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+def display_pct_table(df: pd.DataFrame, pct_cols: List[str]) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
     out = df.copy()
-    for c in cols:
+    for c in pct_cols:
         if c in out.columns:
-            out[c] = out[c].apply(lambda x: safe_pct(x))
+            out[c] = out[c].apply(safe_pct)
     if "거래량비율" in out.columns:
         out["거래량비율"] = out["거래량비율"].apply(lambda x: safe_num(x))
     if "RSI" in out.columns:
         out["RSI"] = out["RSI"].apply(lambda x: safe_num(x))
     if "Current DD" in out.columns:
-        out["Current DD"] = out["Current DD"].apply(lambda x: safe_pct(x))
+        out["Current DD"] = out["Current DD"].apply(safe_pct)
+    if "흐름점수" in out.columns:
+        out["흐름점수"] = out["흐름점수"].apply(lambda x: safe_num(x))
     return out
 
 
 def make_top_summary(theme_flow: pd.DataFrame, early_df: pd.DataFrame) -> Dict[str, str]:
-    if theme_flow.empty:
+    if theme_flow is None or theme_flow.empty:
         return {"강한 유입": "-", "유입": "-", "유출": "-", "뉴스 초입 후보": "-", "추격 금지": "-"}
     strong_in = theme_flow[theme_flow["상태"] == "강한 유입"]["테마"].tolist()
     inflow = theme_flow[theme_flow["상태"] == "유입"]["테마"].tolist()
     outflow = theme_flow[theme_flow["상태"].isin(["유출", "강한 유출"])]["테마"].tolist()
-    early = early_df[early_df["뉴스 초입 가능성"].isin(["높음", "보통"])] ["테마"].tolist() if early_df is not None and not early_df.empty else []
-    chase_ban = early_df[early_df["행동"].isin(["추격 금지", "재료소멸 주의"])] ["테마"].tolist() if early_df is not None and not early_df.empty else []
+    early = early_df[early_df["뉴스 초입 가능성"].isin(["높음", "보통"])]["테마"].tolist() if early_df is not None and not early_df.empty else []
+    chase_ban = early_df[early_df["행동"].isin(["추격 금지", "재료소멸 주의"])]["테마"].tolist() if early_df is not None and not early_df.empty else []
     return {
         "강한 유입": ", ".join(strong_in) if strong_in else "-",
         "유입": ", ".join(inflow) if inflow else "-",
@@ -600,66 +666,33 @@ def make_top_summary(theme_flow: pd.DataFrame, early_df: pd.DataFrame) -> Dict[s
     }
 
 
+def top_table(df: pd.DataFrame, cols: List[str], n: int = 10) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=cols)
+    use_cols = [c for c in cols if c in df.columns]
+    return df.head(n)[use_cols]
 
-
-def parse_custom_theme_tickers(text: str) -> Dict[str, str]:
-    """
-    사용자 추가 테마 파싱.
-    형식: 테마명|티커1, 티커2
-    예: 국내 반도체|005930, 000660, 091990.KQ
-    """
-    out: Dict[str, str] = {}
-    for line in str(text).splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "|" not in line:
-            continue
-        theme, tickers = line.split("|", 1)
-        theme = theme.strip()
-        tickers = tickers.strip()
-        if theme and tickers:
-            out[theme] = tickers
-    return out
 
 # =========================
-# Streamlit 화면
+# Streamlit UI
 # =========================
-st.title("📰 시장 리포트 | 뉴스 · 테마 · 돈의 흐름")
-st.caption("MDD 계산 로직과 분리된 시장 리포트 탭입니다. 뉴스는 RSS/수동 입력 기반이며, 매수 추천이 아니라 시장 판단 보조용입니다.")
+st.title("📰 시장 리포트 | 객관적 돈의 흐름 스캐너")
+st.caption("사용자가 고른 종목이 아니라, 기본 유니버스를 자동 스캔해 뉴스·테마·거래량·수익률 기준으로 시장 흐름을 정리합니다. 매수 추천이 아닙니다.")
 
 with st.sidebar:
     st.header("시장 리포트 설정")
     lookback = st.selectbox("가격 데이터 기간", ["60d", "90d", "120d"], index=1)
     max_news = st.slider("RSS별 최대 뉴스 수", 5, 30, 12, 1)
-    st.divider()
+    include_korea = st.checkbox("한국 종목/ETF 포함", value=True)
+    include_optional_extra = st.checkbox("추가 유니버스 사용", value=False)
     run_report = st.button("시장 리포트 실행", type="primary")
 
-# 기본 UI는 실행 버튼 없이도 한 번 계산되게 처리
-if "market_report_loaded" not in st.session_state:
-    st.session_state["market_report_loaded"] = False
-if run_report:
-    st.session_state["market_report_loaded"] = True
-
-# 1. 오늘 시장 요약 - 입력/기본값
-st.markdown("## 1. 오늘 시장 요약")
-c1, c2, c3, c4 = st.columns(4)
-with c1:
-    manual_mood = st.selectbox("시장 분위기", ["자동", "긍정", "중립", "부정"], index=0)
-with c2:
-    manual_risk = st.selectbox("위험도", ["자동", "낮음", "보통", "높음", "매우 높음"], index=0)
-with c3:
-    manual_buy = st.selectbox("매수 판단", ["자동", "가능", "소액 가능", "대기", "금지"], index=0)
-with c4:
-    manual_chase = st.selectbox("추격매수", ["자동", "가능", "금지"], index=0)
-core_line = st.text_input("핵심 한 줄", value="돈의 흐름과 뉴스 초입 여부를 우선 확인")
-
-# 2. RSS 설정
+# 1. RSS / manual news
 with st.expander("RSS / 수동 뉴스 입력", expanded=False):
     rss_text = st.text_area(
-        "추가 RSS URL 또는 기본 RSS 수정: 형식은 출처명|URL, 한 줄 하나",
+        "RSS URL: 출처명|URL, 한 줄 하나",
         value="\n".join([f"{k}|{v}" for k, v in DEFAULT_RSS.items()]),
-        height=160,
+        height=150,
     )
     manual_news_input = st.data_editor(
         pd.DataFrame([
@@ -677,99 +710,71 @@ for line in rss_text.splitlines():
         if src.strip() and url.strip():
             rss_map[src.strip()] = url.strip()
 
-# 3. 티커 설정
-with st.expander("테마별 대표 티커 수정 / 한국 종목·ETF 추가", expanded=False):
-    st.caption("미국 티커는 NVDA처럼 입력. 한국 종목/ETF는 005930처럼 6자리만 넣어도 .KS/.KQ를 자동 시도합니다. 직접 091990.KQ, 069500.KS처럼 넣어도 됩니다.")
-    theme_tickers = {}
-    for theme, default in DEFAULT_THEME_TICKERS.items():
-        theme_tickers[theme] = st.text_input(theme, default)
+# 2. Universe setup
+base_universe = {k: v for k, v in AUTO_UNIVERSE.items()}
+if not include_korea:
+    for theme in list(base_universe.keys()):
+        base_universe[theme] = [t for t in base_universe[theme] if not re.search(r"\.K[QS]$", t, flags=re.I) and t not in ["KOSPI", "KOSDAQ"]]
 
-    custom_theme_text = st.text_area(
-        "추가 테마/티커 입력: 테마명|티커1, 티커2",
-        value="국내 반도체|005930, 000660\n국내 ETF 관찰|069500.KS, 360750.KS",
+with st.expander("자동 스캔 유니버스 확인 / 보조 추가", expanded=False):
+    st.info("기본값은 자동 스캔 유니버스입니다. 사용자가 종목을 골라 판단하는 구조가 아니라, 아래 전체를 스캔합니다. 추가 유니버스는 보조 확장용입니다.")
+    uni_preview = universe_to_rows(base_universe)
+    st.dataframe(uni_preview, use_container_width=True, hide_index=True)
+    extra_text = st.text_area(
+        "보조 추가 유니버스: 테마명|티커1, 티커2",
+        value="국내 원전/전력|034020.KS, 051600.KS\n국내 AI SW|035720.KS, 035420.KS",
         height=100,
     )
-    custom_theme_tickers = parse_custom_theme_tickers(custom_theme_text)
-    theme_tickers.update(custom_theme_tickers)
 
-# 데이터 로드
-with st.spinner("뉴스와 가격 데이터를 불러오는 중..."):
+extra_universe = parse_extra_universe(extra_text) if include_optional_extra else {}
+universe = merge_universe(base_universe, extra_universe)
+universe_rows = universe_to_rows(universe)
+
+# 3. Data load
+with st.spinner("뉴스와 자동 스캔 유니버스 데이터를 불러오는 중..."):
     news_df = fetch_rss_items(rss_map, max_news)
     manual_df = build_manual_news_df(manual_news_input)
     if not manual_df.empty:
         news_df = pd.concat([manual_df, news_df], ignore_index=True)
         news_df = news_df.drop_duplicates(subset=["제목", "링크"], keep="first")
-    theme_flow_df, detail_df = calc_all_metrics(theme_tickers, period=lookback)
+
+    detail_df = scan_universe(universe_rows, period=lookback)
+    theme_flow_df = classify_theme_flow(detail_df)
     candidate_df = pick_theme_candidates(theme_flow_df, detail_df)
     early_df = calc_news_early_signal(news_df, theme_flow_df, detail_df)
+    inflow_df, outflow_df, unusual_df = global_stock_rankings(detail_df)
 
 summary = make_top_summary(theme_flow_df, early_df)
 
-# 자동 판단 카드
-if manual_mood == "자동":
-    if "강한 유입" in theme_flow_df.get("상태", pd.Series(dtype=str)).values or "유입" in theme_flow_df.get("상태", pd.Series(dtype=str)).values:
-        mood = "긍정"
-    elif "강한 유출" in theme_flow_df.get("상태", pd.Series(dtype=str)).values or "유출" in theme_flow_df.get("상태", pd.Series(dtype=str)).values:
-        mood = "부정"
-    else:
-        mood = "중립"
-else:
-    mood = manual_mood
-
+# 4. Today summary cards
+st.markdown("## 1. 오늘 시장 요약")
 risk_score = 0
 if not theme_flow_df.empty:
-    if (theme_flow_df["상태"] == "강한 유출").any():
-        risk_score += 2
-    if (theme_flow_df["상태"] == "유출").any():
-        risk_score += 1
+    risk_score += 2 if (theme_flow_df["상태"] == "강한 유출").any() else 0
+    risk_score += 1 if (theme_flow_df["상태"] == "유출").any() else 0
 macro_bad_news = news_df[(news_df["관련 테마"] == "매크로 리스크") & (news_df["영향"].isin(["부정", "혼재"]))] if not news_df.empty else pd.DataFrame()
 if len(macro_bad_news) >= 3:
     risk_score += 1
+risk = "낮음" if risk_score == 0 else "보통" if risk_score == 1 else "높음" if risk_score == 2 else "매우 높음"
 
-if manual_risk == "자동":
-    risk = "낮음" if risk_score == 0 else "보통" if risk_score == 1 else "높음" if risk_score == 2 else "매우 높음"
+if summary["강한 유입"] != "-" or summary["유입"] != "-":
+    mood = "긍정"
+elif summary["유출"] != "-":
+    mood = "부정"
 else:
-    risk = manual_risk
+    mood = "중립"
 
-if manual_buy == "자동":
-    if risk in ["매우 높음"]:
-        buy_judge = "금지"
-    elif risk == "높음":
-        buy_judge = "대기"
-    elif summary["강한 유입"] != "-" or summary["뉴스 초입 후보"] != "-":
-        buy_judge = "소액 가능"
-    else:
-        buy_judge = "대기"
-else:
-    buy_judge = manual_buy
+buy_judge = "금지" if risk == "매우 높음" else "대기" if risk == "높음" else "소액 가능" if summary["뉴스 초입 후보"] != "-" or summary["강한 유입"] != "-" else "대기"
+chase = "금지" if summary["추격 금지"] != "-" or risk in ["높음", "매우 높음"] else "가능"
 
-if manual_chase == "자동":
-    chase = "금지" if summary["추격 금지"] != "-" or risk in ["높음", "매우 높음"] else "가능"
-else:
-    chase = manual_chase
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("시장 분위기", mood)
+c2.metric("위험도", risk)
+c3.metric("매수 판단", buy_judge)
+c4.metric("추격매수", chase)
 
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("시장 분위기", mood)
-m2.metric("위험도", risk)
-m3.metric("매수 판단", buy_judge)
-m4.metric("추격매수", chase)
-st.info(f"핵심 한 줄: {core_line}")
-
-# 2. 주요 시장 지표
-st.markdown("## 2. 주요 시장 지표")
-main_tickers = split_tickers(MAIN_INDICATORS)
-main_metric_rows = [calc_ticker_metrics(t, period=lookback) for t in main_tickers]
-main_metric_df = pd.DataFrame(main_metric_rows)
-show_cols = ["티커", "현재가", "1일", "3일", "5일", "20일", "거래량비율", "Current DD", "RSI"]
-st.dataframe(display_pct_table(main_metric_df[show_cols], ["1일", "3일", "5일", "20일"]), use_container_width=True, hide_index=True)
-
-with st.expander("추가 시장 지표 보기", expanded=False):
-    extra_rows = [calc_ticker_metrics(t, period=lookback) for t in split_tickers(EXTRA_INDICATORS)]
-    extra_df = pd.DataFrame(extra_rows)
-    st.dataframe(display_pct_table(extra_df[show_cols], ["1일", "3일", "5일", "20일"]), use_container_width=True, hide_index=True)
-
-# 최종 4개 요약
-st.markdown("## 3. 돈의 흐름 요약")
+# 5. Objective flow summary
+st.markdown("## 2. 돈의 흐름 요약")
 st.markdown(
     f"""
 - **강한 유입:** {summary['강한 유입']}
@@ -780,29 +785,53 @@ st.markdown(
 """
 )
 
-# 최근 뉴스 TOP5
+r1, r2, r3 = st.columns(3)
+with r1:
+    st.markdown("### 수급 유입 종목")
+    cols = ["테마", "티커", "1일", "3일", "5일", "거래량비율", "Current DD", "RSI", "흐름점수"]
+    st.dataframe(display_pct_table(top_table(inflow_df, cols, 8), ["1일", "3일", "5일"]), use_container_width=True, hide_index=True)
+with r2:
+    st.markdown("### 수급 유출 종목")
+    cols = ["테마", "티커", "1일", "3일", "5일", "거래량비율", "Current DD", "RSI", "흐름점수"]
+    st.dataframe(display_pct_table(top_table(outflow_df, cols, 8), ["1일", "3일", "5일"]), use_container_width=True, hide_index=True)
+with r3:
+    st.markdown("### 거래량 급증")
+    cols = ["테마", "티커", "1일", "3일", "5일", "거래량비율", "Current DD", "RSI"]
+    st.dataframe(display_pct_table(top_table(unusual_df, cols, 8), ["1일", "3일", "5일"]), use_container_width=True, hide_index=True)
+
+# 6. Market indicators
+st.markdown("## 3. 주요 시장 지표")
+main_rows = [calc_ticker_metrics(t, period=lookback) for t in MAIN_INDICATORS]
+main_df = pd.DataFrame(main_rows)
+show_cols = ["티커", "현재가", "1일", "3일", "5일", "20일", "거래량비율", "Current DD", "RSI"]
+st.dataframe(display_pct_table(main_df[show_cols], ["1일", "3일", "5일", "20일"]), use_container_width=True, hide_index=True)
+with st.expander("추가 시장 지표 보기", expanded=False):
+    extra_rows = [calc_ticker_metrics(t, period=lookback) for t in EXTRA_INDICATORS]
+    extra_df = pd.DataFrame(extra_rows)
+    st.dataframe(display_pct_table(extra_df[show_cols], ["1일", "3일", "5일", "20일"]), use_container_width=True, hide_index=True)
+
+# 7. News top 5
 st.markdown("## 4. 최근 뉴스 TOP 5")
 if news_df.empty:
     st.warning("뉴스를 불러오지 못했습니다. RSS URL 또는 수동 입력을 확인하세요.")
 else:
-    top_news = news_df.head(5)[["시간", "제목", "출처", "관련 테마", "영향", "신뢰도", "요약 메모", "링크"]]
-    st.dataframe(top_news, use_container_width=True, hide_index=True)
+    st.dataframe(news_df.head(5)[["시간", "제목", "출처", "관련 테마", "영향", "신뢰도", "요약 메모", "링크"]], use_container_width=True, hide_index=True)
 
-# 돈의 흐름 테마 순위
+# 8. Theme flow ranking
 st.markdown("## 5. 돈의 흐름 테마 순위")
-flow_show_cols = ["테마", "상태", "1일 평균", "3일 평균", "5일 평균", "거래량비율", "대표 강세 종목", "대표 약세 종목", "판단 메모"]
-st.dataframe(display_pct_table(theme_flow_df[flow_show_cols], ["1일 평균", "3일 평균", "5일 평균"]), use_container_width=True, hide_index=True)
+flow_cols = ["테마", "상태", "1일 평균", "3일 평균", "5일 평균", "거래량비율", "대표 강세 종목", "대표 약세 종목", "판단 메모"]
+st.dataframe(display_pct_table(theme_flow_df[flow_cols], ["1일 평균", "3일 평균", "5일 평균"]), use_container_width=True, hide_index=True)
 
-# 테마별 후보
+# 9. Leaders / laggards / hidden
 st.markdown("## 6. 테마별 대장주 / 후발주 / 숨은 후보")
-st.caption("숨은 후보는 추천이 아니라 관찰 후보입니다.")
+st.caption("자동 스캔 결과입니다. 숨은 후보는 추천이 아니라 관찰 후보입니다.")
 st.dataframe(candidate_df, use_container_width=True, hide_index=True)
 
-# 뉴스 초입 가능성
+# 10. Early news signal
 st.markdown("## 7. 뉴스 초입 가능성")
 st.dataframe(early_df[["테마", "뉴스 초입 가능성", "이유", "행동"]], use_container_width=True, hide_index=True)
 
-# 주요 리스크
+# 11. Risks
 st.markdown("## 8. 주요 리스크")
 risk_news = news_df[(news_df["관련 테마"] == "매크로 리스크") | (news_df["영향"].isin(["부정", "혼재"]))].head(5) if not news_df.empty else pd.DataFrame()
 if risk_news.empty:
@@ -810,7 +839,7 @@ if risk_news.empty:
 else:
     st.dataframe(risk_news[["시간", "제목", "출처", "관련 테마", "영향", "신뢰도", "요약 메모", "링크"]], use_container_width=True, hide_index=True)
 
-# 상세 데이터
+# 12. Detail data
 with st.expander("상세 뉴스 전체 보기", expanded=False):
     if not news_df.empty:
         st.dataframe(news_df.drop(columns=["_dt"], errors="ignore"), use_container_width=True, hide_index=True)
@@ -821,7 +850,7 @@ with st.expander("상세 뉴스 전체 보기", expanded=False):
             mime="text/csv",
         )
 
-with st.expander("상세 종목 데이터 보기", expanded=False):
+with st.expander("상세 종목 데이터 전체 보기", expanded=False):
     st.dataframe(display_pct_table(detail_df, ["1일", "3일", "5일", "20일"]), use_container_width=True, hide_index=True)
     st.download_button(
         "종목 데이터 CSV 다운로드",
@@ -830,4 +859,4 @@ with st.expander("상세 종목 데이터 보기", expanded=False):
         mime="text/csv",
     )
 
-st.caption("주의: RSS 뉴스와 가격 데이터는 지연·누락될 수 있습니다. 루머성 정보는 사실로 확정하지 말고, 공시·실적·거래대금으로 재확인하세요.")
+st.caption("주의: 자동 스캔은 기본 유니버스 안에서의 객관적 가격·거래량 변화입니다. 전체 상장종목 전체검색은 별도 KRX/Nasdaq screener API가 필요합니다. 루머성 정보는 사실로 확정하지 말고 공시·거래대금으로 재확인하세요.")
