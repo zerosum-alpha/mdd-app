@@ -19,6 +19,12 @@ import streamlit as st
 import yfinance as yf
 import feedparser
 
+# Optional: 한국 종목명 조회용. 설치되어 있으면 6자리 코드명을 자동 변환하고, 없으면 fallback 사전을 사용.
+try:
+    from pykrx import stock as pkstock
+except Exception:
+    pkstock = None
+
 
 # =========================
 # Page setup
@@ -129,6 +135,132 @@ MARKET_TICKER_MAP = {
     "KOSPI200": "^KS200",
 }
 
+# 표시용 종목명. pykrx가 가능하면 한국 6자리 코드는 자동 조회하고, 실패 시 아래 fallback 사용.
+TICKER_NAME_OVERRIDES = {
+    # 지수/ETF
+    "KOSPI": "코스피",
+    "KOSDAQ": "코스닥",
+    "KOSPI200": "코스피200",
+    "^KS11": "코스피",
+    "^KQ11": "코스닥",
+    "^KS200": "코스피200",
+    "EWY": "iShares MSCI Korea ETF",
+    "QQQ": "Invesco QQQ",
+    "SPY": "SPDR S&P 500",
+    "SOXX": "iShares Semiconductor ETF",
+    "SMH": "VanEck Semiconductor ETF",
+    "USO": "United States Oil Fund",
+    "IWM": "iShares Russell 2000 ETF",
+    "UUP": "Invesco Dollar Index Bullish",
+    "^VIX": "VIX",
+    "^TNX": "미국 10년물 금리",
+    "069500": "KODEX 200",
+    "069500.KS": "KODEX 200",
+    "102110": "TIGER 200",
+    "102110.KS": "TIGER 200",
+    "360750": "TIGER 미국S&P500",
+    "360750.KS": "TIGER 미국S&P500",
+    "379810": "KODEX 미국나스닥100TR",
+    "379810.KS": "KODEX 미국나스닥100TR",
+    # 한국 종목
+    "005930": "삼성전자",
+    "005930.KS": "삼성전자",
+    "000660": "SK하이닉스",
+    "000660.KS": "SK하이닉스",
+    "042700": "한미반도체",
+    "042700.KS": "한미반도체",
+    "095340": "ISC",
+    "095340.KQ": "ISC",
+    "039030": "이오테크닉스",
+    "039030.KQ": "이오테크닉스",
+    "089030": "테크윙",
+    "089030.KQ": "테크윙",
+    "010120": "LS ELECTRIC",
+    "010120.KS": "LS ELECTRIC",
+    "267260": "HD현대일렉트릭",
+    "267260.KS": "HD현대일렉트릭",
+    "277810": "레인보우로보틱스",
+    "277810.KQ": "레인보우로보틱스",
+    "108490": "로보티즈",
+    "108490.KQ": "로보티즈",
+    "090360": "로보스타",
+    "090360.KQ": "로보스타",
+    "047810": "한국항공우주",
+    "047810.KS": "한국항공우주",
+    "034020": "두산에너빌리티",
+    "034020.KS": "두산에너빌리티",
+    "051600": "한전KPS",
+    "051600.KS": "한전KPS",
+    "035720": "카카오",
+    "035720.KS": "카카오",
+    "035420": "NAVER",
+    "035420.KS": "NAVER",
+    # 미국 종목
+    "NVDA": "NVIDIA",
+    "AVGO": "Broadcom",
+    "AMD": "AMD",
+    "TSM": "TSMC",
+    "ASML": "ASML",
+    "ARM": "Arm",
+    "MRVL": "Marvell",
+    "QCOM": "Qualcomm",
+    "AMAT": "Applied Materials",
+    "LRCX": "Lam Research",
+    "KLAC": "KLA",
+    "MU": "Micron",
+    "WDC": "Western Digital",
+    "STX": "Seagate",
+    "VRT": "Vertiv",
+    "DELL": "Dell",
+    "HPE": "HPE",
+    "SMCI": "Super Micro Computer",
+    "ORCL": "Oracle",
+    "MSFT": "Microsoft",
+    "AMZN": "Amazon",
+    "ANET": "Arista Networks",
+    "CLS": "Celestica",
+    "NTAP": "NetApp",
+    "PSTG": "Pure Storage",
+    "ETN": "Eaton",
+    "PWR": "Quanta Services",
+    "GEV": "GE Vernova",
+    "NEE": "NextEra Energy",
+    "CEG": "Constellation Energy",
+    "AEP": "American Electric Power",
+    "SO": "Southern Company",
+    "XLU": "Utilities Select Sector SPDR",
+    "GOOGL": "Alphabet",
+    "GOOG": "Alphabet",
+    "META": "Meta",
+    "TSLA": "Tesla",
+    "BOTZ": "Global X Robotics & AI ETF",
+    "ROBO": "ROBO Global Robotics ETF",
+    "ISRG": "Intuitive Surgical",
+    "TER": "Teradyne",
+    "SYM": "Symbotic",
+    "RKLB": "Rocket Lab",
+    "ASTS": "AST SpaceMobile",
+    "RDW": "Redwire",
+    "LUNR": "Intuitive Machines",
+    "PL": "Planet Labs",
+    "IRDM": "Iridium",
+    "ARKX": "ARK Space Exploration ETF",
+    "BA": "Boeing",
+    "LMT": "Lockheed Martin",
+    "CIBR": "First Trust Nasdaq Cybersecurity ETF",
+    "HACK": "Amplify Cybersecurity ETF",
+    "CRWD": "CrowdStrike",
+    "PANW": "Palo Alto Networks",
+    "ZS": "Zscaler",
+    "FTNT": "Fortinet",
+    "PLTR": "Palantir",
+    "SNOW": "Snowflake",
+    "NOW": "ServiceNow",
+    "DDOG": "Datadog",
+    "AIQ": "Global X AI & Technology ETF",
+    "IGV": "iShares Expanded Tech-Software ETF",
+}
+
 MAIN_INDICATORS = ["QQQ", "SPY", "SOXX", "EWY", "^VIX", "USO"]
 EXTRA_INDICATORS = ["IWM", "^TNX", "UUP", "KOSPI", "KOSDAQ", "NVDA", "MU", "VRT", "GOOGL"]
 
@@ -139,6 +271,59 @@ EXTRA_INDICATORS = ["IWM", "^TNX", "UUP", "KOSPI", "KOSDAQ", "NVDA", "MU", "VRT"
 def normalize_ticker(ticker: str) -> str:
     t = str(ticker).strip().upper()
     return MARKET_TICKER_MAP.get(t, t)
+
+
+def strip_kr_suffix(ticker: str) -> str:
+    t = str(ticker).strip().upper()
+    return re.sub(r"\.(KS|KQ)$", "", t)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_display_name(raw_ticker: str, resolved_ticker: str = "") -> str:
+    """티커를 표시명으로 변환. 한국 6자리 코드는 pykrx 우선, 실패 시 fallback 사전 사용."""
+    raw = str(raw_ticker).strip().upper()
+    resolved = str(resolved_ticker or "").strip().upper()
+    candidates = [raw, resolved, strip_kr_suffix(raw), strip_kr_suffix(resolved)]
+
+    for key in candidates:
+        if key and key in TICKER_NAME_OVERRIDES:
+            return TICKER_NAME_OVERRIDES[key]
+
+    code = ""
+    for key in candidates:
+        if re.fullmatch(r"\d{6}", key):
+            code = key
+            break
+    if code and pkstock is not None:
+        try:
+            name = pkstock.get_market_ticker_name(code)
+            if name:
+                return str(name)
+        except Exception:
+            pass
+
+    # 마지막 fallback: 이름을 모르면 티커 그대로 표시하되, 한국 코드는 혼동 방지를 위해 코드 표시
+    return raw or resolved or "-"
+
+
+def format_name_ticker(raw_ticker: str, resolved_ticker: str = "") -> str:
+    name = get_display_name(raw_ticker, resolved_ticker)
+    ticker = str(raw_ticker).strip().upper()
+    if not ticker:
+        ticker = str(resolved_ticker).strip().upper()
+    if name == ticker or not name:
+        return ticker
+    return f"{name} ({ticker})"
+
+
+def format_row_name(row: pd.Series) -> str:
+    return format_name_ticker(str(row.get("티커", "")), str(row.get("조회티커", "")))
+
+
+def format_name_list(df: pd.DataFrame, max_n: int = 3) -> str:
+    if df is None or df.empty:
+        return "-"
+    return ", ".join(format_row_name(r) for _, r in df.head(max_n).iterrows())
 
 
 def ticker_candidates(ticker: str) -> List[str]:
@@ -272,7 +457,7 @@ def universe_to_rows(universe: Dict[str, List[str]]) -> pd.DataFrame:
     rows = []
     for theme, tickers in universe.items():
         for i, ticker in enumerate(tickers):
-            rows.append({"테마": theme, "티커": ticker, "대표순위": i + 1})
+            rows.append({"테마": theme, "종목명": get_display_name(ticker), "티커": ticker, "대표순위": i + 1})
     return pd.DataFrame(rows)
 
 
@@ -371,7 +556,7 @@ def calc_ticker_metrics(ticker: str, period: str = "90d") -> Dict[str, Any]:
     df, resolved_ticker = load_price_single(ticker, period=period)
     if df.empty or "Close" not in df.columns:
         return {
-            "티커": ticker, "조회티커": resolved_ticker, "현재가": np.nan,
+            "티커": ticker, "종목명": get_display_name(ticker, resolved_ticker), "표시명": format_name_ticker(ticker, resolved_ticker), "조회티커": resolved_ticker, "현재가": np.nan,
             "1일": np.nan, "3일": np.nan, "5일": np.nan, "20일": np.nan,
             "거래량비율": np.nan, "Current DD": np.nan, "RSI": np.nan,
             "20일고점근접": False, "흐름점수": np.nan, "상태": "데이터 없음",
@@ -379,7 +564,7 @@ def calc_ticker_metrics(ticker: str, period: str = "90d") -> Dict[str, Any]:
 
     close = pd.to_numeric(df["Close"], errors="coerce").dropna()
     if close.empty:
-        return {"티커": ticker, "조회티커": resolved_ticker, "상태": "데이터 없음"}
+        return {"티커": ticker, "종목명": get_display_name(ticker, resolved_ticker), "표시명": format_name_ticker(ticker, resolved_ticker), "조회티커": resolved_ticker, "상태": "데이터 없음"}
     volume = pd.to_numeric(df.get("Volume", pd.Series(index=df.index, dtype=float)), errors="coerce")
     cur = close.iloc[-1]
 
@@ -413,6 +598,8 @@ def calc_ticker_metrics(ticker: str, period: str = "90d") -> Dict[str, Any]:
 
     return {
         "티커": ticker,
+        "종목명": get_display_name(ticker, resolved_ticker),
+        "표시명": format_name_ticker(ticker, resolved_ticker),
         "조회티커": resolved_ticker,
         "현재가": cur,
         "1일": r1,
@@ -485,8 +672,8 @@ def classify_theme_flow(detail_df: pd.DataFrame) -> pd.DataFrame:
             "5일 평균": avg5,
             "20일 평균": avg20,
             "거래량비율": vol,
-            "대표 강세 종목": strong["티커"].iloc[0] if not strong.empty else "-",
-            "대표 약세 종목": weak["티커"].iloc[0] if not weak.empty else "-",
+            "대표 강세 종목": format_row_name(strong.iloc[0]) if not strong.empty else "-",
+            "대표 약세 종목": format_row_name(weak.iloc[0]) if not weak.empty else "-",
             "판단 메모": memo,
             "테마점수": theme_score,
         })
@@ -557,10 +744,10 @@ def pick_theme_candidates(theme_df: pd.DataFrame, detail_df: pd.DataFrame) -> pd
 
         rows.append({
             "테마": theme,
-            "대장주": ", ".join(leaders.head(3)["티커"].tolist()) if not leaders.empty else "-",
-            "후발주": ", ".join(laggards.head(3)["티커"].tolist()) if not laggards.empty else "-",
-            "숨은 후보": ", ".join(hidden.head(3)["티커"].tolist()) if not hidden.empty else "-",
-            "제외/주의 종목": ", ".join(caution.head(3)["티커"].tolist()) if not caution.empty else "-",
+            "대장주": format_name_list(leaders, 3) if not leaders.empty else "-",
+            "후발주": format_name_list(laggards, 3) if not laggards.empty else "-",
+            "숨은 후보": format_name_list(hidden, 3) if not hidden.empty else "-",
+            "제외/주의 종목": format_name_list(caution, 3) if not caution.empty else "-",
             "이유": f"테마 상태 {theme_state}. 숨은 후보는 추천이 아니라 관찰 후보.",
         })
     return pd.DataFrame(rows)
@@ -677,7 +864,7 @@ def top_table(df: pd.DataFrame, cols: List[str], n: int = 10) -> pd.DataFrame:
 # Streamlit UI
 # =========================
 st.title("📰 시장 리포트 | 객관적 돈의 흐름 스캐너")
-st.caption("사용자가 고른 종목이 아니라, 기본 유니버스를 자동 스캔해 뉴스·테마·거래량·수익률 기준으로 시장 흐름을 정리합니다. 매수 추천이 아닙니다.")
+st.caption("사용자가 고른 종목이 아니라, 기본 유니버스를 자동 스캔해 뉴스·테마·거래량·수익률 기준으로 시장 흐름을 정리합니다. 한국 종목은 코드와 종목명을 함께 표시합니다. 매수 추천이 아닙니다.")
 
 with st.sidebar:
     st.header("시장 리포트 설정")
@@ -717,7 +904,7 @@ if not include_korea:
         base_universe[theme] = [t for t in base_universe[theme] if not re.search(r"\.K[QS]$", t, flags=re.I) and t not in ["KOSPI", "KOSDAQ"]]
 
 with st.expander("자동 스캔 유니버스 확인 / 보조 추가", expanded=False):
-    st.info("기본값은 자동 스캔 유니버스입니다. 사용자가 종목을 골라 판단하는 구조가 아니라, 아래 전체를 스캔합니다. 추가 유니버스는 보조 확장용입니다.")
+    st.info("기본값은 자동 스캔 유니버스입니다. 사용자가 종목을 골라 판단하는 구조가 아니라, 아래 전체를 스캔합니다. 한국 6자리 코드는 종목명으로 자동 매칭해 표시합니다.")
     uni_preview = universe_to_rows(base_universe)
     st.dataframe(uni_preview, use_container_width=True, hide_index=True)
     extra_text = st.text_area(
@@ -788,22 +975,22 @@ st.markdown(
 r1, r2, r3 = st.columns(3)
 with r1:
     st.markdown("### 수급 유입 종목")
-    cols = ["테마", "티커", "1일", "3일", "5일", "거래량비율", "Current DD", "RSI", "흐름점수"]
+    cols = ["테마", "종목명", "티커", "1일", "3일", "5일", "거래량비율", "Current DD", "RSI", "흐름점수"]
     st.dataframe(display_pct_table(top_table(inflow_df, cols, 8), ["1일", "3일", "5일"]), use_container_width=True, hide_index=True)
 with r2:
     st.markdown("### 수급 유출 종목")
-    cols = ["테마", "티커", "1일", "3일", "5일", "거래량비율", "Current DD", "RSI", "흐름점수"]
+    cols = ["테마", "종목명", "티커", "1일", "3일", "5일", "거래량비율", "Current DD", "RSI", "흐름점수"]
     st.dataframe(display_pct_table(top_table(outflow_df, cols, 8), ["1일", "3일", "5일"]), use_container_width=True, hide_index=True)
 with r3:
     st.markdown("### 거래량 급증")
-    cols = ["테마", "티커", "1일", "3일", "5일", "거래량비율", "Current DD", "RSI"]
+    cols = ["테마", "종목명", "티커", "1일", "3일", "5일", "거래량비율", "Current DD", "RSI"]
     st.dataframe(display_pct_table(top_table(unusual_df, cols, 8), ["1일", "3일", "5일"]), use_container_width=True, hide_index=True)
 
 # 6. Market indicators
 st.markdown("## 3. 주요 시장 지표")
 main_rows = [calc_ticker_metrics(t, period=lookback) for t in MAIN_INDICATORS]
 main_df = pd.DataFrame(main_rows)
-show_cols = ["티커", "현재가", "1일", "3일", "5일", "20일", "거래량비율", "Current DD", "RSI"]
+show_cols = ["종목명", "티커", "현재가", "1일", "3일", "5일", "20일", "거래량비율", "Current DD", "RSI"]
 st.dataframe(display_pct_table(main_df[show_cols], ["1일", "3일", "5일", "20일"]), use_container_width=True, hide_index=True)
 with st.expander("추가 시장 지표 보기", expanded=False):
     extra_rows = [calc_ticker_metrics(t, period=lookback) for t in EXTRA_INDICATORS]
