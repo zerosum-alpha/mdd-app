@@ -6,3 +6,4 @@ yfinance
 finance-datareader
 feedparser
 pykrx
+setuptools
