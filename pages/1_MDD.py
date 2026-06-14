@@ -580,10 +580,14 @@ def make_price_pe_trend_chart(fin_trend_df, valuation, ticker):
     if chart_df.empty or "pe_ttm" not in chart_df.columns:
         return None, pd.DataFrame()
 
-    chart_df = chart_df.dropna(subset=["price", "pe_ttm"])
+    chart_df = chart_df.dropna(subset=["price", "pe_ttm"]).copy()
 
-    if chart_df.empty or len(chart_df) < 2:
+    # yfinance quarterly financials often provide only 1~2 usable TTM P/E points.
+    # Drawing a line chart with only 2~3 points is misleading, so block it.
+    if chart_df.empty or len(chart_df) < 6:
         return None, chart_df
+
+    chart_df = chart_df.sort_values("date")
 
     fig, ax_price = plt.subplots(figsize=(12, 5))
 
@@ -609,7 +613,7 @@ def make_price_pe_trend_chart(fin_trend_df, valuation, ticker):
     if is_valid_number(current_forward_pe) and float(current_forward_pe) > 0:
         ax_pe.axhline(float(current_forward_pe), linestyle="--", alpha=0.25, label="Current forward P/E")
 
-    ax_price.set_title(f"{ticker} Price vs P/E Trend")
+    ax_price.set_title(f"{ticker} Price vs TTM P/E Trend")
 
     lines1, labels1 = ax_price.get_legend_handles_labels()
     lines2, labels2 = ax_pe.get_legend_handles_labels()
@@ -621,8 +625,12 @@ def make_price_pe_trend_chart(fin_trend_df, valuation, ticker):
 
 
 def make_price_pe_comment(price_pe_df):
-    if price_pe_df.empty or len(price_pe_df.dropna(subset=["price", "pe_ttm"])) < 2:
-        return "Price + P/E 추세를 계산할 데이터가 부족합니다."
+    if price_pe_df.empty or len(price_pe_df.dropna(subset=["price", "pe_ttm"])) < 6:
+        return (
+            "Price + P/E 추세 차트를 그릴 만큼 데이터가 충분하지 않습니다. "
+            "2~3개 점만 연결하면 오판 가능성이 커서 차트를 표시하지 않습니다. "
+            "정확한 12개월 Forward P/E 추이는 FactSet/Bloomberg/Refinitiv 같은 컨센서스 데이터가 필요합니다."
+        )
 
     df = price_pe_df.dropna(subset=["price", "pe_ttm"]).copy()
 
@@ -1847,7 +1855,16 @@ if run:
         if market != "US":
             st.info("한국 종목은 yfinance 재무제표 기반 P/E 추세 데이터가 제한적이라 이 차트를 표시하지 않습니다.")
         elif price_pe_chart is None:
-            st.info("P/E 추세 계산에 필요한 EPS TTM 데이터가 부족합니다.")
+            st.warning(price_pe_comment)
+            if not price_pe_df.empty:
+                st.caption("아래는 yfinance에서 계산 가능한 원자료입니다. 점이 너무 적으면 추세 차트로 쓰지 않습니다.")
+                show_price_pe_df = price_pe_df.copy()
+                show_price_pe_df["date"] = pd.to_datetime(show_price_pe_df["date"]).dt.strftime("%Y-%m-%d")
+                for col in ["price", "eps_ttm", "pe_ttm"]:
+                    if col in show_price_pe_df.columns:
+                        show_price_pe_df[col] = show_price_pe_df[col].apply(lambda x: None if pd.isna(x) else round(float(x), 2))
+                with st.expander("Price + P/E 원자료 보기"):
+                    st.dataframe(show_price_pe_df[["date", "price", "eps_ttm", "pe_ttm"]], use_container_width=True)
         else:
             st.pyplot(price_pe_chart)
             st.write(price_pe_comment)
