@@ -214,49 +214,73 @@ def add_indicators(df):
 # =========================================================
 @st.cache_data(ttl=3600)
 def load_kr_per_series(ticker, start_date, end_date):
-    """한국 종목: pykrx에서 과거 PER/PBR/EPS를 최대한 가져온다."""
+    """
+    한국 개별 종목 과거 PER/PBR/EPS 조회.
+    검증 기준: pykrx 공식 방식은
+    pkstock.get_market_fundamental(start, end, ticker)
+    pkstock.get_market_fundamental(start, end, ticker, freq="m")
+    이다.
+    """
     if not PYKRX_AVAILABLE:
         return pd.DataFrame(), f"pykrx import 실패: {PYKRX_IMPORT_ERROR}"
 
+    ticker = str(ticker).strip().zfill(6)
     start = pd.to_datetime(start_date).strftime("%Y%m%d")
     end = pd.to_datetime(end_date).strftime("%Y%m%d")
 
     attempts = []
 
-    # 1) 공식적으로 많이 쓰이는 by_date 함수
+    # 1순위: 공식 일자별 PER/PBR/EPS
     try:
-        df = pkstock.get_market_fundamental_by_date(start, end, ticker)
-        attempts.append(("get_market_fundamental_by_date", df))
+        df = pkstock.get_market_fundamental(start, end, ticker)
+        attempts.append(("OK attempt: get_market_fundamental daily", df))
     except Exception as e:
-        attempts.append((f"get_market_fundamental_by_date 실패: {e}", pd.DataFrame()))
+        attempts.append((f"daily error: {repr(e)}", pd.DataFrame()))
 
-    # 2) 다른 pykrx 버전 호환
-    for freq in ["d", "m"]:
-        try:
-            df = pkstock.get_market_fundamental(start, end, ticker, freq=freq)
-            attempts.append((f"get_market_fundamental freq={freq}", df))
-        except Exception as e:
-            attempts.append((f"get_market_fundamental freq={freq} 실패: {e}", pd.DataFrame()))
+    # 2순위: 공식 월별 PER/PBR/EPS. 일별 데이터가 막힐 때 화면에는 ffill해서 표시.
+    try:
+        df = pkstock.get_market_fundamental(start, end, ticker, freq="m")
+        attempts.append(("OK attempt: get_market_fundamental monthly", df))
+    except Exception as e:
+        attempts.append((f"monthly error: {repr(e)}", pd.DataFrame()))
 
     for source, df in attempts:
         if df is None or df.empty:
             continue
-        df = df.copy()
-        df.index = to_datetime_ns_index(df.index)
-        df = df.dropna(axis=0, how="all")
-        if "PER" not in df.columns:
+
+        out = df.copy()
+        out.index = to_datetime_ns_index(out.index)
+        out = out.dropna(axis=0, how="all")
+
+        keep_cols = [c for c in ["PER", "PBR", "EPS", "BPS", "DIV", "DPS"] if c in out.columns]
+        if "PER" not in keep_cols:
             continue
-        keep_cols = [c for c in ["PER", "PBR", "EPS", "BPS"] if c in df.columns]
-        out = df[keep_cols].copy()
+
+        out = out[keep_cols].copy()
         for col in keep_cols:
             out[col] = pd.to_numeric(out[col], errors="coerce")
-        out = out[(out["PER"] > 0) & (out["PER"] < 300)]
-        out = out.dropna(subset=["PER"])
-        if len(out) >= 5:
-            return out, source
 
-    reason = " / ".join([src for src, _ in attempts[:3]])
-    return pd.DataFrame(), reason
+        # KRX PER은 적자/특이 구간에서 0 또는 이상치가 나올 수 있음. 차트용으로 제거.
+        out = out[(out["PER"] > 0) & (out["PER"] < 300)].dropna(subset=["PER"])
+
+        if len(out) >= 3:
+            return out, source.replace("OK attempt: ", "OK: ")
+
+    fail_reason = " / ".join([src for src, _ in attempts])
+    return pd.DataFrame(), fail_reason
+
+
+def run_pykrx_direct_test():
+    """Streamlit 화면에서 직접 검증용. 앱 로직과 별개로 삼성전자 PER 조회가 되는지 확인."""
+    if not PYKRX_AVAILABLE:
+        return pd.DataFrame(), f"pykrx import 실패: {PYKRX_IMPORT_ERROR}"
+    try:
+        test = pkstock.get_market_fundamental("20240102", "20240110", "005930")
+        if test is None or test.empty:
+            return pd.DataFrame(), "직접 검증 결과: 빈 DataFrame"
+        return test, "직접 검증 OK: get_market_fundamental('20240102','20240110','005930')"
+    except Exception as e:
+        return pd.DataFrame(), f"직접 검증 실패: {repr(e)}"
 
 
 @st.cache_data(ttl=3600)
@@ -798,11 +822,15 @@ if run:
         show["Max_Drawdown"] = show["Max_Drawdown"] * 100
         st.dataframe(show, use_container_width=True)
 
-    with st.expander("PER 원자료 확인"):
+    with st.expander("PER 원자료 / pykrx 직접 검증"):
         if market == "KR":
             st.write(f"pykrx import status: {PYKRX_AVAILABLE}")
             if not PYKRX_AVAILABLE:
                 st.code(PYKRX_IMPORT_ERROR)
+            test_df, test_status = run_pykrx_direct_test()
+            st.write(test_status)
+            if not test_df.empty:
+                st.dataframe(test_df, use_container_width=True)
         st.write(f"PER source: {per_source}")
         if per_available:
             st.dataframe(per_df.tail(60), use_container_width=True)
