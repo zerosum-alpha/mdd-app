@@ -5,5 +5,7 @@ numpy
 yfinance
 finance-datareader
 feedparser
+requests
+beautifulsoup4
 setuptools==80.9.0
-pykrx
+pykrx==1.0.51
