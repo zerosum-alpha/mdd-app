@@ -1,6 +1,7 @@
 
 import streamlit as st
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
 import yfinance as yf
 import FinanceDataReader as fdr
@@ -23,6 +24,7 @@ from auth import require_login, logout_button
 # + MDD + Valuation Matrix
 # + Target Price
 # + Cash Warning Light
+# + Lightweight Forecast Reference Chart
 #
 # 원칙:
 # - 기존 MDD / Buy Score 계산 로직은 유지
@@ -448,98 +450,192 @@ def make_valuation_summary(valuation):
 @st.cache_data(ttl=86400)
 def load_financial_trend_data(ticker):
     """
-    yfinance 분기 손익계산서에서 TTM EPS / TTM Revenue를 만든다.
+    미국 종목 Price + P/E 차트용 데이터 생성.
 
-    핵심:
-    - 주가처럼 PER 시계열이 바로 제공되는 것이 아니므로,
-      실제 분기 EPS 또는 Net Income / Diluted Shares로 EPS를 만든다.
-    - 최근 4개 분기 합산 EPS = EPS TTM
-    - 최근 4개 분기 합산 매출 = Revenue TTM
-    - 이후 일별 주가와 결합해서 일별 TTM P/E를 계산한다.
+    우선순위:
+    1) yfinance quarterly income statement에서 Diluted EPS / Basic EPS 사용
+    2) EPS가 없으면 Net Income / Average Shares로 계산
+    3) 그래도 없으면 earnings_dates의 Reported EPS 사용
+
+    반환:
+    fiscal_date, report_date, eps_ttm, revenue_ttm, source
     """
+    def clean_statement(raw_df):
+        if raw_df is None or raw_df.empty:
+            return pd.DataFrame()
+
+        df0 = raw_df.copy()
+
+        # 케이스 A: columns가 날짜, index가 항목명
+        cols_as_date = pd.to_datetime(df0.columns, errors="coerce")
+        if cols_as_date.notna().sum() >= 2:
+            df0.columns = cols_as_date
+            df0 = df0.loc[:, df0.columns.notna()]
+            return df0.sort_index(axis=1)
+
+        # 케이스 B: index가 날짜, columns가 항목명인 경우 transpose
+        idx_as_date = pd.to_datetime(df0.index, errors="coerce")
+        if idx_as_date.notna().sum() >= 2:
+            df0.index = idx_as_date
+            df0 = df0.loc[df0.index.notna()]
+            df0 = df0.T
+            df0.columns = pd.to_datetime(df0.columns, errors="coerce")
+            df0 = df0.loc[:, df0.columns.notna()]
+            return df0.sort_index(axis=1)
+
+        return pd.DataFrame()
+
+    def pick_row(financials, candidates):
+        if financials is None or financials.empty:
+            return None
+
+        norm_index = {str(idx).strip().lower().replace(" ", "").replace("_", ""): idx for idx in financials.index}
+
+        for cand in candidates:
+            key = cand.strip().lower().replace(" ", "").replace("_", "")
+            if key in norm_index:
+                return pd.to_numeric(financials.loc[norm_index[key]], errors="coerce")
+
+        # 부분 매칭 보조
+        for cand in candidates:
+            key = cand.strip().lower().replace(" ", "").replace("_", "")
+            for norm_key, original_idx in norm_index.items():
+                if key in norm_key or norm_key in key:
+                    return pd.to_numeric(financials.loc[original_idx], errors="coerce")
+
+        return None
+
     try:
         t = yf.Ticker(ticker)
 
-        q_inc = t.quarterly_income_stmt
-        q_fin = t.quarterly_financials
+        raw_candidates = []
 
-        if q_inc is not None and not q_inc.empty:
-            financials = q_inc.copy()
-        elif q_fin is not None and not q_fin.empty:
-            financials = q_fin.copy()
-        else:
-            return pd.DataFrame()
+        try:
+            raw_candidates.append(t.get_income_stmt(freq="quarterly"))
+        except Exception:
+            pass
 
-        financials.columns = pd.to_datetime(financials.columns, errors="coerce")
-        financials = financials.loc[:, financials.columns.notna()]
-        financials = financials.sort_index(axis=1)
+        try:
+            raw_candidates.append(t.quarterly_income_stmt)
+        except Exception:
+            pass
 
-        if financials.empty or len(financials.columns) < 4:
-            return pd.DataFrame()
+        try:
+            raw_candidates.append(t.quarterly_financials)
+        except Exception:
+            pass
 
-        def pick_row(candidates):
-            for c in candidates:
-                if c in financials.index:
-                    return pd.to_numeric(financials.loc[c], errors="coerce")
-            return None
+        for raw in raw_candidates:
+            financials = clean_statement(raw)
+            if financials.empty or len(financials.columns) < 4:
+                continue
 
-        revenue = pick_row([
-            "Total Revenue", "TotalRevenue", "Operating Revenue", "Revenue"
-        ])
-
-        eps = pick_row([
-            "Diluted EPS", "DilutedEPS", "Basic EPS", "BasicEPS"
-        ])
-
-        # yfinance에서 EPS 행이 없는 경우 Net Income / Diluted Average Shares로 직접 계산
-        if eps is None:
-            net_income = pick_row([
-                "Net Income Common Stockholders",
-                "Net Income",
-                "NetIncome",
-                "Net Income From Continuing Operation Net Minority Interest"
-            ])
-            shares = pick_row([
-                "Diluted Average Shares",
-                "DilutedAverageShares",
-                "Basic Average Shares",
-                "BasicAverageShares"
+            revenue = pick_row(financials, [
+                "Total Revenue", "TotalRevenue", "Operating Revenue", "Revenue"
             ])
 
-            if net_income is not None and shares is not None:
-                shares = shares.replace(0, pd.NA)
-                eps = net_income / shares
+            eps = pick_row(financials, [
+                "Diluted EPS", "DilutedEPS", "Basic EPS", "BasicEPS"
+            ])
 
-        if eps is None:
-            return pd.DataFrame()
+            if eps is None:
+                net_income = pick_row(financials, [
+                    "Net Income Common Stockholders",
+                    "Net Income",
+                    "NetIncome",
+                    "Net Income From Continuing Operation Net Minority Interest"
+                ])
+                shares = pick_row(financials, [
+                    "Diluted Average Shares",
+                    "DilutedAverageShares",
+                    "Basic Average Shares",
+                    "BasicAverageShares",
+                    "Ordinary Shares Number",
+                    "Share Issued"
+                ])
 
-        eps = pd.to_numeric(eps, errors="coerce")
-        eps_ttm = eps.rolling(4).sum()
+                if net_income is not None and shares is not None:
+                    shares = shares.replace(0, pd.NA)
+                    eps = net_income / shares
 
-        if revenue is not None:
-            revenue = pd.to_numeric(revenue, errors="coerce")
-            revenue_ttm = revenue.rolling(4).sum()
-        else:
-            revenue_ttm = None
+            if eps is None:
+                continue
 
-        rows = []
+            eps = pd.to_numeric(eps, errors="coerce")
+            eps_ttm = eps.rolling(4).sum()
 
-        for dt in financials.columns:
-            eps_value = eps_ttm.get(dt)
-            revenue_value = revenue_ttm.get(dt) if revenue_ttm is not None else None
+            if revenue is not None:
+                revenue = pd.to_numeric(revenue, errors="coerce")
+                revenue_ttm = revenue.rolling(4).sum()
+            else:
+                revenue_ttm = None
 
-            rows.append({
-                "fiscal_date": pd.Timestamp(dt),
-                "revenue_ttm": None if revenue_value is None or pd.isna(revenue_value) else float(revenue_value),
-                "eps_ttm": None if eps_value is None or pd.isna(eps_value) else float(eps_value)
-            })
+            rows = []
+            for dt in financials.columns:
+                eps_value = eps_ttm.get(dt)
+                revenue_value = revenue_ttm.get(dt) if revenue_ttm is not None else None
 
-        trend_df = pd.DataFrame(rows)
-        trend_df = trend_df.dropna(subset=["eps_ttm"]).copy()
-        trend_df = trend_df[trend_df["eps_ttm"] > 0].copy()
-        trend_df = trend_df.sort_values("fiscal_date")
+                rows.append({
+                    "fiscal_date": pd.Timestamp(dt),
+                    "report_date": pd.Timestamp(dt) + pd.Timedelta(days=45),
+                    "revenue_ttm": None if revenue_value is None or pd.isna(revenue_value) else float(revenue_value),
+                    "eps_ttm": None if eps_value is None or pd.isna(eps_value) else float(eps_value),
+                    "source": "income_statement"
+                })
 
-        return trend_df.tail(12)
+            trend_df = pd.DataFrame(rows)
+            trend_df = trend_df.dropna(subset=["eps_ttm"]).copy()
+            trend_df = trend_df[trend_df["eps_ttm"] > 0].copy()
+            trend_df = trend_df.sort_values("fiscal_date")
+
+            if len(trend_df) >= 2:
+                return trend_df.tail(16)
+
+        # 최종 fallback: earnings_dates의 Reported EPS 사용
+        try:
+            ed = t.get_earnings_dates(limit=40)
+        except Exception:
+            ed = pd.DataFrame()
+
+        if ed is not None and not ed.empty:
+            ed = ed.copy()
+            ed = ed.reset_index()
+
+            # 날짜 컬럼 찾기
+            date_col = None
+            for c in ed.columns:
+                if "date" in str(c).lower() or str(c).lower() in ["index", "earnings date"]:
+                    date_col = c
+                    break
+            if date_col is None:
+                date_col = ed.columns[0]
+
+            eps_col = None
+            for c in ed.columns:
+                if "reported" in str(c).lower() and "eps" in str(c).lower():
+                    eps_col = c
+                    break
+
+            if eps_col is not None:
+                ed["report_date"] = pd.to_datetime(ed[date_col], errors="coerce").dt.tz_localize(None)
+                ed["eps_q"] = pd.to_numeric(ed[eps_col], errors="coerce")
+                ed = ed.dropna(subset=["report_date", "eps_q"]).copy()
+                ed = ed.sort_values("report_date")
+                ed = ed[ed["eps_q"] > 0].copy()
+                ed["eps_ttm"] = ed["eps_q"].rolling(4).sum()
+                ed = ed.dropna(subset=["eps_ttm"]).copy()
+
+                if len(ed) >= 2:
+                    result = pd.DataFrame({
+                        "fiscal_date": ed["report_date"] - pd.Timedelta(days=45),
+                        "report_date": ed["report_date"],
+                        "revenue_ttm": pd.NA,
+                        "eps_ttm": ed["eps_ttm"],
+                        "source": "earnings_dates_reported_eps"
+                    })
+                    return result.tail(16)
+
+        return pd.DataFrame()
 
     except Exception:
         return pd.DataFrame()
@@ -548,15 +644,7 @@ def load_financial_trend_data(ticker):
 def add_price_to_financial_trend(financial_df, price_df, report_lag_days=45):
     """
     일별 주가 + EPS TTM을 결합해 일별 TTM P/E 추정값을 만든다.
-
-    계산 방식:
-    - 재무제표의 fiscal_date + 45일을 실적 반영일로 근사한다.
-    - 그 이후 다음 실적 반영일까지 EPS TTM을 유지한다.
-    - 일별 TTM P/E = 일별 주가 / EPS TTM
-
-    주의:
-    - 이 값은 FactSet식 12개월 Forward P/E가 아니다.
-    - 무료 데이터로 가능한 Trailing P/E 추정 시계열이다.
+    financial_df에 report_date가 있으면 그대로 사용하고, 없으면 fiscal_date + report_lag_days를 사용한다.
     """
     if financial_df is None or financial_df.empty or price_df is None or price_df.empty:
         return pd.DataFrame()
@@ -567,21 +655,26 @@ def add_price_to_financial_trend(financial_df, price_df, report_lag_days=45):
             return pd.DataFrame()
 
         fin["fiscal_date"] = pd.to_datetime(fin["fiscal_date"], errors="coerce")
+        if "report_date" in fin.columns:
+            fin["report_date"] = pd.to_datetime(fin["report_date"], errors="coerce")
+        else:
+            fin["report_date"] = fin["fiscal_date"] + pd.Timedelta(days=report_lag_days)
+
         fin["eps_ttm"] = pd.to_numeric(fin["eps_ttm"], errors="coerce")
         if "revenue_ttm" in fin.columns:
             fin["revenue_ttm"] = pd.to_numeric(fin["revenue_ttm"], errors="coerce")
         else:
             fin["revenue_ttm"] = pd.NA
 
-        fin = fin.dropna(subset=["fiscal_date", "eps_ttm"]).copy()
+        if "source" not in fin.columns:
+            fin["source"] = "unknown"
+
+        fin = fin.dropna(subset=["report_date", "eps_ttm"]).copy()
         fin = fin[fin["eps_ttm"] > 0].copy()
-        fin = fin.sort_values("fiscal_date")
+        fin = fin.sort_values("report_date")
 
         if fin.empty:
             return pd.DataFrame()
-
-        fin["report_date"] = fin["fiscal_date"] + pd.Timedelta(days=report_lag_days)
-        fin = fin.sort_values("report_date")
 
         price = price_df.copy().sort_index()
         price = price.reset_index()
@@ -589,6 +682,10 @@ def add_price_to_financial_trend(financial_df, price_df, report_lag_days=45):
         date_col = price.columns[0]
         price = price.rename(columns={date_col: "date", "Close": "price"})
         price["date"] = pd.to_datetime(price["date"], errors="coerce")
+        try:
+            price["date"] = price["date"].dt.tz_localize(None)
+        except Exception:
+            pass
         price["price"] = pd.to_numeric(price["price"], errors="coerce")
         price = price.dropna(subset=["date", "price"]).copy()
         price = price[price["price"] > 0].copy()
@@ -599,7 +696,7 @@ def add_price_to_financial_trend(financial_df, price_df, report_lag_days=45):
 
         merged = pd.merge_asof(
             price[["date", "price"]],
-            fin[["report_date", "fiscal_date", "revenue_ttm", "eps_ttm"]],
+            fin[["report_date", "fiscal_date", "revenue_ttm", "eps_ttm", "source"]],
             left_on="date",
             right_on="report_date",
             direction="backward"
@@ -607,11 +704,9 @@ def add_price_to_financial_trend(financial_df, price_df, report_lag_days=45):
 
         merged = merged.dropna(subset=["eps_ttm"]).copy()
         merged["pe_ttm"] = merged["price"] / merged["eps_ttm"]
-
-        # 차트를 망가뜨리는 극단값 제거. 음수 EPS는 이미 제외.
         merged = merged[(merged["pe_ttm"] > 0) & (merged["pe_ttm"] < 300)].copy()
 
-        return merged[["date", "price", "pe_ttm", "eps_ttm", "revenue_ttm", "fiscal_date", "report_date"]]
+        return merged[["date", "price", "pe_ttm", "eps_ttm", "revenue_ttm", "fiscal_date", "report_date", "source"]]
 
     except Exception:
         return pd.DataFrame()
@@ -2041,6 +2136,121 @@ def make_final_trade_view(decision, cash_result, matrix_decision, current_dd, rs
     return "대기", "가격·수급·이벤트 조건 중 명확한 우위 부족"
 
 
+
+
+# =========================================================
+# Lightweight price forecast chart
+# =========================================================
+def make_linear_forecast_chart(df, forecast_days=20, lookback_days=120):
+    """
+    참고용 단순 추세 예측 차트.
+    - 입력: 기존 가격 데이터 df
+    - 최근 lookback_days 종가를 선형회귀(polyfit)로 추세화
+    - 향후 forecast_days 영업일 예측선 표시
+    - Buy Score / 매수비율에는 절대 반영하지 않음
+    """
+    try:
+        if df is None or df.empty or "Close" not in df.columns:
+            return None, "예측 차트를 만들 가격 데이터가 없습니다.", pd.DataFrame()
+
+        price_df = df[["Close"]].dropna().copy()
+        price_df.index = pd.to_datetime(price_df.index)
+
+        if len(price_df) < 60:
+            return None, "예측 차트를 만들 데이터가 부족합니다. 최소 60거래일 이상 필요합니다.", pd.DataFrame()
+
+        hist = price_df.tail(int(lookback_days)).copy()
+        hist = hist.reset_index().rename(columns={hist.index.name or "index": "Date"})
+
+        if "Date" not in hist.columns:
+            hist = hist.rename(columns={hist.columns[0]: "Date"})
+
+        hist["Date"] = pd.to_datetime(hist["Date"])
+        hist["x"] = np.arange(len(hist))
+        hist["Close"] = pd.to_numeric(hist["Close"], errors="coerce")
+        hist = hist.dropna(subset=["Close"])
+
+        if len(hist) < 60:
+            return None, "예측 차트를 만들 유효 가격 데이터가 부족합니다.", pd.DataFrame()
+
+        x = hist["x"].values.astype(float)
+        y = hist["Close"].values.astype(float)
+
+        slope, intercept = np.polyfit(x, y, 1)
+        hist["Trend"] = intercept + slope * x
+        residual_std = float(np.std(y - hist["Trend"].values))
+
+        last_date = hist["Date"].iloc[-1]
+        future_dates = pd.bdate_range(last_date + pd.Timedelta(days=1), periods=int(forecast_days))
+        future_x = np.arange(len(hist), len(hist) + int(forecast_days)).astype(float)
+        forecast_values = intercept + slope * future_x
+
+        forecast_df = pd.DataFrame({
+            "Date": future_dates,
+            "Forecast": forecast_values,
+            "Upper": forecast_values + residual_std,
+            "Lower": forecast_values - residual_std
+        })
+
+        plot_hist = hist[["Date", "Close", "Trend"]].copy()
+
+        current_price = float(hist["Close"].iloc[-1])
+        forecast_last = float(forecast_values[-1])
+        forecast_return = forecast_last / current_price - 1
+
+        # 신뢰도는 예측 정확도가 아니라 추세 안정성 참고값
+        trend_move = float(hist["Trend"].iloc[-1] / hist["Trend"].iloc[0] - 1) if hist["Trend"].iloc[0] != 0 else 0
+        volatility_ratio = residual_std / current_price if current_price != 0 else np.nan
+
+        if forecast_return > 0.05:
+            direction_text = "단순 추세선 기준 향후 20거래일 예상 방향은 상승 우위입니다."
+        elif forecast_return < -0.05:
+            direction_text = "단순 추세선 기준 향후 20거래일 예상 방향은 하락 우위입니다."
+        else:
+            direction_text = "단순 추세선 기준 향후 20거래일 예상 방향은 횡보에 가깝습니다."
+
+        if pd.notna(volatility_ratio) and volatility_ratio > 0.08:
+            risk_text = "최근 변동성이 커서 예측선 신뢰도는 낮습니다."
+        elif pd.notna(volatility_ratio) and volatility_ratio > 0.04:
+            risk_text = "최근 변동성은 보통 수준입니다."
+        else:
+            risk_text = "최근 변동성은 낮은 편입니다."
+
+        comment = (
+            f"{direction_text} 20거래일 예상 변화율: {forecast_return * 100:.2f}%. "
+            f"최근 {len(hist)}거래일 추세 변화율: {trend_move * 100:.2f}%. {risk_text} "
+            "이 차트는 가격 추세 참고용이며 매수·매도 신호가 아닙니다."
+        )
+
+        fig, ax = plt.subplots(figsize=(14, 5))
+        ax.plot(plot_hist["Date"], plot_hist["Close"], label="Actual Price", linewidth=2)
+        ax.plot(plot_hist["Date"], plot_hist["Trend"], label="Recent Linear Trend", linestyle="--", alpha=0.8)
+        ax.plot(forecast_df["Date"], forecast_df["Forecast"], label="Forecast", linewidth=2)
+        ax.fill_between(
+            forecast_df["Date"],
+            forecast_df["Lower"],
+            forecast_df["Upper"],
+            alpha=0.15,
+            label="Rough Range"
+        )
+        ax.axvline(last_date, linestyle=":", alpha=0.7, label="Forecast Start")
+        ax.set_title("Price Forecast Reference")
+        ax.set_ylabel("Price")
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="upper left")
+        plt.tight_layout()
+
+        output_df = pd.concat([
+            plot_hist.assign(Type="History"),
+            forecast_df.rename(columns={"Forecast": "Close"}).assign(Trend=np.nan, Type="Forecast")
+        ], ignore_index=True)
+
+        return fig, comment, output_df
+
+    except Exception as e:
+        return None, f"예측 차트 생성 중 오류가 발생했습니다: {e}", pd.DataFrame()
+
+
 # =========================================================
 # Main screen
 # =========================================================
@@ -2470,8 +2680,63 @@ if run:
         plt.tight_layout()
         st.pyplot(fig)
 
+
+
         # =================================================
-        # 8. 상세 정보
+        # 8. Forecast 참고 차트
+        # =================================================
+        with st.expander("Forecast 참고 차트 보기"):
+            st.warning(
+                "이 예측선은 최근 가격만 이용한 단순 추세 참고용입니다. "
+                "실적, 뉴스, 금리, 이벤트, 수급은 반영하지 않으며 Buy Score에 반영하지 않습니다."
+            )
+
+            fc1, fc2 = st.columns(2)
+            with fc1:
+                forecast_lookback = st.number_input(
+                    "예측 기준 기간(거래일)",
+                    min_value=60,
+                    max_value=300,
+                    value=120,
+                    step=20,
+                    key="forecast_lookback"
+                )
+            with fc2:
+                forecast_days = st.number_input(
+                    "예측 기간(영업일)",
+                    min_value=5,
+                    max_value=60,
+                    value=20,
+                    step=5,
+                    key="forecast_days"
+                )
+
+            forecast_fig, forecast_comment, forecast_df = make_linear_forecast_chart(
+                df,
+                forecast_days=forecast_days,
+                lookback_days=forecast_lookback
+            )
+
+            if forecast_fig is None:
+                st.info(forecast_comment)
+            else:
+                st.pyplot(forecast_fig)
+                st.info(forecast_comment)
+
+                with st.expander("Forecast 원자료 보기"):
+                    show_forecast_df = forecast_df.copy()
+                    if "Date" in show_forecast_df.columns:
+                        show_forecast_df["Date"] = pd.to_datetime(show_forecast_df["Date"]).dt.strftime("%Y-%m-%d")
+                    for col in ["Close", "Trend", "Upper", "Lower"]:
+                        if col in show_forecast_df.columns:
+                            show_forecast_df[col] = show_forecast_df[col].apply(
+                                lambda x: None if pd.isna(x) else round(float(x), 2)
+                            )
+                    st.dataframe(show_forecast_df.tail(80), use_container_width=True)
+
+
+        # =================================================
+        # 9. 상세 정보
         # =================================================
         with st.expander("Price vs EPS/Revenue Trend 보기"):
             if market != "US":
