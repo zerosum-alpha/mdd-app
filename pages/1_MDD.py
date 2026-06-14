@@ -444,6 +444,29 @@ def make_valuation_summary(valuation):
     return " / ".join(parts) + f" → {summary}"
 
 
+def get_current_valuation_points(valuation):
+    """현재 시점 밸류에이션 값을 화면 카드용으로 정리한다.
+    차트가 실패해도 현재 PER/P/S/PEG는 반드시 표시하기 위한 함수.
+    """
+    if not isinstance(valuation, dict):
+        valuation = {}
+    return {
+        "Trailing P/E": valuation.get("trailing_pe"),
+        "Forward P/E": valuation.get("forward_pe"),
+        "P/S": valuation.get("price_to_sales"),
+        "PEG": valuation.get("peg_ratio"),
+        "EV/EBITDA": valuation.get("enterprise_to_ebitda"),
+        "Market Cap": valuation.get("market_cap"),
+    }
+
+
+def format_metric_na(value):
+    if not is_valid_number(value):
+        return "N/A"
+    return f"{float(value):,.2f}"
+
+
+
 # =========================================================
 # Financial trend
 # =========================================================
@@ -868,7 +891,7 @@ def make_price_pe_trend_chart(fin_trend_df, valuation, ticker):
     elif is_valid_number(current_trailing_pe) and float(current_trailing_pe) > 0:
         ax_pe.axhline(float(current_trailing_pe), linestyle="--", alpha=0.25, label="Current trailing P/E")
 
-    ax_price.set_title(f"{ticker} Price vs Estimated TTM P/E")
+    ax_price.set_title(f"{ticker} Daily Price + Estimated TTM P/E")
 
     lines1, labels1 = ax_price.get_legend_handles_labels()
     lines2, labels2 = ax_pe.get_legend_handles_labels()
@@ -1429,7 +1452,7 @@ def make_kr_price_per_chart(kr_val_df, ticker):
     if is_valid_number(current_per):
         ax_per.axhline(float(current_per), linestyle="--", alpha=0.25, label="Current PER")
 
-    ax_price.set_title(f"{ticker} Price vs PER")
+    ax_price.set_title(f"{ticker} Daily Price + PER")
 
     lines1, labels1 = ax_price.get_legend_handles_labels()
     lines2, labels2 = ax_per.get_legend_handles_labels()
