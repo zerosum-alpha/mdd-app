@@ -266,6 +266,134 @@ EXTRA_INDICATORS = ["IWM", "^TNX", "UUP", "KOSPI", "KOSDAQ", "NVDA", "MU", "VRT"
 
 
 # =========================
+# Theme registry v6
+# =========================
+# 주의: 거래소/증권사에서 제공하는 '공식 테마'를 자동 수집하는 구조가 아니다.
+# 아래 테마는 앱 내부 투자분석용 taxonomy이며, RSS 키워드와 ETF/대표 종목 유니버스로 최신 흐름을 갱신한다.
+THEME_SOURCE_META = {
+    "AI 반도체": {
+        "분류기준": "AI GPU/ASIC/파운드리/반도체 장비·설계",
+        "참고": "SOXX/SMH와 AI 반도체·HBM 관련 ETF·뉴스 키워드",
+        "업데이트": "RSS 키워드 + 대표 ETF/종목 수익률/거래량",
+    },
+    "메모리/HBM": {
+        "분류기준": "HBM, DRAM, NAND, SSD, 스토리지",
+        "참고": "Micron, SK하이닉스, 삼성전자, WDC 및 국내 AI반도체 ETF",
+        "업데이트": "HBM/DRAM/NAND 뉴스 빈도 + MU/WDC/국내 메모리주 흐름",
+    },
+    "AI 서버/데이터센터": {
+        "분류기준": "서버랙, 네트워킹, 클라우드 CAPEX, 데이터센터 장비",
+        "참고": "VRT, DELL, HPE, SMCI, ANET, ORCL 등",
+        "업데이트": "hyperscaler/cloud capex/data center 뉴스 + 장비주 거래량",
+    },
+    "전력/AI 인프라": {
+        "분류기준": "데이터센터 전력, 전력망, 변압기, 원전, 유틸리티",
+        "참고": "TIGER 글로벌AI전력인프라액티브, ETN/PWR/VRT/GEV 및 국내 전력주",
+        "업데이트": "power grid/nuclear/utility 뉴스 + 전력주·ETF 거래량",
+    },
+    "플랫폼 AI": {
+        "분류기준": "플랫폼 기업의 AI, 검색/광고/클라우드/TPU/Agent AI",
+        "참고": "GOOGL, META, MSFT, AMZN 및 ACE 구글밸류체인액티브",
+        "업데이트": "Google/Gemini/TPU/Cloud/AI agent 뉴스 + 플랫폼주 흐름",
+    },
+    "로봇·자율주행": {
+        "분류기준": "Robotaxi, FSD, humanoid, industrial robotics, automation",
+        "참고": "TSLA, BOTZ, ROBO, 국내 로봇주",
+        "업데이트": "Tesla/robotaxi/humanoid 뉴스 + 로봇 ETF·종목 거래량",
+    },
+    "우주/위성": {
+        "분류기준": "SpaceX, Starlink, 발사체, 위성통신, 우주 IPO",
+        "참고": "RKLB, ASTS, RDW, ARKX, 국내 우주항공주",
+        "업데이트": "SpaceX/Starlink/satellite/launch 뉴스 + 우주주 수급",
+    },
+    "사이버보안/AI SW": {
+        "분류기준": "Cybersecurity, AI software, SaaS, data/agent 플랫폼",
+        "참고": "CIBR/HACK/CRWD/PANW/PLTR/SNOW/NOW",
+        "업데이트": "cyber/security/AI software 뉴스 + 소프트웨어 ETF 흐름",
+    },
+    "한국 코어/ETF": {
+        "분류기준": "한국 지수/국내상장 해외 ETF/테마 ETF의 시장 흐름",
+        "참고": "KODEX200, TIGER200, S&P500/나스닥100/AI반도체/AI전력 ETF",
+        "업데이트": "한국 ETF·지수 수익률/거래량",
+    },
+    "매크로 리스크": {
+        "분류기준": "CPI/PPI/FOMC/금리/유가/전쟁/관세/달러/VIX",
+        "참고": "RSS 매크로 뉴스 + VIX/USO/UUP/^TNX",
+        "업데이트": "RSS 리스크 뉴스와 주요 지표 흐름",
+    },
+}
+
+# 최신 버전의 앱 기준 테마명으로 키워드 사전을 정규화한다.
+THEME_KEYWORDS.update({
+    "전력/AI 인프라": THEME_KEYWORDS.get("전력/인프라", []) + ["ai power", "power infra", "electric grid", "transformer", "원전", "전력망"],
+    "플랫폼 AI": THEME_KEYWORDS.get("구글/플랫폼 AI", []) + ["agent ai", "ai search", "ai platform"],
+    "로봇·자율주행": THEME_KEYWORDS.get("테슬라/로봇·자율주행", []) + ["robotics", "automation", "로봇", "자율주행"],
+    "우주/위성": THEME_KEYWORDS.get("우주/SpaceX", []) + ["space", "satellite", "starlink", "위성", "우주"],
+    "한국 코어/ETF": ["kospi", "kosdaq", "korea etf", "kodex", "tiger", "ace etf", "한국 etf", "코스피", "코스닥"],
+})
+# 구형 테마명은 뉴스 분류에 노출되지 않도록 제거한다.
+for _old in ["전력/인프라", "구글/플랫폼 AI", "테슬라/로봇·자율주행", "우주/SpaceX"]:
+    THEME_KEYWORDS.pop(_old, None)
+
+# ETF 여부 판별용. 티커는 yfinance 조회를 위해 .KS를 유지한다.
+KOREAN_ETF_TICKERS = {
+    "069500.KS", "102110.KS", "360750.KS", "379810.KS",
+    "471990.KS", "491010.KS", "483320.KS", "483340.KS", "457480.KS", "465580.KS",
+}
+US_ETF_TICKERS = {
+    "SOXX", "SMH", "QQQ", "SPY", "IWM", "USO", "UUP", "XLU", "BOTZ", "ROBO", "ARKX", "CIBR", "HACK", "AIQ", "IGV", "EWY",
+}
+
+# 기존 기본 유니버스를 v6 테마 기준으로 덮어쓴다. 종목명 자체를 테마로 쓰지 않는다.
+AUTO_UNIVERSE = {
+    "AI 반도체": [
+        "SOXX", "SMH", "NVDA", "AVGO", "AMD", "TSM", "ASML", "ARM", "MRVL", "QCOM", "AMAT", "LRCX", "KLAC",
+        "483320.KS", "471990.KS",
+    ],
+    "메모리/HBM": [
+        "MU", "WDC", "STX", "000660.KS", "005930.KS", "042700.KS", "095340.KQ", "039030.KQ", "089030.KQ", "471990.KS",
+    ],
+    "AI 서버/데이터센터": [
+        "VRT", "DELL", "HPE", "SMCI", "ORCL", "MSFT", "AMZN", "ANET", "CLS", "NTAP", "PSTG", "491010.KS",
+    ],
+    "전력/AI 인프라": [
+        "ETN", "PWR", "VRT", "GEV", "NEE", "CEG", "AEP", "SO", "XLU", "010120.KS", "267260.KS", "034020.KS", "491010.KS",
+    ],
+    "플랫폼 AI": [
+        "GOOGL", "GOOG", "META", "MSFT", "AMZN", "483340.KS", "465580.KS",
+    ],
+    "로봇·자율주행": [
+        "TSLA", "BOTZ", "ROBO", "ISRG", "TER", "SYM", "277810.KQ", "108490.KQ", "090360.KQ", "457480.KS",
+    ],
+    "우주/위성": [
+        "RKLB", "ASTS", "RDW", "LUNR", "PL", "IRDM", "ARKX", "BA", "LMT", "047810.KS",
+    ],
+    "사이버보안/AI SW": [
+        "CIBR", "HACK", "CRWD", "PANW", "ZS", "FTNT", "PLTR", "SNOW", "NOW", "DDOG", "AIQ", "IGV",
+    ],
+    "한국 코어/ETF": [
+        "EWY", "KOSPI", "KOSDAQ", "069500.KS", "102110.KS", "360750.KS", "379810.KS", "471990.KS", "491010.KS", "483320.KS", "483340.KS", "457480.KS", "465580.KS",
+    ],
+}
+
+# 한국 ETF 표시명 보강
+TICKER_NAME_OVERRIDES.update({
+    "471990": "KODEX AI반도체핵심장비",
+    "471990.KS": "KODEX AI반도체핵심장비",
+    "491010": "TIGER 글로벌AI전력인프라액티브",
+    "491010.KS": "TIGER 글로벌AI전력인프라액티브",
+    "483320": "ACE 엔비디아밸류체인액티브",
+    "483320.KS": "ACE 엔비디아밸류체인액티브",
+    "483340": "ACE 구글밸류체인액티브",
+    "483340.KS": "ACE 구글밸류체인액티브",
+    "457480": "ACE 테슬라밸류체인액티브",
+    "457480.KS": "ACE 테슬라밸류체인액티브",
+    "465580": "ACE 미국빅테크TOP7 Plus",
+    "465580.KS": "ACE 미국빅테크TOP7 Plus",
+})
+
+
+# =========================
 # Utility
 # =========================
 def normalize_ticker(ticker: str) -> str:
@@ -352,6 +480,55 @@ def market_badge(market: str) -> str:
     if market == "미국":
         return "🇺🇸 미국"
     return "기타"
+
+
+def classify_instrument_type(ticker: str) -> str:
+    t = str(ticker or "").strip().upper()
+    if t in ["KOSPI", "KOSDAQ", "KOSPI200", "^KS11", "^KQ11", "^KS200", "^VIX", "^TNX"]:
+        return "지수/지표"
+    if t in KOREAN_ETF_TICKERS or t in US_ETF_TICKERS:
+        return "ETF"
+    if re.fullmatch(r"\d{6}\.(KS|KQ)", t) or re.fullmatch(r"\d{6}", t):
+        return "개별주"
+    return "ETF" if t in US_ETF_TICKERS else "개별주"
+
+
+def make_theme_source_df() -> pd.DataFrame:
+    rows = []
+    for theme, meta in THEME_SOURCE_META.items():
+        rows.append({
+            "테마": theme,
+            "분류기준": meta.get("분류기준", ""),
+            "참고 기준": meta.get("참고", ""),
+            "업데이트 방식": meta.get("업데이트", ""),
+        })
+    return pd.DataFrame(rows)
+
+
+def build_news_theme_update(news_df: pd.DataFrame) -> pd.DataFrame:
+    if news_df is None or news_df.empty or "관련 테마" not in news_df.columns:
+        return pd.DataFrame(columns=["테마", "최근 뉴스 수", "긍정", "부정/혼재", "판단 메모"])
+    d = news_df.copy()
+    if "_dt" not in d.columns:
+        d["_dt"] = pd.to_datetime(d.get("시간", pd.Timestamp.now()), errors="coerce")
+    now = pd.Timestamp.now()
+    recent = d[d["_dt"] >= now - pd.Timedelta(hours=72)].copy()
+    if recent.empty:
+        recent = d.head(30).copy()
+    rows = []
+    for theme, g in recent.groupby("관련 테마"):
+        if theme == "기타":
+            continue
+        pos = int((g["영향"] == "긍정").sum()) if "영향" in g.columns else 0
+        neg = int(g["영향"].isin(["부정", "혼재"]).sum()) if "영향" in g.columns else 0
+        rows.append({
+            "테마": theme,
+            "최근 뉴스 수": len(g),
+            "긍정": pos,
+            "부정/혼재": neg,
+            "판단 메모": "RSS 기준 최근 72시간 뉴스 빈도. 공식 테마가 아니라 뉴스 기반 업데이트 신호.",
+        })
+    return pd.DataFrame(rows).sort_values(["최근 뉴스 수", "긍정"], ascending=[False, False]).reset_index(drop=True)
 
 
 def filter_market(df: pd.DataFrame, market: str) -> pd.DataFrame:
@@ -491,7 +668,7 @@ def universe_to_rows(universe: Dict[str, List[str]]) -> pd.DataFrame:
     rows = []
     for theme, tickers in universe.items():
         for i, ticker in enumerate(tickers):
-            rows.append({"시장": detect_market(ticker), "테마": theme, "종목명": get_display_name(ticker), "티커": ticker, "대표순위": i + 1})
+            rows.append({"시장": detect_market(ticker), "종목유형": classify_instrument_type(ticker), "테마": theme, "종목명": get_display_name(ticker), "티커": ticker, "대표순위": i + 1})
     return pd.DataFrame(rows)
 
 
@@ -634,6 +811,7 @@ def calc_ticker_metrics(ticker: str, period: str = "90d") -> Dict[str, Any]:
         "시장": detect_market(ticker, resolved_ticker),
         "티커": ticker,
         "종목명": get_display_name(ticker, resolved_ticker),
+        "종목유형": classify_instrument_type(ticker),
         "표시명": format_name_ticker(ticker, resolved_ticker),
         "조회티커": resolved_ticker,
         "현재가": cur,
@@ -657,6 +835,7 @@ def scan_universe(universe_rows: pd.DataFrame, period: str = "90d") -> pd.DataFr
         m = calc_ticker_metrics(str(r["티커"]), period=period)
         m["시장"] = m.get("시장", r.get("시장", detect_market(str(r["티커"]))))
         m["테마"] = r["테마"]
+        m["종목유형"] = r.get("종목유형", classify_instrument_type(str(r["티커"])))
         m["대표순위"] = r.get("대표순위", 999)
         rows.append(m)
     df = pd.DataFrame(rows)
@@ -899,8 +1078,8 @@ def top_table(df: pd.DataFrame, cols: List[str], n: int = 10) -> pd.DataFrame:
 # =========================
 # Streamlit UI
 # =========================
-st.title("📰 시장 리포트 | 객관적 돈의 흐름 스캐너")
-st.caption("사용자가 고른 종목이 아니라, 기본 유니버스를 자동 스캔해 뉴스·테마·거래량·수익률 기준으로 시장 흐름을 정리합니다. 한국 종목은 코드와 종목명을 함께 표시합니다. 매수 추천이 아닙니다.")
+st.title("📰 시장 리포트 | 테마·수급 자동 스캐너")
+st.caption("테마는 거래소 공식 테마가 아니라, 앱 내부 투자분석용 분류 기준입니다. RSS 뉴스 키워드와 대표 ETF/종목 수익률·거래량으로 최신 흐름을 업데이트합니다. 한국/미국과 ETF/개별주를 구분해 표시합니다. 매수 추천이 아닙니다.")
 
 with st.sidebar:
     st.header("시장 리포트 설정")
@@ -939,19 +1118,27 @@ if not include_korea:
     for theme in list(base_universe.keys()):
         base_universe[theme] = [t for t in base_universe[theme] if not re.search(r"\.K[QS]$", t, flags=re.I) and t not in ["KOSPI", "KOSDAQ"]]
 
-with st.expander("자동 스캔 유니버스 확인 / 보조 추가", expanded=False):
-    st.info("기본값은 자동 스캔 유니버스입니다. 사용자가 종목을 골라 판단하는 구조가 아니라, 아래 전체를 스캔합니다. 한국 6자리 코드는 종목명으로 자동 매칭해 표시합니다.")
+with st.expander("테마 기준 / 자동 스캔 유니버스 확인", expanded=False):
+    st.warning("현재 테마는 공식 거래소 테마가 아니라 앱 내부 taxonomy입니다. 종목명 자체를 테마로 쓰지 않고, 고정 테마 아래에 ETF/개별주를 배치합니다.")
+    st.markdown("#### 테마 분류 기준")
+    st.dataframe(make_theme_source_df(), use_container_width=True, hide_index=True)
+    st.markdown("#### 자동 스캔 유니버스")
     uni_preview = universe_to_rows(base_universe)
     st.dataframe(uni_preview, use_container_width=True, hide_index=True)
     extra_text = st.text_area(
-        "보조 추가 유니버스: 테마명|티커1, 티커2",
-        value="국내 원전/전력|034020.KS, 051600.KS\n국내 AI SW|035720.KS, 035420.KS",
+        "보조 티커 추가: 기존 테마명|티커1, 티커2  ※ 신규 테마명/종목명 테마는 무시",
+        value="전력/AI 인프라|034020.KS, 051600.KS\n플랫폼 AI|035720.KS, 035420.KS",
         height=100,
     )
 
-extra_universe = parse_extra_universe(extra_text) if include_optional_extra else {}
+raw_extra_universe = parse_extra_universe(extra_text) if include_optional_extra else {}
+# 신규 테마명이나 종목명을 테마로 쓰는 입력은 제외한다. 기존 테마에 티커만 추가한다.
+extra_universe = {k: v for k, v in raw_extra_universe.items() if k in AUTO_UNIVERSE}
+ignored_extra_themes = sorted(set(raw_extra_universe.keys()) - set(extra_universe.keys()))
 universe = merge_universe(base_universe, extra_universe)
 universe_rows = universe_to_rows(universe)
+if include_optional_extra and ignored_extra_themes:
+    st.info("기존 테마가 아닌 입력은 제외했습니다: " + ", ".join(ignored_extra_themes))
 
 # 3. Data load
 with st.spinner("뉴스와 자동 스캔 유니버스 데이터를 불러오는 중..."):
@@ -983,6 +1170,7 @@ with st.spinner("뉴스와 자동 스캔 유니버스 데이터를 불러오는 
     inflow_df, outflow_df, unusual_df = global_stock_rankings(detail_df)
     inflow_us, outflow_us, unusual_us = global_stock_rankings(detail_us)
     inflow_kr, outflow_kr, unusual_kr = global_stock_rankings(detail_kr)
+    news_theme_update_df = build_news_theme_update(news_df)
 
 summary = make_top_summary(theme_flow_df, early_df)
 summary_us = make_top_summary(theme_flow_us, early_us)
@@ -1003,7 +1191,7 @@ def render_flow_summary(title: str, summary_obj: Dict[str, str]) -> None:
 
 
 def render_rank_tables(in_df: pd.DataFrame, out_df: pd.DataFrame, vol_df: pd.DataFrame, n: int = 8) -> None:
-    cols = ["시장", "테마", "종목명", "티커", "1일", "3일", "5일", "거래량비율", "Current DD", "RSI", "흐름점수"]
+    cols = ["시장", "종목유형", "테마", "종목명", "티커", "1일", "3일", "5일", "거래량비율", "Current DD", "RSI", "흐름점수"]
     c1, c2, c3 = st.columns(3)
     with c1:
         st.markdown("#### 수급 유입")
@@ -1013,7 +1201,7 @@ def render_rank_tables(in_df: pd.DataFrame, out_df: pd.DataFrame, vol_df: pd.Dat
         st.dataframe(display_pct_table(top_table(out_df, cols, n), ["1일", "3일", "5일"]), use_container_width=True, hide_index=True)
     with c3:
         st.markdown("#### 거래량 급증")
-        vol_cols = ["시장", "테마", "종목명", "티커", "1일", "3일", "5일", "거래량비율", "Current DD", "RSI"]
+        vol_cols = ["시장", "종목유형", "테마", "종목명", "티커", "1일", "3일", "5일", "거래량비율", "Current DD", "RSI"]
         st.dataframe(display_pct_table(top_table(vol_df, vol_cols, n), ["1일", "3일", "5일"]), use_container_width=True, hide_index=True)
 
 
@@ -1089,8 +1277,8 @@ with tab_all:
 # 6. Market indicators - separated
 st.markdown("## 4. 주요 시장 지표")
 us_indicator_list = ["QQQ", "SPY", "SOXX", "^VIX", "USO", "IWM", "^TNX", "UUP", "NVDA", "MU", "VRT", "GOOGL"]
-kr_indicator_list = ["EWY", "KOSPI", "KOSDAQ", "069500.KS", "102110.KS", "360750.KS", "379810.KS"]
-ind_cols = ["시장", "종목명", "티커", "현재가", "1일", "3일", "5일", "20일", "거래량비율", "Current DD", "RSI"]
+kr_indicator_list = ["EWY", "KOSPI", "KOSDAQ", "069500.KS", "102110.KS", "360750.KS", "379810.KS", "471990.KS", "491010.KS", "483320.KS", "483340.KS", "457480.KS", "465580.KS"]
+ind_cols = ["시장", "종목유형", "종목명", "티커", "현재가", "1일", "3일", "5일", "20일", "거래량비율", "Current DD", "RSI"]
 ind_us = pd.DataFrame([calc_ticker_metrics(t, period=lookback) for t in us_indicator_list])
 ind_kr = pd.DataFrame([calc_ticker_metrics(t, period=lookback) for t in kr_indicator_list])
 mi_us, mi_kr = st.tabs(["미국/글로벌 지표", "한국 지표·ETF"])
@@ -1106,8 +1294,16 @@ if news_df.empty:
 else:
     st.dataframe(news_df.head(5)[["시간", "제목", "출처", "관련 테마", "영향", "신뢰도", "요약 메모", "링크"]], use_container_width=True, hide_index=True)
 
-# 8. Theme flow ranking - separated
-st.markdown("## 6. 돈의 흐름 테마 순위")
+# 8. News-driven theme update
+st.markdown("## 6. 뉴스 기반 최신 테마 업데이트")
+st.caption("공식 테마 목록이 아니라, RSS에서 최근 72시간 동안 언급이 늘어난 테마입니다. 기존 테마 taxonomy를 최신 뉴스로 보정하는 용도입니다.")
+if news_theme_update_df.empty:
+    st.info("뉴스 기반 테마 업데이트 신호가 없습니다.")
+else:
+    st.dataframe(news_theme_update_df, use_container_width=True, hide_index=True)
+
+# 9. Theme flow ranking - separated
+st.markdown("## 7. 돈의 흐름 테마 순위")
 tf_us, tf_kr, tf_all = st.tabs(["미국", "한국", "전체"])
 with tf_us:
     render_theme_flow(theme_flow_us)
@@ -1117,7 +1313,7 @@ with tf_all:
     render_theme_flow(theme_flow_df)
 
 # 9. Leaders / laggards / hidden - separated
-st.markdown("## 7. 테마별 대장주 / 후발주 / 숨은 후보")
+st.markdown("## 8. 테마별 대장주 / 후발주 / 숨은 후보")
 st.caption("자동 스캔 결과입니다. 숨은 후보는 추천이 아니라 관찰 후보입니다. 미국/한국을 분리했습니다.")
 ca_us, ca_kr, ca_all = st.tabs(["미국", "한국", "전체"])
 with ca_us:
@@ -1128,7 +1324,7 @@ with ca_all:
     render_candidate_table(candidate_df)
 
 # 10. Early news signal - separated
-st.markdown("## 8. 뉴스 초입 가능성")
+st.markdown("## 9. 뉴스 초입 가능성")
 es_us, es_kr, es_all = st.tabs(["미국", "한국", "전체"])
 with es_us:
     render_early_table(early_us)
@@ -1138,7 +1334,7 @@ with es_all:
     render_early_table(early_df)
 
 # 11. Risks
-st.markdown("## 9. 주요 리스크")
+st.markdown("## 10. 주요 리스크")
 risk_news = news_df[(news_df["관련 테마"] == "매크로 리스크") | (news_df["영향"].isin(["부정", "혼재"]))].head(5) if not news_df.empty else pd.DataFrame()
 if risk_news.empty:
     st.success("상단 뉴스 기준 주요 리스크 신호는 제한적입니다.")
