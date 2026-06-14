@@ -110,8 +110,34 @@ EXTRA_INDICATORS = "IWM, ^TNX, UUP, KOSPI, KOSDAQ, NVDA, MU, VRT, GOOGL"
 # 유틸 함수
 # =========================
 def normalize_ticker(ticker: str) -> str:
+    """대표 표기용 티커 정규화. 실제 조회는 ticker_candidates()에서 fallback 처리."""
     t = str(ticker).strip().upper()
     return MARKET_TICKER_MAP.get(t, t)
+
+
+def ticker_candidates(ticker: str) -> List[str]:
+    """
+    yfinance 조회 후보 생성.
+    - 미국 티커: NVDA 그대로
+    - 한국 지수 별칭: KOSPI -> ^KS11
+    - 한국 6자리 코드: 005930 -> 005930.KS, 005930.KQ 순서로 시도
+    - 사용자가 .KS/.KQ를 붙이면 그대로 우선 사용
+    """
+    raw = str(ticker).strip()
+    if not raw:
+        return []
+
+    t = raw.upper()
+    if t in MARKET_TICKER_MAP:
+        return [MARKET_TICKER_MAP[t]]
+
+    if re.fullmatch(r"\d{6}", t):
+        return [f"{t}.KS", f"{t}.KQ"]
+
+    if re.fullmatch(r"\d{6}\.(KS|KQ)", t):
+        return [t]
+
+    return [t]
 
 
 def split_tickers(text: str) -> List[str]:
@@ -273,25 +299,29 @@ def build_manual_news_df(manual_df: pd.DataFrame) -> pd.DataFrame:
 # 가격/수급 데이터
 # =========================
 @st.cache_data(ttl=900, show_spinner=False)
-def load_price(ticker: str, period: str = "90d") -> pd.DataFrame:
-    yf_ticker = normalize_ticker(ticker)
-    try:
-        df = yf.Ticker(yf_ticker).history(period=period, interval="1d", auto_adjust=True)
-        if df is None or df.empty:
-            return pd.DataFrame()
-        df = df.copy()
-        df.index = pd.to_datetime(df.index).tz_localize(None)
-        return df
-    except Exception:
-        return pd.DataFrame()
+def load_price(ticker: str, period: str = "90d") -> Tuple[pd.DataFrame, str]:
+    """여러 후보 티커를 순차 조회. 한국 6자리 코드는 .KS/.KQ를 자동 시도."""
+    tried = []
+    for yf_ticker in ticker_candidates(ticker):
+        tried.append(yf_ticker)
+        try:
+            df = yf.Ticker(yf_ticker).history(period=period, interval="1d", auto_adjust=True)
+            if df is None or df.empty or "Close" not in df.columns:
+                continue
+            df = df.copy()
+            df.index = pd.to_datetime(df.index).tz_localize(None)
+            return df, yf_ticker
+        except Exception:
+            continue
+    return pd.DataFrame(), " / ".join(tried) if tried else normalize_ticker(ticker)
 
 
 def calc_ticker_metrics(ticker: str, period: str = "90d") -> Dict[str, Any]:
-    df = load_price(ticker, period=period)
+    df, resolved_ticker = load_price(ticker, period=period)
     if df.empty or "Close" not in df.columns:
         return {
             "티커": ticker,
-            "조회티커": normalize_ticker(ticker),
+            "조회티커": resolved_ticker,
             "1일": np.nan,
             "3일": np.nan,
             "5일": np.nan,
@@ -328,7 +358,7 @@ def calc_ticker_metrics(ticker: str, period: str = "90d") -> Dict[str, Any]:
 
     return {
         "티커": ticker,
-        "조회티커": normalize_ticker(ticker),
+        "조회티커": resolved_ticker,
         "현재가": cur,
         "1일": ret(1),
         "3일": ret(3),
@@ -570,6 +600,28 @@ def make_top_summary(theme_flow: pd.DataFrame, early_df: pd.DataFrame) -> Dict[s
     }
 
 
+
+
+def parse_custom_theme_tickers(text: str) -> Dict[str, str]:
+    """
+    사용자 추가 테마 파싱.
+    형식: 테마명|티커1, 티커2
+    예: 국내 반도체|005930, 000660, 091990.KQ
+    """
+    out: Dict[str, str] = {}
+    for line in str(text).splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "|" not in line:
+            continue
+        theme, tickers = line.split("|", 1)
+        theme = theme.strip()
+        tickers = tickers.strip()
+        if theme and tickers:
+            out[theme] = tickers
+    return out
+
 # =========================
 # Streamlit 화면
 # =========================
@@ -626,10 +678,19 @@ for line in rss_text.splitlines():
             rss_map[src.strip()] = url.strip()
 
 # 3. 티커 설정
-with st.expander("테마별 대표 티커 수정", expanded=False):
+with st.expander("테마별 대표 티커 수정 / 한국 종목·ETF 추가", expanded=False):
+    st.caption("미국 티커는 NVDA처럼 입력. 한국 종목/ETF는 005930처럼 6자리만 넣어도 .KS/.KQ를 자동 시도합니다. 직접 091990.KQ, 069500.KS처럼 넣어도 됩니다.")
     theme_tickers = {}
     for theme, default in DEFAULT_THEME_TICKERS.items():
         theme_tickers[theme] = st.text_input(theme, default)
+
+    custom_theme_text = st.text_area(
+        "추가 테마/티커 입력: 테마명|티커1, 티커2",
+        value="국내 반도체|005930, 000660\n국내 ETF 관찰|069500.KS, 360750.KS",
+        height=100,
+    )
+    custom_theme_tickers = parse_custom_theme_tickers(custom_theme_text)
+    theme_tickers.update(custom_theme_tickers)
 
 # 데이터 로드
 with st.spinner("뉴스와 가격 데이터를 불러오는 중..."):
