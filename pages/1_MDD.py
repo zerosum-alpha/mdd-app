@@ -833,126 +833,225 @@ def make_financial_trend_chart(fin_trend_df, ticker):
 
 
 
-def make_price_pe_trend_chart(fin_trend_df, valuation, ticker):
+def extract_us_quarterly_eps_records(ticker):
     """
-    미국 종목용 Price + 실제/추정 TTM P/E 겹침 차트.
-    - 왼쪽 축: Price
-    - 오른쪽 축: Estimated TTM P/E
-    - 가짜 price-implied P/E는 만들지 않음
-    - 단, 현재 Forward/Trailing P/E는 보조 수평선으로 표시 가능
+    미국 종목의 분기 EPS를 가능한 모든 yfinance 경로에서 가져온다.
+    반환: date, eps_quarter, source
     """
-    if fin_trend_df is None or fin_trend_df.empty:
-        return None, pd.DataFrame()
+    records = []
+    try:
+        t = yf.Ticker(ticker)
+    except Exception:
+        return pd.DataFrame(columns=["date", "eps_quarter", "source"])
 
-    needed = {"date", "price", "pe_ttm"}
-    if not needed.issubset(set(fin_trend_df.columns)):
-        return None, pd.DataFrame()
+    # 1) quarterly_income_stmt / get_income_stmt
+    stmt_candidates = []
+    for attr_name in ["quarterly_income_stmt", "quarterly_financials"]:
+        try:
+            q = getattr(t, attr_name)
+            if q is not None and not q.empty:
+                stmt_candidates.append((attr_name, q.copy()))
+        except Exception:
+            pass
+    try:
+        q = t.get_income_stmt(freq="quarterly")
+        if q is not None and not q.empty:
+            stmt_candidates.append(("get_income_stmt", q.copy()))
+    except Exception:
+        pass
 
-    chart_df = fin_trend_df.copy()
-    chart_df["date"] = pd.to_datetime(chart_df["date"], errors="coerce")
-    chart_df["price"] = pd.to_numeric(chart_df["price"], errors="coerce")
-    chart_df["pe_ttm"] = pd.to_numeric(chart_df["pe_ttm"], errors="coerce")
-    chart_df = chart_df.dropna(subset=["date", "price", "pe_ttm"]).copy()
-    chart_df = chart_df[(chart_df["price"] > 0) & (chart_df["pe_ttm"] > 0) & (chart_df["pe_ttm"] < 300)].copy()
-    chart_df = chart_df.sort_values("date")
+    eps_row_candidates = [
+        "Diluted EPS", "Basic EPS", "DilutedEPS", "BasicEPS",
+        "Diluted Eps", "Basic Eps", "EPS Diluted", "EPS Basic"
+    ]
+    net_income_candidates = [
+        "Net Income", "NetIncome", "Net Income Common Stockholders",
+        "Net Income Applicable To Common Shares"
+    ]
+    share_candidates = [
+        "Diluted Average Shares", "DilutedAverageShares",
+        "Basic Average Shares", "BasicAverageShares",
+        "Weighted Average Shs Out Dil", "Weighted Average Shs Out"
+    ]
 
-    if len(chart_df) < 10:
-        return None, chart_df
+    for source, q in stmt_candidates:
+        try:
+            # yfinance 재무제표는 보통 index=row items, columns=quarter dates
+            q.index = q.index.astype(str)
+            eps_series = None
+            for row in eps_row_candidates:
+                if row in q.index:
+                    eps_series = q.loc[row]
+                    break
 
-    # 너무 촘촘하면 월말 기준으로 축약, 그래도 최근 흐름은 유지
-    plot_df = make_monthly_view(chart_df)
-    if plot_df.empty or len(plot_df) < 6:
-        plot_df = chart_df.copy()
+            if eps_series is None:
+                ni = None
+                sh = None
+                for row in net_income_candidates:
+                    if row in q.index:
+                        ni = pd.to_numeric(q.loc[row], errors="coerce")
+                        break
+                for row in share_candidates:
+                    if row in q.index:
+                        sh = pd.to_numeric(q.loc[row], errors="coerce")
+                        break
+                if ni is not None and sh is not None:
+                    eps_series = ni / sh
 
-    fig, ax_price = plt.subplots(figsize=(13.5, 5.8))
+            if eps_series is not None:
+                for dt, eps in eps_series.items():
+                    if pd.notna(eps) and float(eps) != 0:
+                        # 재무제표 column date는 회계기간 종료일 성격이므로 발표 반영 지연을 보수적으로 45일 부여
+                        records.append({
+                            "date": pd.to_datetime(dt, errors="coerce") + pd.Timedelta(days=45),
+                            "eps_quarter": float(eps),
+                            "source": source
+                        })
+        except Exception:
+            continue
 
-    ax_price.plot(plot_df["date"], plot_df["price"], label="Price", linewidth=2)
-    ax_price.set_ylabel("Price")
-    ax_price.grid(True, alpha=0.3)
+    # 2) earnings_dates Reported EPS fallback
+    try:
+        ed = t.get_earnings_dates(limit=32)
+        if ed is not None and not ed.empty:
+            ed = ed.copy().reset_index()
+            date_col = ed.columns[0]
+            reported_col = None
+            for c in ed.columns:
+                if str(c).lower().replace(" ", "") in ["reportedeps", "epsactual"]:
+                    reported_col = c
+                    break
+            if reported_col is not None:
+                for _, r in ed.iterrows():
+                    eps = r.get(reported_col)
+                    dt = r.get(date_col)
+                    if pd.notna(eps) and pd.notna(dt) and float(eps) != 0:
+                        records.append({
+                            "date": pd.to_datetime(dt, errors="coerce").tz_localize(None) if getattr(pd.to_datetime(dt, errors="coerce"), 'tzinfo', None) else pd.to_datetime(dt, errors="coerce"),
+                            "eps_quarter": float(eps),
+                            "source": "earnings_dates"
+                        })
+    except Exception:
+        pass
 
-    ax_pe = ax_price.twinx()
-    ax_pe.plot(plot_df["date"], plot_df["pe_ttm"], linestyle="--", label="Estimated TTM P/E", linewidth=2)
-    ax_pe.set_ylabel("P/E")
+    if not records:
+        return pd.DataFrame(columns=["date", "eps_quarter", "source"])
 
-    pe_mean = plot_df["pe_ttm"].mean()
-    pe_std = plot_df["pe_ttm"].std()
+    df_eps = pd.DataFrame(records)
+    df_eps["date"] = pd.to_datetime(df_eps["date"], errors="coerce").dt.tz_localize(None)
+    df_eps = df_eps.dropna(subset=["date", "eps_quarter"])
+    df_eps = df_eps.sort_values("date")
+    # 같은 날짜 중복은 평균 대신 마지막 경로 우선
+    df_eps = df_eps.drop_duplicates(subset=["date"], keep="last")
+    return df_eps
 
-    if is_valid_number(pe_mean):
-        ax_pe.axhline(pe_mean, linestyle="-", alpha=0.35, label="P/E avg")
-    if is_valid_number(pe_std) and pe_std > 0:
-        ax_pe.axhline(pe_mean + pe_std, linestyle=":", alpha=0.35, label="P/E +1SD")
-        ax_pe.axhline(max(pe_mean - pe_std, 0), linestyle=":", alpha=0.35, label="P/E -1SD")
 
-    current_forward_pe = valuation.get("forward_pe") if isinstance(valuation, dict) else None
-    current_trailing_pe = valuation.get("trailing_pe") if isinstance(valuation, dict) else None
-
-    if is_valid_number(current_forward_pe) and float(current_forward_pe) > 0:
-        ax_pe.axhline(float(current_forward_pe), linestyle="--", alpha=0.25, label="Current forward P/E")
-    elif is_valid_number(current_trailing_pe) and float(current_trailing_pe) > 0:
-        ax_pe.axhline(float(current_trailing_pe), linestyle="--", alpha=0.25, label="Current trailing P/E")
-
-    ax_price.set_title(f"{ticker} Daily Price + Estimated TTM P/E")
-
-    lines1, labels1 = ax_price.get_legend_handles_labels()
-    lines2, labels2 = ax_pe.get_legend_handles_labels()
-    ax_price.legend(lines1 + lines2, labels1 + labels2, loc="best", fontsize=8)
-
-    plt.tight_layout()
-    return fig, chart_df
-
-def make_current_pe_reference_chart(price_df, valuation, ticker):
+def build_us_daily_ttm_pe_df(price_df, ticker):
     """
-    미국 종목에서 과거 TTM P/E 추세를 만들 수 없을 때 사용하는 최소 참고 차트.
-    - Price는 일별/월별 실제 주가
-    - 오른쪽 축에는 현재 Trailing/Forward P/E 수평선만 표시
-    - PER 변화 차트가 아니므로 제목에 Reference라고 명시
+    일별 주가 + 분기 EPS TTM 기반 Estimated TTM P/E를 만든다.
+    PER = 일별 Price / 최근 4개 분기 EPS 합산값
     """
     if price_df is None or price_df.empty:
-        return None
+        return pd.DataFrame(), pd.DataFrame()
 
-    pe_value = None
-    pe_label = None
-    if isinstance(valuation, dict):
-        if is_valid_number(valuation.get("forward_pe")) and float(valuation.get("forward_pe")) > 0:
-            pe_value = float(valuation.get("forward_pe"))
-            pe_label = "Current Forward P/E"
-        elif is_valid_number(valuation.get("trailing_pe")) and float(valuation.get("trailing_pe")) > 0:
-            pe_value = float(valuation.get("trailing_pe"))
-            pe_label = "Current Trailing P/E"
+    eps_q = extract_us_quarterly_eps_records(ticker)
+    if eps_q.empty or len(eps_q) < 4:
+        return pd.DataFrame(), eps_q
 
-    if pe_value is None:
-        return None
+    eps_q = eps_q.sort_values("date").copy()
+    eps_q["eps_ttm"] = eps_q["eps_quarter"].rolling(4).sum()
+    eps_q = eps_q.dropna(subset=["eps_ttm"])
+    eps_q = eps_q[eps_q["eps_ttm"] > 0]
+    if eps_q.empty:
+        return pd.DataFrame(), eps_q
 
-    try:
-        p = price_df.copy().reset_index()
-        date_col = p.columns[0]
-        p = p.rename(columns={date_col: "date", "Close": "price"})
-        p["date"] = pd.to_datetime(p["date"], errors="coerce")
-        p["price"] = pd.to_numeric(p["price"], errors="coerce")
-        p = p.dropna(subset=["date", "price"]).sort_values("date")
-        if len(p) > 260:
-            p = make_monthly_view(p)
-        if p.empty or len(p) < 2:
-            return None
+    p = price_df.copy().reset_index()
+    date_col = p.columns[0]
+    p = p.rename(columns={date_col: "date", "Close": "price"})
+    p["date"] = pd.to_datetime(p["date"], errors="coerce").dt.tz_localize(None)
+    p["price"] = pd.to_numeric(p["price"], errors="coerce")
+    p = p.dropna(subset=["date", "price"]).sort_values("date")
 
-        fig, ax_price = plt.subplots(figsize=(13.5, 5.8))
-        ax_price.plot(p["date"], p["price"], label="Price", linewidth=2)
-        ax_price.set_ylabel("Price")
-        ax_price.grid(True, alpha=0.3)
+    merged = pd.merge_asof(
+        p[["date", "price"]],
+        eps_q[["date", "eps_ttm", "source"]],
+        on="date",
+        direction="backward"
+    )
+    merged["pe_ttm"] = merged["price"] / merged["eps_ttm"]
+    merged = merged.replace([float("inf"), float("-inf")], pd.NA)
+    merged = merged[(merged["price"] > 0) & (merged["pe_ttm"] > 0) & (merged["pe_ttm"] < 300)]
+    return merged.sort_values("date"), eps_q
 
-        ax_pe = ax_price.twinx()
-        ax_pe.axhline(pe_value, linestyle="--", alpha=0.8, label=f"{pe_label}: {pe_value:.2f}x")
-        ax_pe.set_ylabel("P/E reference")
-        ax_price.set_title(f"{ticker} Price + Current P/E Reference")
 
-        lines1, labels1 = ax_price.get_legend_handles_labels()
-        lines2, labels2 = ax_pe.get_legend_handles_labels()
-        ax_price.legend(lines1 + lines2, labels1 + labels2, loc="best", fontsize=8)
-        plt.tight_layout()
-        return fig
-    except Exception:
-        return None
+def make_dual_axis_price_per_chart(chart_df, ticker, per_col="per", per_label="PER", title_suffix="Price + PER"):
+    """
+    Gemini 예시와 동일한 원리: 왼쪽 y축 Price, 오른쪽 y축 PER을 같은 일자축에 겹쳐 표시.
+    """
+    if chart_df is None or chart_df.empty:
+        return None, pd.DataFrame()
+    needed = {"date", "price", per_col}
+    if not needed.issubset(set(chart_df.columns)):
+        return None, pd.DataFrame()
 
+    d = chart_df.copy()
+    d["date"] = pd.to_datetime(d["date"], errors="coerce")
+    d["price"] = pd.to_numeric(d["price"], errors="coerce")
+    d[per_col] = pd.to_numeric(d[per_col], errors="coerce")
+    d = d.dropna(subset=["date", "price", per_col]).copy()
+    d = d[(d["price"] > 0) & (d[per_col] > 0) & (d[per_col] < 300)].sort_values("date")
+    if len(d) < 5:
+        return None, d
+
+    # 일별이 너무 많으면 화면에서는 주간 마지막값으로 축약한다. 원자료는 그대로 유지.
+    plot_df = d.set_index("date").resample("W-FRI").last().dropna(how="all").reset_index() if len(d) > 260 else d.copy()
+    if plot_df.empty or len(plot_df) < 5:
+        plot_df = d.copy()
+
+    fig, ax1 = plt.subplots(figsize=(13.5, 5.8))
+
+    ax1.set_xlabel("Date")
+    ax1.set_ylabel("Price")
+    ax1.plot(plot_df["date"], plot_df["price"], label="Price", linewidth=1.8)
+    ax1.tick_params(axis="y")
+    ax1.grid(True, linestyle="--", alpha=0.35)
+
+    ax2 = ax1.twinx()
+    ax2.set_ylabel(per_label)
+    ax2.plot(plot_df["date"], plot_df[per_col], label=per_label, linewidth=1.6, linestyle="--")
+    ax2.tick_params(axis="y")
+
+    current_per = d[per_col].dropna().iloc[-1] if d[per_col].notna().any() else None
+    if is_valid_number(current_per):
+        ax2.axhline(float(current_per), linestyle=":", alpha=0.45, label=f"Current {per_label}: {float(current_per):.2f}x")
+
+    pe_mean = plot_df[per_col].mean()
+    pe_std = plot_df[per_col].std()
+    if is_valid_number(pe_mean):
+        ax2.axhline(float(pe_mean), linestyle="-", alpha=0.30, label=f"{per_label} avg")
+    if is_valid_number(pe_std) and float(pe_std) > 0:
+        ax2.axhline(float(pe_mean + pe_std), linestyle="--", alpha=0.25, label=f"{per_label} +1SD")
+        ax2.axhline(max(float(pe_mean - pe_std), 0), linestyle="--", alpha=0.25, label=f"{per_label} -1SD")
+
+    ax1.set_title(f"{ticker} {title_suffix}")
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc="best", fontsize=8)
+    fig.tight_layout()
+    return fig, d
+
+
+def make_price_pe_trend_chart(fin_trend_df, valuation, ticker):
+    # 기존 financial_trend_df가 이미 pe_ttm을 갖고 있는 경우만 사용
+    if fin_trend_df is None or fin_trend_df.empty:
+        return None, pd.DataFrame()
+    return make_dual_axis_price_per_chart(
+        fin_trend_df,
+        ticker,
+        per_col="pe_ttm",
+        per_label="Estimated TTM P/E",
+        title_suffix="Daily Price + Estimated TTM P/E"
+    )
 
 def make_price_pe_comment(price_pe_df):
     if price_pe_df is None or price_pe_df.empty or not {"date", "price", "pe_ttm"}.issubset(set(price_pe_df.columns)):
@@ -1493,66 +1592,16 @@ def make_kr_price_valuation_df(ticker, start_date, price_df):
 
 def make_kr_price_per_chart(kr_val_df, ticker):
     """
-    한국 종목용 Price + PER 겹침 차트.
-    - 왼쪽 축: Price
-    - 오른쪽 축: KRX PER
-    - 일별 데이터가 있으면 일별, 월별이면 월별 그대로 표시
+    한국 종목용 일자별 Price + PER 겹침 차트.
+    왼쪽 y축 Price / 오른쪽 y축 KRX PER.
     """
-    if kr_val_df is None or kr_val_df.empty:
-        return None, pd.DataFrame()
-
-    needed = {"date", "price", "per"}
-    if not needed.issubset(set(kr_val_df.columns)):
-        return None, pd.DataFrame()
-
-    chart_df = kr_val_df.copy()
-    chart_df["date"] = pd.to_datetime(chart_df["date"], errors="coerce")
-    chart_df["price"] = pd.to_numeric(chart_df["price"], errors="coerce")
-    chart_df["per"] = pd.to_numeric(chart_df["per"], errors="coerce")
-    chart_df = chart_df.dropna(subset=["date", "price", "per"]).copy()
-    chart_df = chart_df[(chart_df["price"] > 0) & (chart_df["per"] > 0) & (chart_df["per"] < 300)].copy()
-    chart_df = chart_df.sort_values("date")
-
-    if len(chart_df) < 2:
-        return None, chart_df
-
-    # 너무 길면 월말로 축약해서 가독성 확보
-    plot_df = make_monthly_view(chart_df) if len(chart_df) > 260 else chart_df.copy()
-    if plot_df.empty or len(plot_df) < 2:
-        plot_df = chart_df.copy()
-
-    fig, ax_price = plt.subplots(figsize=(13.5, 5.8))
-
-    ax_price.plot(plot_df["date"], plot_df["price"], label="Price", linewidth=2)
-    ax_price.set_ylabel("Price")
-    ax_price.grid(True, alpha=0.3)
-
-    ax_per = ax_price.twinx()
-    ax_per.plot(plot_df["date"], plot_df["per"], linestyle="--", label="PER", linewidth=2)
-    ax_per.set_ylabel("PER")
-
-    per_mean = plot_df["per"].mean()
-    per_std = plot_df["per"].std()
-
-    if is_valid_number(per_mean):
-        ax_per.axhline(per_mean, linestyle="-", alpha=0.35, label="PER avg")
-    if is_valid_number(per_std) and per_std > 0:
-        ax_per.axhline(per_mean + per_std, linestyle=":", alpha=0.35, label="PER +1SD")
-        ax_per.axhline(max(per_mean - per_std, 0), linestyle=":", alpha=0.35, label="PER -1SD")
-
-    # 현재 PER을 반드시 표시
-    current_per = chart_df["per"].dropna().iloc[-1] if chart_df["per"].notna().any() else None
-    if is_valid_number(current_per):
-        ax_per.axhline(float(current_per), linestyle="--", alpha=0.25, label="Current PER")
-
-    ax_price.set_title(f"{ticker} Daily Price + PER")
-
-    lines1, labels1 = ax_price.get_legend_handles_labels()
-    lines2, labels2 = ax_per.get_legend_handles_labels()
-    ax_price.legend(lines1 + lines2, labels1 + labels2, loc="best", fontsize=8)
-
-    plt.tight_layout()
-    return fig, chart_df
+    return make_dual_axis_price_per_chart(
+        kr_val_df,
+        ticker,
+        per_col="per",
+        per_label="PER",
+        title_suffix="Daily Price + PER"
+    )
 
 def make_kr_price_pbr_chart(kr_val_df, ticker):
     if kr_val_df is None or kr_val_df.empty:
@@ -2713,29 +2762,25 @@ if run:
             st.caption("미국 종목은 yfinance 재무제표 기반 Estimated TTM P/E를 사용합니다. 한국 종목처럼 상단 Price / 하단 P/E로 분리 표시합니다. FactSet식 12개월 Forward P/E 시계열은 아닙니다.")
             if price_pe_chart is None:
                 st.warning(price_pe_comment)
-                reference_fig = make_current_pe_reference_chart(df, valuation, ticker)
-                if reference_fig is not None:
-                    st.pyplot(reference_fig)
-                    st.info(
-                        "위 차트는 PER 변화 차트가 아니라 현재 PER 기준선입니다. "
-                        "미국 종목의 과거 Forward P/E 시계열은 yfinance에서 직접 제공하지 않아, "
-                        "실제 Estimated TTM P/E가 계산될 때만 PER 변화선을 표시합니다."
-                    )
-                else:
-                    st.info(
-                        "현재 Trailing/Forward P/E 데이터도 부족해 참고선 차트를 표시하지 못했습니다. "
-                        "위 Current Valuation 카드만 확인하세요."
-                    )
+                st.info(
+                    "미국 종목의 PER 변화선은 분기 EPS TTM이 계산될 때만 표시합니다. "
+                    "현재 Trailing/Forward P/E는 위 카드로 표시합니다. "
+                    "주가를 그대로 따라가는 가짜 Price-implied P/E 차트는 표시하지 않습니다."
+                )
+                if 'us_eps_raw_df' in locals() and us_eps_raw_df is not None and not us_eps_raw_df.empty:
+                    with st.expander("미국 EPS 원자료 보기"):
+                        show_eps = us_eps_raw_df.copy()
+                        show_eps["date"] = pd.to_datetime(show_eps["date"]).dt.strftime("%Y-%m-%d")
+                        st.dataframe(show_eps.tail(20), use_container_width=True)
                 if not price_pe_df.empty:
-                    st.caption("아래는 yfinance에서 계산 가능한 원자료입니다.")
-                    show_price_pe_df = price_pe_df.copy()
-                    show_price_pe_df["date"] = pd.to_datetime(show_price_pe_df["date"]).dt.strftime("%Y-%m-%d")
-                    for col in ["price", "eps_ttm", "pe_ttm"]:
-                        if col in show_price_pe_df.columns:
-                            show_price_pe_df[col] = show_price_pe_df[col].apply(lambda x: None if pd.isna(x) else round(float(x), 2))
-                    with st.expander("Price + P/E 원자료 보기"):
+                    with st.expander("Price + P/E 계산 원자료 보기"):
+                        show_price_pe_df = price_pe_df.copy()
+                        show_price_pe_df["date"] = pd.to_datetime(show_price_pe_df["date"]).dt.strftime("%Y-%m-%d")
+                        for col in ["price", "eps_ttm", "pe_ttm"]:
+                            if col in show_price_pe_df.columns:
+                                show_price_pe_df[col] = show_price_pe_df[col].apply(lambda x: None if pd.isna(x) else round(float(x), 2))
                         cols = [c for c in ["date", "price", "eps_ttm", "pe_ttm", "source"] if c in show_price_pe_df.columns]
-                        st.dataframe(show_price_pe_df[cols], use_container_width=True)
+                        st.dataframe(show_price_pe_df[cols].tail(120), use_container_width=True)
             else:
                 st.pyplot(price_pe_chart)
                 st.write(price_pe_comment)
