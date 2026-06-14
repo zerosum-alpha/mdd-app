@@ -372,8 +372,13 @@ def extract_ticker_row(raw, ticker):
 @st.cache_data(ttl=3600)
 def load_kr_per_series(ticker, start_date, end_date):
     """KR PER/PBR/EPS time series.
-    Attempts official pykrx period call first; if empty, samples market-wide daily rows.
-    Returns (DataFrame indexed by date, compact_status, debug_text).
+
+    안정성 우선 순서:
+    1) pykrx 공식 기간 조회: get_market_fundamental(start, end, ticker)
+    2) 월별 기간 조회: get_market_fundamental(start, end, ticker, freq="m")
+    3) 날짜별 시장 전체 조회: get_market_fundamental_by_ticker(date, market="KOSPI/KOSDAQ/KONEX")
+       - 기존 실패 원인 보정: market="ALL"만 쓰면 환경에 따라 empty가 나올 수 있음.
+       - 한국 종목은 KOSPI/KOSDAQ/KONEX를 각각 조회해서 ticker 행을 직접 뽑음.
     """
     if not PYKRX_AVAILABLE:
         return pd.DataFrame(), f"pykrx import 실패: {PYKRX_IMPORT_ERROR}", PYKRX_IMPORT_ERROR
@@ -383,69 +388,136 @@ def load_kr_per_series(ticker, start_date, end_date):
     end = _date_yyyymmdd(end_date)
     debug = []
 
-    # 1) Official period calls
+    def _clean_fundamental(raw, source_name):
+        if raw is None or not isinstance(raw, pd.DataFrame) or raw.empty:
+            debug.append(f"{source_name}: empty")
+            return pd.DataFrame()
+
+        debug.append(
+            f"{source_name}: shape={getattr(raw, 'shape', None)}, "
+            f"cols={list(getattr(raw, 'columns', []))[:8]}, "
+            f"index_sample={list(getattr(raw, 'index', []))[:3]}"
+        )
+
+        out = canonicalize_fundamental_columns(raw)
+        if out.empty:
+            return pd.DataFrame()
+
+        try:
+            if len(out) == len(raw):
+                out.index = _dt_index(raw.index)
+        except Exception:
+            pass
+
+        for c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+
+        # pykrx에서 PER 0 또는 음수는 적자/미제공 성격이므로 차트용에서는 제외.
+        if "PER" in out.columns:
+            out = out[(out["PER"] > 0) & (out["PER"] < 500)]
+
+        return out.dropna(how="all")
+
+    # 1) 공식 기간 조회: 가장 정상적인 경로
     period_calls = [
-        ("period daily", lambda: pkstock.get_market_fundamental(start, end, ticker)),
-        ("period monthly", lambda: pkstock.get_market_fundamental(start, end, ticker, freq="m")),
+        ("period daily get_market_fundamental", lambda: pkstock.get_market_fundamental(start, end, ticker)),
+        ("period monthly get_market_fundamental", lambda: pkstock.get_market_fundamental(start, end, ticker, freq="m")),
     ]
-    if hasattr(pkstock, "get_market_fundamental_by_date"):
-        period_calls.append(("by_date daily", lambda: pkstock.get_market_fundamental_by_date(start, end, ticker)))
-        period_calls.append(("by_date monthly", lambda: pkstock.get_market_fundamental_by_date(start, end, ticker, freq="m")))
 
     for name, fn in period_calls:
         try:
-            raw = fn()
-            debug.append(f"{name}: shape={getattr(raw, 'shape', None)}, cols={list(getattr(raw, 'columns', []))[:8]}")
-            out = canonicalize_fundamental_columns(raw)
-            if not out.empty:
-                out.index = _dt_index(raw.index if len(out) == len(raw) else out.index)
-                if "PER" in out.columns:
-                    out = out[(out["PER"] > 0) & (out["PER"] < 500)]
-                if not out.empty:
-                    return out.sort_index(), f"OK: {name}", " / ".join(debug[-3:])
+            out = _clean_fundamental(fn(), name)
+            if not out.empty and ("PER" in out.columns or "EPS" in out.columns):
+                return out.sort_index(), f"OK: {name}", " / ".join(debug[-5:])
         except Exception as e:
             debug.append(f"{name}: {repr(e)}")
 
-    # 2) Market-wide latest/monthly sampling fallback.
-    # Use business days from price period end backwards; keeps calls limited.
+    # 2) 날짜별 시장 전체 fallback.
+    #    핵심 수정: market='ALL'에 의존하지 않고 KOSPI/KOSDAQ/KONEX를 각각 조회한다.
     start_dt = pd.to_datetime(start_date)
     end_dt = pd.to_datetime(end_date)
-    # monthly endpoints + latest 15 business days
-    monthly_dates = pd.date_range(start=start_dt, end=end_dt, freq="ME")
-    latest_bdays = pd.bdate_range(end=end_dt, periods=min(20, max(1, len(pd.bdate_range(start_dt, end_dt)))))
+
+    # 월말 + 최근 영업일을 샘플링. 너무 많은 KRX 호출 방지.
+    try:
+        monthly_dates = pd.date_range(start=start_dt, end=end_dt, freq="ME")
+    except Exception:
+        monthly_dates = pd.date_range(start=start_dt, end=end_dt, freq="M")
+
+    latest_bdays = pd.bdate_range(end=end_dt, periods=min(30, max(1, len(pd.bdate_range(start_dt, end_dt)))))
     sample_dates = sorted(set(list(monthly_dates) + list(latest_bdays)))
 
+    markets = ["KOSPI", "KOSDAQ", "KONEX"]
     rows = []
+
     for d in sample_dates:
-        ds = d.strftime("%Y%m%d")
-        raw = None
-        for label, fn in [
-            ("one_day get_market_fundamental", lambda ds=ds: pkstock.get_market_fundamental(ds, market="ALL")),
-            ("one_day by_ticker", lambda ds=ds: pkstock.get_market_fundamental_by_ticker(ds, market="ALL") if hasattr(pkstock, "get_market_fundamental_by_ticker") else pd.DataFrame()),
-        ]:
-            try:
-                raw = fn()
-                row_raw = extract_ticker_row(raw, ticker)
-                out = canonicalize_fundamental_columns(row_raw)
-                if not out.empty:
-                    out = out.iloc[[0]].copy()
-                    out.index = pd.DatetimeIndex([pd.to_datetime(d)]).astype("datetime64[ns]")
-                    rows.append(out)
+        # 휴일이면 직전 7일 안에서 조회 시도
+        candidate_dates = [d - pd.Timedelta(days=i) for i in range(0, 8)]
+        got_this_sample = False
+
+        for cd in candidate_dates:
+            ds = cd.strftime("%Y%m%d")
+
+            for mkt in markets:
+                call_list = []
+                if hasattr(pkstock, "get_market_fundamental_by_ticker"):
+                    call_list.append((
+                        f"by_ticker {mkt} {ds}",
+                        lambda ds=ds, mkt=mkt: pkstock.get_market_fundamental_by_ticker(ds, market=mkt)
+                    ))
+
+                # pykrx 버전에 따라 단일 날짜 시장 조회가 되는 경우가 있음
+                call_list.append((
+                    f"one_day fundamental {mkt} {ds}",
+                    lambda ds=ds, mkt=mkt: pkstock.get_market_fundamental(ds, market=mkt)
+                ))
+
+                for label, fn in call_list:
+                    try:
+                        raw = fn()
+                        row_raw = extract_ticker_row(raw, ticker)
+                        if row_raw is None or row_raw.empty:
+                            continue
+
+                        out = canonicalize_fundamental_columns(row_raw)
+                        if out.empty:
+                            continue
+
+                        for c in out.columns:
+                            out[c] = pd.to_numeric(out[c], errors="coerce")
+
+                        if "PER" in out.columns:
+                            out = out[(out["PER"] > 0) & (out["PER"] < 500)]
+
+                        if not out.empty:
+                            out = out.iloc[[0]].copy()
+                            out.index = pd.DatetimeIndex([pd.to_datetime(cd)]).astype("datetime64[ns]")
+                            rows.append(out)
+                            if len(debug) < 10:
+                                debug.append(f"OK sample: {label}")
+                            got_this_sample = True
+                            break
+                    except Exception as e:
+                        if len(debug) < 10:
+                            debug.append(f"{label}: {repr(e)}")
+
+                if got_this_sample:
                     break
-            except Exception as e:
-                if len(debug) < 8:
-                    debug.append(f"{label} {ds}: {repr(e)}")
+            if got_this_sample:
+                break
 
     if rows:
         out = pd.concat(rows).sort_index()
         out = out[~out.index.duplicated(keep="last")]
+        for c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
         if "PER" in out.columns:
             out = out[(out["PER"] > 0) & (out["PER"] < 500)]
+        out = out.dropna(how="all")
         if not out.empty:
-            return out, "OK: market-wide sampled fallback", " / ".join(debug[-5:])
+            return out, "OK: KOSPI/KOSDAQ/KONEX sampled fallback", " / ".join(debug[-10:])
 
-    compact = "PER 데이터 없음: 공식 기간조회와 샘플조회 모두 실패/empty"
-    return pd.DataFrame(), compact, " / ".join(debug[-8:])
+    compact = "PER 데이터 없음: 기간조회 실패 + KOSPI/KOSDAQ/KONEX 샘플조회 실패"
+    return pd.DataFrame(), compact, " / ".join(debug[-12:])
 
 # -----------------------------------------------------------------------------
 # US Estimated TTM P/E
