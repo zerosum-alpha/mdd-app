@@ -86,7 +86,7 @@ require_login()
 logout_button()
 
 st.title("📈 MDD 저점매수 분석기 | Trading Final")
-st.caption("기본 종목 없음 · 기준 시작일 2024/01/01 · 개별주/ETF/시장지수 분석 · 주가/PER/MDD/시장위험/이평선/매매 체크포인트 중심")
+st.caption("기본 종목 없음 · 기준 시작일 2024/01/01 · 자산유형별 MDD 기준 · 주가/PER/MDD/시장위험/이평선/매매 체크포인트 중심")
 
 # =========================================================
 # Utilities
@@ -241,7 +241,24 @@ def find_ticker(q):
         return idx
 
     if q.isdigit() and len(q) == 6:
+        sl = kr_stock_list()
+        if not sl.empty and {"Code", "Name"}.issubset(sl.columns):
+            hit = sl[sl["Code"].astype(str).str.zfill(6) == q]
+            if not hit.empty:
+                return "KR", q, hit.iloc[0]["Name"]
         return "KR", q, q
+
+    # New KRX ETF codes may include letters, e.g. 0174B0, 0051A0, 0020H0.
+    q_up = q.upper()
+    if re.fullmatch(r"[0-9A-Z]{6}", q_up) and any(ch.isdigit() for ch in q_up):
+        sl = kr_stock_list()
+        if not sl.empty and {"Code", "Name"}.issubset(sl.columns):
+            hit = sl[sl["Code"].astype(str).str.upper() == q_up]
+            if not hit.empty:
+                return "KR", q_up, hit.iloc[0]["Name"]
+        # If it starts with a digit, treat as KR code fallback rather than a US ticker.
+        if q_up[0].isdigit():
+            return "KR", q_up, q_up
     if q in KR_FALLBACK_MAP:
         return "KR", KR_FALLBACK_MAP[q], q
 
@@ -359,8 +376,10 @@ def spaced_signal(mask, min_gap=25):
     return out
 
 
-def build_signals(df):
-    buy = (df["Current_Drawdown"] <= -0.12) & (df["RSI"] <= 42)
+def build_signals(df, buy_dd=-0.12):
+    # Buy marker uses the asset-specific 1차 관심 MDD threshold.
+    # This is a chart marker only; final action is decided by asset rule + correction score.
+    buy = (df["Current_Drawdown"] <= buy_dd) & (df["RSI"] <= 42)
     cash = ((df["Current_Drawdown"] >= -0.03) & (df["RSI"] >= 68)) | ((df["Close"] > df["MA20"] * 1.08) & (df["RSI"] >= 65))
     sig = pd.DataFrame(index=df.index)
     sig["Buy"] = df["Close"].where(spaced_signal(buy, 30))
@@ -833,7 +852,7 @@ def market_risk_series(market, ticker, start_date):
 # =========================================================
 # Chart and comment
 # =========================================================
-def plot_core_chart(df, per_df, risk_df, risk_label, ticker):
+def plot_core_chart(df, per_df, risk_df, risk_label, ticker, asset_rule_key=None):
     """Core chart with full PER visibility.
 
     Rule:
@@ -917,7 +936,13 @@ def plot_core_chart(df, per_df, risk_df, risk_label, ticker):
     if "Risk" not in chart.columns:
         chart["Risk"] = np.nan
 
-    sig = build_signals(df).copy()
+    buy_dd = -0.12
+    if asset_rule_key in ASSET_RULES:
+        try:
+            buy_dd = ASSET_RULES[asset_rule_key]["mdd_levels"][1] / 100.0
+        except Exception:
+            buy_dd = -0.12
+    sig = build_signals(df, buy_dd=buy_dd).copy()
     if sig is not None and not sig.empty:
         sig.index = to_dt_index(sig.index).normalize()
         sig = sig[~sig.index.duplicated(keep="last")]
@@ -1355,6 +1380,414 @@ def format_valuation_guide_table(df):
 # =========================================================
 # Trading helper tables
 # =========================================================
+
+# =========================================================
+# Asset-type MDD rules and correction score
+# =========================================================
+ASSET_RULES = {
+    "US_SP500": {
+        "label": "미국 S&P500 대표지수",
+        "mdd_levels": [-5, -7, -10, -15, -20],
+        "actions": ["관찰", "대기", "1차 매수", "2차 매수", "적극 매수", "위기 확인"],
+        "memo": "대표지수는 회복력이 높아 테마 ETF보다 얕은 MDD에서도 분할 관심 가능"
+    },
+    "US_NASDAQ100": {
+        "label": "미국 나스닥100 대표지수",
+        "mdd_levels": [-5, -8, -12, -18, -25],
+        "actions": ["관찰", "대기", "1차 매수", "2차 매수", "적극 매수", "위기 확인"],
+        "memo": "성장주 비중이 높아 S&P500보다 한 단계 깊은 조정 기준 적용"
+    },
+    "US_AI_THEME": {
+        "label": "미국 AI 테마 ETF/종목군",
+        "mdd_levels": [-7, -10, -15, -20, -25],
+        "actions": ["관찰", "대기", "1차 매수", "2차 매수", "적극 매수", "과매도 확인"],
+        "memo": "AI 테마는 주도주 유지와 EPS 상향 여부를 같이 확인"
+    },
+    "US_SEMICONDUCTOR": {
+        "label": "미국 반도체 ETF/종목군",
+        "mdd_levels": [-8, -12, -15, -20, -25],
+        "actions": ["관찰", "대기", "1차 매수", "2차 매수", "적극 매수", "과매도 확인"],
+        "memo": "SOXX/SMH와 NVDA·AVGO·AMD·MU 흐름 확인 필요"
+    },
+    "US_MEMORY_HBM": {
+        "label": "미국/글로벌 메모리·HBM 종목군",
+        "mdd_levels": [-10, -15, -20, -25, -30],
+        "actions": ["관찰", "대기", "1차 매수", "2차 매수", "적극 매수", "사이클 점검"],
+        "memo": "메모리/HBM은 사이클 변동성이 커서 -15% 이상부터 의미 있는 1차권"
+    },
+    "US_POWER_INFRA": {
+        "label": "미국 전력·AI 인프라 종목군",
+        "mdd_levels": [-7, -10, -15, -20, -25],
+        "actions": ["관찰", "대기", "1차 매수", "2차 매수", "적극 매수", "수주/실적 점검"],
+        "memo": "데이터센터 전력·냉각·변압기 수요 지속 여부 확인"
+    },
+    "US_VALUECHAIN": {
+        "label": "미국 빅테크 밸류체인 ETF/종목군",
+        "mdd_levels": [-8, -12, -15, -20, -25],
+        "actions": ["관찰", "대기", "1차 매수", "2차 매수", "적극 매수", "본주 흐름 확인"],
+        "memo": "엔비디아·구글·브로드컴·테슬라 등 본주 흐름 확인 필요"
+    },
+    "KR_KOSPI": {
+        "label": "한국 KOSPI 지수/대형 ETF",
+        "mdd_levels": [-5, -8, -12, -18, -25],
+        "actions": ["관찰", "대기", "조건부 1차", "2차 매수", "적극 매수", "환율/외국인 확인"],
+        "memo": "한국 대형주는 외국인 현물·선물, 원/달러, 연기금 매도를 함께 확인"
+    },
+    "KR_KOSDAQ": {
+        "label": "한국 KOSDAQ 지수/성장 ETF",
+        "mdd_levels": [-7, -12, -18, -25, -35],
+        "actions": ["관찰", "대기", "조건부 1차", "2차 매수", "적극 매수", "거래대금 확인"],
+        "memo": "코스닥은 변동성이 커서 거래대금 회복 전까지 보수적으로 판단"
+    },
+    "KR_SEMICON_EQUIP": {
+        "label": "한국 반도체 대형·소부장·장비 ETF/종목군",
+        "mdd_levels": [-8, -12, -15, -20, -25],
+        "actions": ["관찰", "대기", "조건부 1차", "2차 매수", "적극 매수", "거래대금 확인"],
+        "memo": "반도체는 외국인 흡수와 거래대금 유지 여부가 핵심"
+    },
+    "KR_THEME_HIGH_BETA": {
+        "label": "한국 고변동 테마 ETF/종목군",
+        "mdd_levels": [-10, -15, -20, -25, -35],
+        "actions": ["관찰", "대기", "조건부 1차", "2차 매수", "적극 매수", "테마 생존 확인"],
+        "memo": "2차전지·바이오·고성장 테마는 더 깊은 MDD와 거래대금 회복 필요"
+    },
+}
+
+SP500_TICKERS = {"SPY", "VOO", "IVV", "SPLG"}
+NASDAQ_TICKERS = {"QQQ", "QQQM", "TQQQ", "QLD"}
+AI_THEME_TICKERS = {"AIQ", "BOTZ", "ROBO", "ARKQ", "IRBO", "CIBR"}
+SEMICONDUCTOR_TICKERS = {"SOXX", "SMH", "SOXL", "XSD", "NVDA", "AVGO", "AMD", "TSM", "ASML", "MRVL", "ARM"}
+MEMORY_HBM_TICKERS = {"MU", "WDC", "STX", "NXPI", "LRCX", "AMAT"}
+POWER_INFRA_TICKERS = {"VRT", "ETN", "PWR", "GEV", "NEE", "CEG", "GNRC", "EME"}
+VALUECHAIN_TICKERS = {"GOOGL", "GOOG", "TSLA", "MSFT", "AMZN", "ORCL", "DELL", "HPE", "SMCI"}
+
+KR_KOSPI_ETF_CODES = {"069500", "102110", "152100", "278530", "226490", "360750", "379810", "367380", "381180"}
+KR_KOSDAQ_ETF_CODES = {"229200", "233740", "251340", "364960", "376250"}
+KR_SEMICON_CODES = {"005930", "000660", "042700", "039030", "058470", "108320", "240810", "036930", "403870", "471990", "396500", "091160", "395160", "0174B0", "487130"}
+KR_HIGH_BETA_CODES = {"373220", "006400", "066970", "247540", "086520", "068270", "207940", "277810", "108490", "491010", "483320", "483340", "457480", "465580"}
+
+
+def asset_rule_options():
+    return ["AUTO"] + list(ASSET_RULES.keys())
+
+
+def asset_rule_label(key):
+    if key == "AUTO":
+        return "자동 분류"
+    return ASSET_RULES.get(key, {}).get("label", str(key))
+
+
+def normalize_asset_code(ticker):
+    t = str(ticker).upper().strip()
+    if t.endswith(".KS") or t.endswith(".KQ"):
+        return t.split(".")[0]
+    return t
+
+
+def auto_classify_asset(market, ticker, display_name=""):
+    t = str(ticker).upper().strip()
+    code = normalize_asset_code(ticker)
+    name = str(display_name).upper()
+    name_kr = str(display_name)
+
+    if market == "US_INDEX":
+        if t in ["^GSPC", "SPY", "VOO"]:
+            return "US_SP500", "지수/대표 ETF 매핑"
+        if t in ["^IXIC", "^NDX", "QQQ", "QQQM"]:
+            return "US_NASDAQ100", "지수/대표 ETF 매핑"
+        if t in ["^SOX"]:
+            return "US_SEMICONDUCTOR", "반도체 지수 매핑"
+        return "US_SP500", "미국 지수 기본값"
+
+    if market == "KR_INDEX":
+        if t == "KS11":
+            return "KR_KOSPI", "KOSPI 지수 매핑"
+        if t == "KQ11":
+            return "KR_KOSDAQ", "KOSDAQ 지수 매핑"
+        return "KR_KOSPI", "한국 지수 기본값"
+
+    if market == "US":
+        if t in SP500_TICKERS:
+            return "US_SP500", "S&P500 대표 ETF"
+        if t in NASDAQ_TICKERS:
+            return "US_NASDAQ100", "나스닥100 대표 ETF"
+        if t in SEMICONDUCTOR_TICKERS:
+            return "US_SEMICONDUCTOR", "미국 반도체 유니버스"
+        if t in MEMORY_HBM_TICKERS:
+            return "US_MEMORY_HBM", "메모리/HBM 유니버스"
+        if t in POWER_INFRA_TICKERS:
+            return "US_POWER_INFRA", "전력/AI 인프라 유니버스"
+        if t in VALUECHAIN_TICKERS:
+            return "US_VALUECHAIN", "빅테크 밸류체인 유니버스"
+        if t in AI_THEME_TICKERS or any(k in name for k in ["AI", "ROBOT", "ROBO", "BOTZ"]):
+            return "US_AI_THEME", "AI/로봇 테마명 매핑"
+        return "US_AI_THEME", "미국 개별주/ETF 기본 고성장 보정"
+
+    # KR stocks and ETFs
+    if code in KR_KOSPI_ETF_CODES or any(k in name_kr for k in ["KOSPI", "코스피", "200", "대형"]):
+        return "KR_KOSPI", "한국 대형 ETF/이름 매핑"
+    if code in KR_KOSDAQ_ETF_CODES or any(k in name_kr for k in ["KOSDAQ", "코스닥"]):
+        return "KR_KOSDAQ", "한국 코스닥 ETF/이름 매핑"
+    if code in KR_SEMICON_CODES or any(k in name_kr for k in ["반도체", "메모리", "HBM", "하이닉스", "삼성전자", "소부장", "장비"]):
+        return "KR_SEMICON_EQUIP", "한국 반도체/소부장 매핑"
+    if code in KR_HIGH_BETA_CODES or any(k in name_kr for k in ["2차전지", "바이오", "전력", "AI", "로봇", "밸류체인", "성장"]):
+        return "KR_THEME_HIGH_BETA", "한국 고변동 테마 매핑"
+    return "KR_KOSPI", "한국 개별주 기본값"
+
+
+def get_mdd_action(mdd_pct, asset_type):
+    """mdd_pct is percentage value, e.g. -11.5."""
+    rule = ASSET_RULES.get(asset_type, ASSET_RULES["US_SP500"])
+    levels = rule["mdd_levels"]
+    actions = rule["actions"]
+    mdd_pct = safe_float(mdd_pct)
+    if mdd_pct is None:
+        stage = "판단 보류"
+    elif mdd_pct > levels[0]:
+        stage = actions[0]
+    elif mdd_pct > levels[1]:
+        stage = actions[1]
+    elif mdd_pct > levels[2]:
+        stage = actions[2]
+    elif mdd_pct > levels[3]:
+        stage = actions[3]
+    elif mdd_pct > levels[4]:
+        stage = actions[4]
+    else:
+        stage = actions[5]
+    return {"asset_label": rule["label"], "mdd_pct": mdd_pct, "stage": stage, "levels": levels, "rule": rule}
+
+
+def us_signal_score(
+    rate_stable=False, vix_down=False, eps_stable=False, index_reclaim_20d=False, leaders_strong=False,
+    rate_spike=False, vix_spike=False, eps_down=False, leaders_break_20d=False,
+):
+    score = 0
+    score += 1 if rate_stable else 0
+    score += 1 if vix_down else 0
+    score += 1 if eps_stable else 0
+    score += 1 if index_reclaim_20d else 0
+    score += 1 if leaders_strong else 0
+    score -= 2 if rate_spike else 0
+    score -= 1 if vix_spike else 0
+    score -= 2 if eps_down else 0
+    score -= 2 if leaders_break_20d else 0
+    return int(score)
+
+
+def kr_signal_score(
+    foreign_spot_buy=False, foreign_futures_buy=False, fx_stable=False, volume_up=False, leaders_close_strong=False,
+    pension_heavy_sell=False, foreign_double_sell=False, fx_spike=False, volume_down=False, upper_tail_repeat=False,
+):
+    score = 0
+    score += 2 if foreign_spot_buy else 0
+    score += 1 if foreign_futures_buy else 0
+    score += 1 if fx_stable else 0
+    score += 1 if volume_up else 0
+    score += 1 if leaders_close_strong else 0
+    score -= 2 if pension_heavy_sell else 0
+    score -= 3 if foreign_double_sell else 0
+    score -= 2 if fx_spike else 0
+    score -= 1 if volume_down else 0
+    score -= 1 if upper_tail_repeat else 0
+    return int(score)
+
+
+def final_buy_decision(stage, signal_score):
+    if stage in ["관찰"]:
+        return "관망"
+    if stage in ["대기"]:
+        return "소액 관심" if signal_score >= 3 else "대기"
+    if stage in ["1차 매수", "조건부 1차"]:
+        if signal_score >= 2:
+            return "1차 매수 가능"
+        if signal_score >= 0:
+            return "대기"
+        return "매수 금지"
+    if stage in ["2차 매수"]:
+        return "2차 매수 가능" if signal_score >= 1 else "분할 대기"
+    if stage in ["적극 매수"]:
+        return "적극 분할매수" if signal_score >= 0 else "위험 확인 후 분할"
+    return "판단 보류"
+
+
+def latest_safe(series, default=None):
+    try:
+        s = pd.to_numeric(series, errors="coerce").dropna()
+        if s.empty:
+            return default
+        return float(s.iloc[-1])
+    except Exception:
+        return default
+
+
+@st.cache_data(ttl=1800)
+def load_usdkrw_series(start_date):
+    if YF_OK:
+        try:
+            df = yf.Ticker("KRW=X").history(start=pd.to_datetime(start_date).strftime("%Y-%m-%d"), auto_adjust=True)
+            if df is not None and not df.empty and "Close" in df.columns:
+                df = df.copy()
+                df.index = to_dt_index(df.index)
+                return df[["Close"]].rename(columns={"Close": "USDKRW"}), "OK:yfinance KRW=X"
+        except Exception as e:
+            err1 = repr(e)
+    else:
+        err1 = YF_ERR
+    if FDR_OK:
+        try:
+            df = fdr.DataReader("USD/KRW", pd.to_datetime(start_date).strftime("%Y-%m-%d"))
+            if df is not None and not df.empty and "Close" in df.columns:
+                df = df.copy()
+                df.index = to_dt_index(df.index)
+                return df[["Close"]].rename(columns={"Close": "USDKRW"}), "OK:FDR USD/KRW"
+        except Exception as e:
+            return pd.DataFrame(), f"USD/KRW 조회 실패: {err1} / {repr(e)}"
+    return pd.DataFrame(), f"USD/KRW 조회 실패: {err1}"
+
+
+def detect_upper_tail_repeat(df, lookback=5):
+    try:
+        x = df.tail(lookback).copy()
+        rng = (x["High"] - x["Low"]).replace(0, np.nan)
+        upper = (x["High"] - x["Close"]) / rng
+        return bool((upper >= 0.45).sum() >= 3)
+    except Exception:
+        return False
+
+
+def compute_auto_correction_flags(df, risk_df, risk_label, market, start_date):
+    latest = df.iloc[-1]
+    close = safe_float(latest.get("Close"))
+    ma20 = safe_float(latest.get("MA20"))
+    rsi = safe_float(latest.get("RSI"))
+    volr = safe_float(latest.get("Volume_Ratio"))
+    day_ret = None
+    if len(df) >= 2 and safe_float(df["Close"].iloc[-2]) not in (None, 0):
+        day_ret = close / safe_float(df["Close"].iloc[-2]) - 1
+
+    vix_latest = latest_safe(risk_df["Risk"]) if risk_df is not None and not risk_df.empty and "Risk" in risk_df.columns else None
+    vix_prev = None
+    if risk_df is not None and not risk_df.empty and "Risk" in risk_df.columns and len(risk_df.dropna()) >= 6:
+        try:
+            vix_prev = float(pd.to_numeric(risk_df["Risk"], errors="coerce").dropna().iloc[-6])
+        except Exception:
+            pass
+
+    index_reclaim_20d = close is not None and ma20 is not None and close >= ma20
+    leaders_strong = bool(index_reclaim_20d and (day_ret is not None and day_ret > 0) and (rsi is None or rsi < 70))
+    leaders_break_20d = close is not None and ma20 is not None and close < ma20
+    vix_down = bool(risk_label == "VIX" and vix_latest is not None and vix_prev is not None and vix_latest < vix_prev)
+    vix_spike = bool(risk_label == "VIX" and vix_latest is not None and vix_latest >= 25)
+
+    kr_fx_stable = False
+    kr_fx_spike = False
+    fx_note = "USD/KRW 미조회"
+    if str(market).startswith("KR"):
+        fx_df, fx_status = load_usdkrw_series(start_date)
+        fx_note = fx_status
+        if not fx_df.empty and len(fx_df) >= 6:
+            fx_now = latest_safe(fx_df["USDKRW"])
+            fx_5 = safe_float(fx_df["USDKRW"].iloc[-6])
+            if fx_now is not None and fx_5 not in (None, 0):
+                fx_chg = fx_now / fx_5 - 1
+                kr_fx_stable = fx_chg <= 0.005
+                kr_fx_spike = fx_chg >= 0.015
+                fx_note = f"USD/KRW 5일 변화 {fx_chg*100:.1f}%"
+
+    return {
+        "rate_stable": False,
+        "vix_down": vix_down,
+        "eps_stable": False,
+        "index_reclaim_20d": bool(index_reclaim_20d),
+        "leaders_strong": bool(leaders_strong),
+        "rate_spike": False,
+        "vix_spike": vix_spike,
+        "eps_down": False,
+        "leaders_break_20d": bool(leaders_break_20d),
+        "foreign_spot_buy": False,
+        "foreign_futures_buy": False,
+        "fx_stable": bool(kr_fx_stable),
+        "volume_up": bool(volr is not None and volr >= 1.15),
+        "leaders_close_strong": bool(index_reclaim_20d and day_ret is not None and day_ret > 0),
+        "pension_heavy_sell": False,
+        "foreign_double_sell": False,
+        "fx_spike": bool(kr_fx_spike),
+        "volume_down": bool(volr is not None and volr <= 0.80),
+        "upper_tail_repeat": detect_upper_tail_repeat(df),
+        "fx_note": fx_note,
+    }
+
+
+def correction_score_details(asset_rule_key, market, flags):
+    rows = []
+    if str(asset_rule_key).startswith("KR_") or str(market).startswith("KR"):
+        mapping = [
+            ("외국인 현물 순매수", "foreign_spot_buy", 2),
+            ("외국인 선물 순매수", "foreign_futures_buy", 1),
+            ("원/달러 안정 또는 하락", "fx_stable", 1),
+            ("거래대금 증가", "volume_up", 1),
+            ("주도주/가격 종가 강세", "leaders_close_strong", 1),
+            ("연기금 대규모 순매도", "pension_heavy_sell", -2),
+            ("외국인 현물·선물 동반 매도", "foreign_double_sell", -3),
+            ("원/달러 급등", "fx_spike", -2),
+            ("거래대금 감소", "volume_down", -1),
+            ("장중 윗꼬리 반복", "upper_tail_repeat", -1),
+        ]
+    else:
+        mapping = [
+            ("금리 안정 또는 하락", "rate_stable", 1),
+            ("VIX 하락 전환", "vix_down", 1),
+            ("EPS 전망 유지/상향", "eps_stable", 1),
+            ("지수/종목 MA20 회복", "index_reclaim_20d", 1),
+            ("주도주 강세", "leaders_strong", 1),
+            ("금리 급등", "rate_spike", -2),
+            ("VIX 재급등", "vix_spike", -1),
+            ("EPS 하향", "eps_down", -2),
+            ("주도주 20일선 이탈", "leaders_break_20d", -2),
+        ]
+    score = 0
+    for label, key, pts in mapping:
+        on = bool(flags.get(key, False))
+        applied = pts if on else 0
+        score += applied
+        rows.append({"조건": label, "충족": "Y" if on else "-", "점수": applied})
+    return int(score), pd.DataFrame(rows)
+
+
+def build_asset_mdd_rule_table(asset_rule_key):
+    rule = ASSET_RULES.get(asset_rule_key, ASSET_RULES["US_SP500"])
+    levels = rule["mdd_levels"]
+    actions = rule["actions"]
+    ranges = [
+        f"0 ~ {levels[0]}%",
+        f"{levels[0]} ~ {levels[1]}%",
+        f"{levels[1]} ~ {levels[2]}%",
+        f"{levels[2]} ~ {levels[3]}%",
+        f"{levels[3]} ~ {levels[4]}%",
+        f"{levels[4]}% 이하",
+    ]
+    meanings = [
+        "정상 눌림 / 초기 관찰",
+        "약한 조정 / 대기",
+        "1차 매수권",
+        "2차 매수권",
+        "적극 매수권",
+        "위기성 구간 / 매크로 확인",
+    ]
+    return pd.DataFrame({"MDD 구간": ranges, "단계": actions, "의미": meanings})
+
+
+def make_mdd_comment(asset_label, mdd_pct, stage, signal_score, final_decision, rule_memo=""):
+    return (
+        f"현재 자산 유형: {asset_label}\n"
+        f"현재 MDD: {mdd_pct:.1f}%\n"
+        f"MDD 기준 단계: {stage}\n"
+        f"보정 점수: {signal_score:+d}점\n"
+        f"최종 판단: {final_decision}\n"
+        f"기준 메모: {rule_memo}"
+    )
+
 def _price_at_drawdown_from_peak(peak_price, dd_level):
     v = safe_float(peak_price)
     if v is None:
@@ -1559,11 +1992,60 @@ def format_trade_tables(df):
     return out
 
 
-def render_trading_dashboard(df, per_df, risk_df, risk_label):
+def render_trading_dashboard(df, per_df, risk_df, risk_label, market, ticker, display_name, asset_rule_key, auto_rule_reason, start_date):
     snap = build_trading_snapshot(df, per_df, risk_df, risk_label)
     st.markdown("## 4. 매매 체크포인트")
+
+    current_mdd_pct = (snap["dd"] or 0) * 100
+    mdd_info = get_mdd_action(current_mdd_pct, asset_rule_key)
+    auto_flags = compute_auto_correction_flags(df, risk_df, risk_label, market, start_date)
+
+    with st.expander("보정 조건 직접 확인 / 수정", expanded=False):
+        st.caption("자동으로 확인 가능한 것은 기본 반영했습니다. 외국인·연기금·EPS·금리처럼 앱이 직접 확인하지 못한 항목은 여기서 수동 보정하세요.")
+        if str(asset_rule_key).startswith("KR_") or str(market).startswith("KR"):
+            cc1, cc2 = st.columns(2)
+            auto_flags["foreign_spot_buy"] = cc1.checkbox("외국인 현물 순매수", value=auto_flags.get("foreign_spot_buy", False))
+            auto_flags["foreign_futures_buy"] = cc1.checkbox("외국인 선물 순매수", value=auto_flags.get("foreign_futures_buy", False))
+            auto_flags["pension_heavy_sell"] = cc2.checkbox("연기금 대규모 순매도", value=auto_flags.get("pension_heavy_sell", False))
+            auto_flags["foreign_double_sell"] = cc2.checkbox("외국인 현물·선물 동반 매도", value=auto_flags.get("foreign_double_sell", False))
+            st.caption(auto_flags.get("fx_note", ""))
+        else:
+            cc1, cc2 = st.columns(2)
+            auto_flags["rate_stable"] = cc1.checkbox("금리 안정 또는 하락", value=auto_flags.get("rate_stable", False))
+            auto_flags["eps_stable"] = cc1.checkbox("EPS 전망 유지/상향", value=auto_flags.get("eps_stable", False))
+            auto_flags["rate_spike"] = cc2.checkbox("금리 급등", value=auto_flags.get("rate_spike", False))
+            auto_flags["eps_down"] = cc2.checkbox("EPS 하향", value=auto_flags.get("eps_down", False))
+
+    signal_score, score_df = correction_score_details(asset_rule_key, market, auto_flags)
+    final_decision = final_buy_decision(mdd_info["stage"], signal_score)
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("최종 판단", final_decision)
+    c2.metric("MDD 단계", mdd_info["stage"])
+    c3.metric("보정 점수", f"{signal_score:+d}점")
+    c4.metric("RSI", fmt_num(snap["rsi"]))
+    c5.metric("거래량비율", fmt_num(snap["volr"]))
+
+    if "금지" in final_decision or "보류" in final_decision:
+        st.warning(make_mdd_comment(mdd_info["asset_label"], current_mdd_pct, mdd_info["stage"], signal_score, final_decision, mdd_info["rule"].get("memo", "")))
+    elif "가능" in final_decision or "분할" in final_decision:
+        st.success(make_mdd_comment(mdd_info["asset_label"], current_mdd_pct, mdd_info["stage"], signal_score, final_decision, mdd_info["rule"].get("memo", "")))
+    else:
+        st.info(make_mdd_comment(mdd_info["asset_label"], current_mdd_pct, mdd_info["stage"], signal_score, final_decision, mdd_info["rule"].get("memo", "")))
+
+    st.caption(f"자산 유형 분류: {asset_rule_label(asset_rule_key)} / 근거: {auto_rule_reason}")
+
+    st.markdown("### 자산 유형별 MDD 기준표")
+    st.dataframe(build_asset_mdd_rule_table(asset_rule_key), use_container_width=True, hide_index=True)
+
+    with st.expander("보정 점수 상세"):
+        st.dataframe(score_df, use_container_width=True, hide_index=True)
+        st.write("- 미국: VIX, MA20 회복, 주도주 흐름, 금리/EPS 수동 보정을 반영합니다.")
+        st.write("- 한국: 원/달러, 거래대금, 윗꼬리, 외국인/연기금 수동 보정을 반영합니다.")
+
+    st.markdown("### 기존 가격·MDD·PER 체크")
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("행동 판단", snap["action"])
+    c1.metric("기존 행동 판단", snap["action"])
     c2.metric("현재 MDD", fmt_pct_ratio(snap["dd"]))
     c3.metric("RSI", fmt_num(snap["rsi"]))
     c4.metric("거래량비율", fmt_num(snap["volr"]))
@@ -1602,14 +2084,14 @@ with c1:
     user_input = st.text_input(
         "종목명 / 종목코드 / 미국 티커",
         key="ticker_input",
-        placeholder="예: NVDA, 005930, 삼성전자, KOSPI, KOSDAQ, NASDAQ, S&P500, SOX",
+        placeholder="예: NVDA, 005930, 0174B0, 삼성전자, KOSPI, NASDAQ, SOX",
         help="개별주/ETF는 물론 KOSPI·KOSDAQ·NASDAQ·S&P500·SOX 같은 지수도 입력 가능합니다."
     )
     st.button("입력 초기화", on_click=_clear_ticker_input)
 with c2:
     start_date = st.date_input("기준 시작일", pd.to_datetime("2024-01-01"))
 with c3:
-    asset_type = st.selectbox("종목 유형", ["일반 주식/ETF", "시장지수", "나스닥형 ETF", "반도체/메모리 ETF", "전력/인프라 ETF", "우주/소형 테마"])
+    asset_rule_choice = st.selectbox("자산 유형 보정", asset_rule_options(), format_func=asset_rule_label, help="기본은 자동 분류입니다. 잘못 잡히면 직접 선택하세요.")
 
 try:
     dart_secret = st.secrets.get("DART_API_KEY", "")
@@ -1623,17 +2105,28 @@ with st.expander("지원하는 시장지수 입력 예시", expanded=False):
     st.write("- 한국: KOSPI / 코스피 / KS11, KOSDAQ / 코스닥 / KQ11")
     st.write("- 미국: NASDAQ / 나스닥 / ^IXIC, S&P500 / SP500 / ^GSPC, SOX / 필라델피아반도체 / ^SOX, DOW / ^DJI, Russell2000 / ^RUT")
 
+with st.expander("자산 유형별 MDD 기준 설명", expanded=False):
+    st.write("- MDD 매수 기준은 자산 유형별로 다르게 적용합니다.")
+    st.write("- 미국 대표지수는 -7~-10%부터 1차 분할 관심이 가능하지만, AI·반도체·메모리·전력 같은 테마 ETF는 -12~-15% 이상 조정과 주도주 확인이 필요합니다.")
+    st.write("- 한국 자산은 MDD만으로 판단하지 않습니다. 외국인 현물·선물, 원/달러, 거래대금, 연기금 매도 여부를 함께 확인합니다.")
+    st.write("- 최종 판단은 MDD 구간 + 시장 보정 점수로 산출합니다. Buy Score 계산 자체는 변경하지 않습니다.")
+
 run = st.button("분석 실행")
 
 if run:
     if not str(user_input).strip():
-        st.error("종목명/코드/티커를 입력하세요. 예: NVDA, 005930, 삼성전자")
+        st.error("종목명/코드/티커를 입력하세요. 예: NVDA, 005930, 0174B0, 삼성전자")
         st.stop()
 
     market, ticker, display_name = find_ticker(user_input)
     if ticker is None:
-        st.error("종목을 찾지 못했습니다. 예: 삼성전자, 005930, NVDA")
+        st.error("종목을 찾지 못했습니다. 예: 삼성전자, 005930, 0174B0, NVDA")
         st.stop()
+
+    auto_rule_key, auto_rule_reason = auto_classify_asset(market, ticker, display_name)
+    selected_asset_rule_key = auto_rule_key if asset_rule_choice == "AUTO" else asset_rule_choice
+    if asset_rule_choice != "AUTO":
+        auto_rule_reason = "사용자 직접 선택"
 
     price_df, price_status = load_price_data(market, ticker, start_date)
     if price_df.empty:
@@ -1735,7 +2228,7 @@ if run:
         st.info("지수 차트는 가격·MDD·시장위험·이평선을 봅니다. PER선은 지수 분석에서 제외합니다.")
     else:
         st.info("차트는 주가·PER·MDD·시장위험만 봅니다. 빨간 실선은 actual P/E, 빨간 점선은 proxy P/E입니다. 실제 판단은 actual P/E를 우선합니다.")
-    fig, chart_df = plot_core_chart(df, per_df, risk_df, risk_label, ticker)
+    fig, chart_df = plot_core_chart(df, per_df, risk_df, risk_label, ticker, selected_asset_rule_key)
     render_chart(fig)
 
     if market not in ["US_INDEX", "KR_INDEX"]:
@@ -1753,7 +2246,7 @@ if run:
     for msg in comments:
         st.write(f"- {msg}")
 
-    render_trading_dashboard(df, per_df, risk_df, risk_label)
+    render_trading_dashboard(df, per_df, risk_df, risk_label, market, ticker, display_name, selected_asset_rule_key, auto_rule_reason, start_date)
 
     with st.expander("PER 원자료 / 상태"):
         st.write(f"Current valuation status: {val_status}")
