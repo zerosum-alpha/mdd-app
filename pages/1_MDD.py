@@ -86,7 +86,7 @@ require_login()
 logout_button()
 
 st.title("📈 MDD 저점매수 분석기 | Trading Final")
-st.caption("기본 종목 없음 · 기준 시작일 2024/01/01 · 자산유형별 MDD 기준 · 주가/PER/MDD/시장위험/이평선/매매 체크포인트 중심")
+st.caption("기본 종목 없음 · 기준 시작일 2024/01/01 · 자산유형별 MDD 기준 · 국내상장 해외 ETF 기초자산 분류 · 주가/PER/MDD/시장위험/이평선/매매 체크포인트 중심")
 
 # =========================================================
 # Utilities
@@ -832,8 +832,9 @@ def dart_kr_ttm_pe_series(code, price_df, start_date, end_date, api_key):
 # =========================================================
 # Market risk
 # =========================================================
-def market_risk_series(market, ticker, start_date):
-    if market in ["US", "US_INDEX"]:
+def market_risk_series(market, ticker, start_date, asset_rule_key=None):
+    # 국내상장 해외 ETF라도 자산 룰이 US_*이면 VIX를 시장위험 기준으로 사용한다.
+    if str(asset_rule_key).startswith("US_") or market in ["US", "US_INDEX"]:
         vix = load_us_close("^VIX", start_date)
         if not vix.empty:
             return vix.rename(columns={"^VIX": "Risk"}), "VIX"
@@ -1398,8 +1399,8 @@ ASSET_RULES = {
         "memo": "성장주 비중이 높아 S&P500보다 한 단계 깊은 조정 기준 적용"
     },
     "US_AI_THEME": {
-        "label": "미국 AI 테마 ETF/종목군",
-        "mdd_levels": [-7, -10, -15, -20, -25],
+        "label": "미국 AI·성장 테마 ETF",
+        "mdd_levels": [-7, -10, -12, -15, -20],
         "actions": ["관찰", "대기", "1차 매수", "2차 매수", "적극 매수", "과매도 확인"],
         "memo": "AI 테마는 주도주 유지와 EPS 상향 여부를 같이 확인"
     },
@@ -1416,8 +1417,8 @@ ASSET_RULES = {
         "memo": "메모리/HBM은 사이클 변동성이 커서 -15% 이상부터 의미 있는 1차권"
     },
     "US_POWER_INFRA": {
-        "label": "미국 전력·AI 인프라 종목군",
-        "mdd_levels": [-7, -10, -15, -20, -25],
+        "label": "미국 전력·AI 인프라 ETF",
+        "mdd_levels": [-7, -10, -12, -18, -20],
         "actions": ["관찰", "대기", "1차 매수", "2차 매수", "적극 매수", "수주/실적 점검"],
         "memo": "데이터센터 전력·냉각·변압기 수요 지속 여부 확인"
     },
@@ -1439,17 +1440,59 @@ ASSET_RULES = {
         "actions": ["관찰", "대기", "조건부 1차", "2차 매수", "적극 매수", "거래대금 확인"],
         "memo": "코스닥은 변동성이 커서 거래대금 회복 전까지 보수적으로 판단"
     },
+    "KR_SEMICON_LARGE": {
+        "label": "한국 반도체 대형 ETF/종목군",
+        "mdd_levels": [-5, -8, -10, -15, -20],
+        "actions": ["관찰", "대기", "조건부 1차", "2차 매수", "적극 매수", "외국인 흡수 확인"],
+        "memo": "국내 반도체 대형주는 -10% 전후부터 조건부 1차권. 외국인 흡수와 SOXX/메모리 본주 흐름 확인"
+    },
     "KR_SEMICON_EQUIP": {
-        "label": "한국 반도체 대형·소부장·장비 ETF/종목군",
+        "label": "한국 반도체 소부장·장비 ETF/종목군",
         "mdd_levels": [-8, -12, -15, -20, -25],
         "actions": ["관찰", "대기", "조건부 1차", "2차 매수", "적극 매수", "거래대금 확인"],
-        "memo": "반도체는 외국인 흡수와 거래대금 유지 여부가 핵심"
+        "memo": "소부장·장비는 대형 반도체보다 변동성이 커서 -12~-15% 이상과 거래대금 유지가 필요"
+    },
+    "KR_BATTERY": {
+        "label": "한국 2차전지 ETF/종목군",
+        "mdd_levels": [-10, -15, -25, -35, -45],
+        "actions": ["관찰", "대기", "조건부 1차", "2차 매수", "적극 매수", "실적 턴 확인"],
+        "memo": "2차전지는 사이클·실적 변동성이 커서 -15% 이상부터 1차권. 실적 턴 확인 전 추격 금지"
+    },
+    "KR_POWER": {
+        "label": "한국 전력기기 ETF/종목군",
+        "mdd_levels": [-7, -12, -18, -25, -35],
+        "actions": ["관찰", "대기", "조건부 1차", "2차 매수", "적극 매수", "수주/실적 확인"],
+        "memo": "전력기기는 수주·실적 유지가 전제. -12% 이상부터 조건부 접근"
+    },
+    "KR_BIO": {
+        "label": "한국 바이오 ETF/종목군",
+        "mdd_levels": [-10, -15, -25, -35, -45],
+        "actions": ["관찰", "대기", "조건부 1차", "2차 매수", "적극 매수", "임상/이벤트 확인"],
+        "memo": "바이오는 이벤트 리스크가 커서 MDD만으로 매수 금지. 임상·허가·수급 확인 필요"
+    },
+    "KR_GROWTH": {
+        "label": "한국 코스닥 성장 ETF/종목군",
+        "mdd_levels": [-7, -15, -20, -25, -30],
+        "actions": ["관찰", "대기", "조건부 1차", "2차 매수", "적극 매수", "위험선호 회복 확인"],
+        "memo": "코스닥 성장주는 위험선호 회복과 거래대금 증가가 전제"
     },
     "KR_THEME_HIGH_BETA": {
         "label": "한국 고변동 테마 ETF/종목군",
         "mdd_levels": [-10, -15, -20, -25, -35],
         "actions": ["관찰", "대기", "조건부 1차", "2차 매수", "적극 매수", "테마 생존 확인"],
-        "memo": "2차전지·바이오·고성장 테마는 더 깊은 MDD와 거래대금 회복 필요"
+        "memo": "로봇·우주 등 고변동 테마는 더 깊은 MDD와 거래대금 회복 필요"
+    },
+    "US_INDIVIDUAL": {
+        "label": "미국 개별주",
+        "mdd_levels": [-8, -12, -18, -25, -35],
+        "actions": ["관찰", "대기", "1차 매수", "2차 매수", "적극 매수", "실적/가이던스 확인"],
+        "memo": "개별주는 ETF보다 보수적으로 판단. 실적·가이던스·밸류에이션 확인 필요"
+    },
+    "KR_INDIVIDUAL": {
+        "label": "한국 개별주",
+        "mdd_levels": [-8, -12, -18, -25, -35],
+        "actions": ["관찰", "대기", "조건부 1차", "2차 매수", "적극 매수", "공시/수급 확인"],
+        "memo": "한국 개별주는 공시·수급·거래대금 리스크가 ETF보다 크므로 조건부 판단"
     },
 }
 
@@ -1463,8 +1506,20 @@ VALUECHAIN_TICKERS = {"GOOGL", "GOOG", "TSLA", "MSFT", "AMZN", "ORCL", "DELL", "
 
 KR_KOSPI_ETF_CODES = {"069500", "102110", "152100", "278530", "226490", "360750", "379810", "367380", "381180"}
 KR_KOSDAQ_ETF_CODES = {"229200", "233740", "251340", "364960", "376250"}
-KR_SEMICON_CODES = {"005930", "000660", "042700", "039030", "058470", "108320", "240810", "036930", "403870", "471990", "396500", "091160", "395160", "0174B0", "487130"}
-KR_HIGH_BETA_CODES = {"373220", "006400", "066970", "247540", "086520", "068270", "207940", "277810", "108490", "491010", "483320", "483340", "457480", "465580"}
+KR_SEMICON_LARGE_CODES = {"005930", "000660", "091160", "395160"}
+KR_SEMICON_EQUIP_CODES = {"042700", "039030", "058470", "108320", "240810", "036930", "403870", "471990", "396500", "487130"}
+KR_BATTERY_CODES = {"373220", "006400", "066970", "247540"}
+KR_POWER_CODES = {"010120", "267260", "272210", "103590", "491010"}
+KR_BIO_CODES = {"068270", "207940"}
+KR_GROWTH_CODES = {"229200", "233740", "251340", "364960", "376250"}
+KR_HIGH_BETA_CODES = {"277810", "108490"}
+
+# 국내상장 해외 ETF는 상장시장이 KR이어도 기초자산 기준 MDD 룰을 우선 적용한다.
+KR_LISTED_US_NASDAQ_CODES = {"379810", "360750", "367380", "381180"}
+KR_LISTED_US_AI_CODES = {"465580"}
+KR_LISTED_US_MEMORY_CODES = {"0174B0"}
+KR_LISTED_US_POWER_CODES = {"491010"}
+KR_LISTED_US_VALUECHAIN_CODES = {"483320", "483340", "457480", "0051A0"}
 
 
 def asset_rule_options():
@@ -1519,20 +1574,41 @@ def auto_classify_asset(market, ticker, display_name=""):
             return "US_POWER_INFRA", "전력/AI 인프라 유니버스"
         if t in VALUECHAIN_TICKERS:
             return "US_VALUECHAIN", "빅테크 밸류체인 유니버스"
-        if t in AI_THEME_TICKERS or any(k in name for k in ["AI", "ROBOT", "ROBO", "BOTZ"]):
-            return "US_AI_THEME", "AI/로봇 테마명 매핑"
-        return "US_AI_THEME", "미국 개별주/ETF 기본 고성장 보정"
+        if t in AI_THEME_TICKERS or any(k in name for k in ["AI", "ROBOT", "ROBO", "BOTZ", "CLOUD", "BIGTECH", "GROWTH"]):
+            return "US_AI_THEME", "AI/성장 테마명 매핑"
+        return "US_INDIVIDUAL", "미국 개별주 기본값"
 
-    # KR stocks and ETFs
+    # KR stocks and ETFs. 국내상장 해외 ETF는 먼저 기초자산 기준으로 분류한다.
+    if code in KR_LISTED_US_NASDAQ_CODES or any(k in name_kr for k in ["미국나스닥", "나스닥100", "NASDAQ100", "나스닥성장"]):
+        return "US_NASDAQ100", "국내상장 미국 나스닥/성장 ETF: 기초자산 기준"
+    if code in KR_LISTED_US_MEMORY_CODES or any(k in name_kr for k in ["글로벌AI메모리", "글로벌 AI 메모리", "HBM", "글로벌메모리", "메모리반도체"]):
+        return "US_MEMORY_HBM", "국내상장 글로벌 메모리/HBM ETF: 기초자산 기준"
+    if code in KR_LISTED_US_POWER_CODES or any(k in name_kr for k in ["글로벌AI전력", "글로벌 AI 전력", "AI전력인프라", "AI 전력인프라"]):
+        return "US_POWER_INFRA", "국내상장 글로벌 전력·AI 인프라 ETF: 기초자산 기준"
+    if code in KR_LISTED_US_VALUECHAIN_CODES or any(k in name_kr for k in ["엔비디아밸류체인", "구글밸류체인", "테슬라밸류체인", "브로드컴밸류체인", "밸류체인액티브"]):
+        return "US_VALUECHAIN", "국내상장 미국 밸류체인 ETF: 기초자산 기준"
+    if code in KR_LISTED_US_AI_CODES or any(k in name_kr for k in ["글로벌AI인공지능", "글로벌 AI", "미국빅테크", "빅테크TOP"]):
+        return "US_AI_THEME", "국내상장 미국/글로벌 AI ETF: 기초자산 기준"
+
     if code in KR_KOSPI_ETF_CODES or any(k in name_kr for k in ["KOSPI", "코스피", "200", "대형"]):
         return "KR_KOSPI", "한국 대형 ETF/이름 매핑"
     if code in KR_KOSDAQ_ETF_CODES or any(k in name_kr for k in ["KOSDAQ", "코스닥"]):
         return "KR_KOSDAQ", "한국 코스닥 ETF/이름 매핑"
-    if code in KR_SEMICON_CODES or any(k in name_kr for k in ["반도체", "메모리", "HBM", "하이닉스", "삼성전자", "소부장", "장비"]):
-        return "KR_SEMICON_EQUIP", "한국 반도체/소부장 매핑"
-    if code in KR_HIGH_BETA_CODES or any(k in name_kr for k in ["2차전지", "바이오", "전력", "AI", "로봇", "밸류체인", "성장"]):
+    if code in KR_SEMICON_LARGE_CODES or any(k in name_kr for k in ["삼성전자", "하이닉스", "반도체대형", "반도체 대형"]):
+        return "KR_SEMICON_LARGE", "한국 반도체 대형 매핑"
+    if code in KR_SEMICON_EQUIP_CODES or any(k in name_kr for k in ["소부장", "장비", "AI인프라", "반도체핵심장비"]):
+        return "KR_SEMICON_EQUIP", "한국 반도체 소부장/장비 매핑"
+    if code in KR_BATTERY_CODES or any(k in name_kr for k in ["2차전지", "배터리", "양극재"]):
+        return "KR_BATTERY", "한국 2차전지 매핑"
+    if code in KR_POWER_CODES or any(k in name_kr for k in ["전력기기", "전력", "변압기", "전선"]):
+        return "KR_POWER", "한국 전력기기 매핑"
+    if code in KR_BIO_CODES or any(k in name_kr for k in ["바이오", "헬스케어", "임상"]):
+        return "KR_BIO", "한국 바이오 매핑"
+    if code in KR_GROWTH_CODES or any(k in name_kr for k in ["성장", "코스닥성장"]):
+        return "KR_GROWTH", "한국 성장 ETF 매핑"
+    if code in KR_HIGH_BETA_CODES or any(k in name_kr for k in ["로봇", "우주"]):
         return "KR_THEME_HIGH_BETA", "한국 고변동 테마 매핑"
-    return "KR_KOSPI", "한국 개별주 기본값"
+    return "KR_INDIVIDUAL", "한국 개별주 기본값"
 
 
 def get_mdd_action(mdd_pct, asset_type):
@@ -1721,7 +1797,7 @@ def compute_auto_correction_flags(df, risk_df, risk_label, market, start_date):
 
 def correction_score_details(asset_rule_key, market, flags):
     rows = []
-    if str(asset_rule_key).startswith("KR_") or str(market).startswith("KR"):
+    if str(asset_rule_key).startswith("KR_"):
         mapping = [
             ("외국인 현물 순매수", "foreign_spot_buy", 2),
             ("외국인 선물 순매수", "foreign_futures_buy", 1),
@@ -2002,7 +2078,7 @@ def render_trading_dashboard(df, per_df, risk_df, risk_label, market, ticker, di
 
     with st.expander("보정 조건 직접 확인 / 수정", expanded=False):
         st.caption("자동으로 확인 가능한 것은 기본 반영했습니다. 외국인·연기금·EPS·금리처럼 앱이 직접 확인하지 못한 항목은 여기서 수동 보정하세요.")
-        if str(asset_rule_key).startswith("KR_") or str(market).startswith("KR"):
+        if str(asset_rule_key).startswith("KR_"):
             cc1, cc2 = st.columns(2)
             auto_flags["foreign_spot_buy"] = cc1.checkbox("외국인 현물 순매수", value=auto_flags.get("foreign_spot_buy", False))
             auto_flags["foreign_futures_buy"] = cc1.checkbox("외국인 선물 순매수", value=auto_flags.get("foreign_futures_buy", False))
@@ -2178,7 +2254,7 @@ if run:
         per_df = merge_actual_and_proxy_per(actual_per_df, proxy_df)
         per_status = f"Actual: {actual_per_status} / DART: {dart_status} / Proxy: {proxy_status}"
 
-    risk_df, risk_label = market_risk_series(market, ticker, start_date)
+    risk_df, risk_label = market_risk_series(market, ticker, start_date, selected_asset_rule_key)
 
     st.subheader(f"분석 대상: {display_name} / {ticker} / {market}")
     if market in ["US_INDEX", "KR_INDEX"]:
