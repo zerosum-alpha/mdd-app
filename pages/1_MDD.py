@@ -13,6 +13,22 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 
+
+def render_chart(fig):
+    """Render matplotlib chart safely.
+    Do not change calculation or plot logic; only handle Streamlit versions.
+    """
+    try:
+        st.pyplot(fig, use_container_width=True)
+    except TypeError:
+        st.pyplot(fig)
+    finally:
+        try:
+            plt.close(fig)
+        except Exception:
+            pass
+
+
 try:
     import yfinance as yf
     YF_OK = True
@@ -65,12 +81,12 @@ except Exception:
 # =========================================================
 # Page
 # =========================================================
-st.set_page_config(page_title="MDD 핵심 분석기", layout="wide")
+st.set_page_config(page_title="MDD 저점매수 분석기 FINAL", layout="wide")
 require_login()
 logout_button()
 
-st.title("📈 MDD 저점매수 분석기 | Core Practical")
-st.caption("주가 / PER / MDD / 시장위험 / 이평선만 표시합니다. 미국·한국 PER은 Actual과 Proxy를 구분 표시합니다.")
+st.title("📈 MDD 저점매수 분석기 | Trading Final")
+st.caption("기본 종목 없음 · 기준 시작일 2024/01/01 · 주가/PER/MDD/시장위험/이평선/매매 체크포인트 중심")
 
 # =========================================================
 # Utilities
@@ -764,76 +780,75 @@ def market_risk_series(market, ticker, start_date):
 # Chart and comment
 # =========================================================
 def plot_core_chart(df, per_df, risk_df, risk_label, ticker):
-    """Core chart with robust PER plotting.
+    """Core chart with full PER visibility.
 
-    Fix point:
-    - If PER_PROXY exists, it is not just shown in the raw table. It is merged into the chart by date and plotted.
-    - Date matching uses normalized dates + merge_asof, so Date column / index / monthly sparse data all work.
-    - Actual PER and Proxy PER are clearly separated.
+    Rule:
+    - P/E actual is plotted where actual EPS/TTM data exists.
+    - P/E proxy(current EPS) is plotted across the full price range when available.
+    - If actual is partial, proxy is still visible; it is not suppressed.
     """
-
-    # ---- Base price chart ----
     chart = df[["Close", "MA20", "MA60", "MA200", "Current_Drawdown"]].copy()
     chart = chart.rename(columns={"Close": "Price", "Current_Drawdown": "DD"})
     chart.index = to_dt_index(chart.index).normalize()
     chart = chart[~chart.index.duplicated(keep="last")].sort_index()
     chart["_Date"] = chart.index
 
-    def _merge_series_by_date(base, source, col):
-        """Merge one numeric column from source into base by nearest previous date."""
+    def _merge_col(base, source, col):
         if source is None or source.empty or col not in source.columns:
             return base
-        p = source.copy()
-        if "Date" in p.columns:
-            p["_Date"] = to_dt_index(p["Date"]).normalize()
+        s = source.copy()
+        if "Date" in s.columns:
+            s["_Date"] = to_dt_index(s["Date"]).normalize()
         else:
-            p["_Date"] = to_dt_index(p.index).normalize()
-        p[col] = pd.to_numeric(p[col], errors="coerce")
-        p = p[["_Date", col]].dropna().sort_values("_Date")
-        p = p.drop_duplicates("_Date", keep="last")
-        if p.empty:
+            s["_Date"] = to_dt_index(s.index).normalize()
+        s[col] = pd.to_numeric(s[col], errors="coerce")
+        s = s[["_Date", col]].dropna().sort_values("_Date")
+        s = s.drop_duplicates("_Date", keep="last")
+        if s.empty:
             return base
-        left = base[["_Date"]].sort_values("_Date")
-        merged = pd.merge_asof(left, p, on="_Date", direction="backward")
-        base[col] = merged[col].to_numpy()
+        merged = pd.merge_asof(
+            base[["_Date"]].sort_values("_Date"),
+            s,
+            on="_Date",
+            direction="backward"
+        )
+        base[col] = pd.to_numeric(merged[col].to_numpy(), errors="coerce")
         return base
 
-    # ---- Merge PER data robustly ----
     if per_df is not None and not per_df.empty:
         p = per_df.copy()
         if "Date" in p.columns:
             p["_Date"] = to_dt_index(p["Date"]).normalize()
         else:
             p["_Date"] = to_dt_index(p.index).normalize()
-        for c in ["PER", "PER_PROXY", "EPS", "EPS_TTM", "EPS_PROXY"]:
-            if c in p.columns:
-                p[c] = pd.to_numeric(p[c], errors="coerce")
         for col in ["PER", "PER_PROXY", "EPS", "EPS_TTM", "EPS_PROXY"]:
             if col in p.columns:
-                chart = _merge_series_by_date(chart, p, col)
+                p[col] = pd.to_numeric(p[col], errors="coerce")
+                chart = _merge_col(chart, p, col)
 
     for col in ["PER", "PER_PROXY", "EPS", "EPS_TTM", "EPS_PROXY"]:
         if col not in chart.columns:
             chart[col] = np.nan
-        else:
-            chart[col] = pd.to_numeric(chart[col], errors="coerce")
+        chart[col] = pd.to_numeric(chart[col], errors="coerce")
 
-    # If EPS exists but no PER, calculate PER from price / EPS.
     if chart["PER"].dropna().empty:
         eps_col = None
-        if chart["EPS"].dropna().any():
+        if chart["EPS"].dropna().shape[0] > 0:
             eps_col = "EPS"
-        elif chart["EPS_TTM"].dropna().any():
+        elif chart["EPS_TTM"].dropna().shape[0] > 0:
             eps_col = "EPS_TTM"
         if eps_col:
             chart[eps_col] = chart[eps_col].ffill()
             chart["PER"] = chart["Price"] / chart[eps_col].replace(0, np.nan)
 
-    # Important: if actual PER is absent but PER_PROXY exists, make proxy the visible main PER line.
-    has_actual_per = not chart["PER"].dropna().empty
-    has_proxy_per = not chart["PER_PROXY"].dropna().empty
+    chart["PER"] = chart["PER"].where((chart["PER"] > 0) & (chart["PER"] < 500))
+    chart["PER_PROXY"] = chart["PER_PROXY"].where((chart["PER_PROXY"] > 0) & (chart["PER_PROXY"] < 500))
 
-    # ---- Merge market risk robustly ----
+    has_actual_per = chart["PER"].dropna().shape[0] > 0
+    has_proxy_per = chart["PER_PROXY"].dropna().shape[0] > 0
+    chart["PER_DISPLAY"] = chart["PER"].combine_first(chart["PER_PROXY"])
+    has_per_display = chart["PER_DISPLAY"].dropna().shape[0] > 0
+
     if risk_df is not None and not risk_df.empty and "Risk" in risk_df.columns:
         r = risk_df.copy()
         if "Date" in r.columns:
@@ -844,81 +859,77 @@ def plot_core_chart(df, per_df, risk_df, risk_label, ticker):
         r = r[["_Date", "Risk"]].dropna().sort_values("_Date").drop_duplicates("_Date", keep="last")
         if not r.empty:
             merged = pd.merge_asof(chart[["_Date"]].sort_values("_Date"), r, on="_Date", direction="backward")
-            chart["Risk"] = merged["Risk"].to_numpy()
+            chart["Risk"] = pd.to_numeric(merged["Risk"].to_numpy(), errors="coerce")
     if "Risk" not in chart.columns:
         chart["Risk"] = np.nan
 
-    # ---- Signals ----
     sig = build_signals(df).copy()
     if sig is not None and not sig.empty:
         sig.index = to_dt_index(sig.index).normalize()
         sig = sig[~sig.index.duplicated(keep="last")]
         chart = chart.join(sig[[c for c in ["Buy", "Cash"] if c in sig.columns]], how="left")
 
-    # ---- Draw chart ----
     fig, (ax1, ax3) = plt.subplots(
-        2, 1, figsize=(19, 10.5), sharex=True,
+        2, 1, figsize=(17.0, 9.6), sharex=True,
         gridspec_kw={"height_ratios": [3.2, 1.1]}
     )
 
-    # Price and moving averages
-    ax1.plot(chart.index, chart["Price"], color="#0057B8", linewidth=2.4, label="Price")
+    ax1.plot(chart.index, chart["Price"], color="#0057B8", linewidth=2.35, label="Price")
     ax1.plot(chart.index, chart["MA20"], color="#FF8C00", linewidth=1.35, label="MA20")
     ax1.plot(chart.index, chart["MA60"], color="#228B22", linewidth=1.35, label="MA60")
     ax1.plot(chart.index, chart["MA200"], color="#7B2CBF", linewidth=1.35, label="MA200")
 
     if "Buy" in chart.columns and chart["Buy"].notna().any():
-        ax1.scatter(chart.index, chart["Buy"] * 0.975, color="#008000", marker="^", s=90, label="BUY candidate", zorder=5)
+        ax1.scatter(chart.index, chart["Buy"] * 0.975, color="#008000", marker="^", s=74, label="BUY candidate", zorder=5)
     if "Cash" in chart.columns and chart["Cash"].notna().any():
-        ax1.scatter(chart.index, chart["Cash"] * 1.025, color="#FF0000", marker="v", s=90, label="Cash / overheat", zorder=5)
+        ax1.scatter(chart.index, chart["Cash"] * 1.025, color="#FF0000", marker="v", s=74, label="Cash / overheat", zorder=5)
 
     ax1.set_ylabel("Price", color="#0057B8")
     ax1.tick_params(axis="y", labelcolor="#0057B8")
     ax1.grid(True, linestyle=":", alpha=0.35)
 
-    # PER axis
     ax2 = ax1.twinx()
     per_lines = []
+
+    # Make proxy visible whenever it exists. Do not suppress it because actual exists.
+    if has_proxy_per:
+        ax2.plot(chart.index, chart["PER_PROXY"], color="#D62728", linewidth=1.85, linestyle="--", alpha=0.78, label="P/E proxy(current EPS)")
+        per_lines.append(chart["PER_PROXY"])
     if has_actual_per:
-        if has_proxy_per:
-            ln = ax2.plot(chart.index, chart["PER_PROXY"], color="#D62728", linewidth=1.15, linestyle=":", alpha=0.6, label="P/E proxy(current EPS)")
-            per_lines.append(chart["PER_PROXY"])
-        ax2.plot(chart.index, chart["PER"], color="#D62728", linewidth=2.25, linestyle="-", label="P/E actual")
+        ax2.plot(chart.index, chart["PER"], color="#D62728", linewidth=2.55, linestyle="-", alpha=0.98, label="P/E actual")
         per_lines.append(chart["PER"])
         per_avg = chart["PER"].dropna().mean()
         if pd.notna(per_avg):
-            ax2.axhline(per_avg, color="#D62728", linewidth=1.0, linestyle="--", alpha=0.35, label="P/E actual avg")
+            ax2.axhline(per_avg, color="#D62728", linewidth=1.0, linestyle=":", alpha=0.45, label="P/E actual avg")
     elif has_proxy_per:
-        # Main fix for KR: proxy is promoted to visible P/E line.
-        ax2.plot(chart.index, chart["PER_PROXY"], color="#D62728", linewidth=2.25, linestyle="-", alpha=0.98, label="P/E proxy(current EPS)")
-        per_lines.append(chart["PER_PROXY"])
         proxy_avg = chart["PER_PROXY"].dropna().mean()
         if pd.notna(proxy_avg):
-            ax2.axhline(proxy_avg, color="#D62728", linewidth=1.0, linestyle="--", alpha=0.35, label="P/E proxy avg")
+            ax2.axhline(proxy_avg, color="#D62728", linewidth=1.0, linestyle=":", alpha=0.45, label="P/E proxy avg")
+    elif has_per_display:
+        ax2.plot(chart.index, chart["PER_DISPLAY"], color="#D62728", linewidth=2.25, linestyle="-", alpha=0.98, label="P/E display")
+        per_lines.append(chart["PER_DISPLAY"])
     else:
         ax2.text(0.99, 0.95, "P/E line: N/A", transform=ax2.transAxes, ha="right", va="top", color="#D62728")
 
-    # Keep PER axis readable; do not let outliers flatten the visible line.
     if per_lines:
-        vals = pd.concat([x.dropna() for x in per_lines if x is not None and not x.dropna().empty])
+        vals = pd.concat([s.dropna() for s in per_lines if s is not None and not s.dropna().empty])
         vals = vals[(vals > 0) & (vals < 500)]
         if not vals.empty:
-            q05, q95 = vals.quantile([0.05, 0.95])
-            span = max(q95 - q05, 1)
-            ax2.set_ylim(max(0, q05 - span * 0.35), q95 + span * 0.35)
+            q03, q97 = vals.quantile([0.03, 0.97])
+            span = max(float(q97 - q03), 1.0)
+            ax2.set_ylim(max(0, q03 - span * 0.25), q97 + span * 0.25)
 
     ax2.set_ylabel("P/E", color="#D62728")
     ax2.tick_params(axis="y", labelcolor="#D62728")
 
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left", fontsize=8)
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left", fontsize=7)
     ax1.set_title(f"{ticker} Price + P/E + MDD + Market Risk", fontweight="bold")
 
-    # Lower: MDD + market risk
-    ax3.plot(chart.index, chart["DD"] * 100, color="#8B0000", linewidth=1.7, label="Current DD")
-    for level, label in [(-8, "Watch -8%"), (-12, "Buy zone -12%"), (-15, "Deep -15%"), (-20, "Risk -20%")]:
-        ax3.axhline(level, color="#5DADE2", linestyle="--", linewidth=0.9, alpha=0.55, label=label)
+    ax3.plot(chart.index, chart["DD"] * 100, color="#8B0000", linewidth=1.6, label="Current DD")
+    for y, name in [(-8, "Watch -8%"), (-12, "Buy zone -12%"), (-15, "Deep -15%"), (-20, "Risk -20%")]:
+        ax3.axhline(y, color="#9ED0FF", linestyle="--", linewidth=0.85, alpha=0.8, label=name)
     ax3.set_ylabel("MDD (%)", color="#8B0000")
     ax3.tick_params(axis="y", labelcolor="#8B0000")
     ax3.grid(True, linestyle=":", alpha=0.35)
@@ -937,9 +948,156 @@ def plot_core_chart(df, per_df, risk_df, risk_label, ticker):
     lines4, labels4 = ax4.get_legend_handles_labels()
     ax3.legend(lines3 + lines4, labels3 + labels4, loc="lower left", fontsize=7)
 
-    # Wider right margin prevents clipping.
-    fig.subplots_adjust(left=0.06, right=0.90, top=0.93, bottom=0.08, hspace=0.08)
+    fig.subplots_adjust(left=0.065, right=0.885, top=0.93, bottom=0.085, hspace=0.08)
     return fig, chart
+
+
+def build_per_display_chart_df(price_df, per_df):
+    """Create dedicated Price + P/E display frame.
+
+    Returns a frame where actual P/E and proxy P/E are both merged across the full
+    selected price range. Proxy is not suppressed when actual exists.
+    """
+    if price_df is None or price_df.empty:
+        return pd.DataFrame(), "가격 데이터 없음"
+
+    base = price_df[["Close"]].copy().rename(columns={"Close": "Price"})
+    base.index = to_dt_index(base.index).normalize()
+    base = base[~base.index.duplicated(keep="last")].sort_index()
+    base["_Date"] = base.index
+    base["PER_ACTUAL"] = np.nan
+    base["PER_PROXY_VIEW"] = np.nan
+
+    if per_df is None or per_df.empty:
+        return base, "PER 원자료 없음"
+
+    p = per_df.copy()
+    if "Date" in p.columns:
+        p["_Date"] = to_dt_index(p["Date"]).normalize()
+    else:
+        p["_Date"] = to_dt_index(p.index).normalize()
+
+    for col in ["PER", "PER_PROXY", "EPS", "EPS_TTM", "EPS_PROXY"]:
+        if col in p.columns:
+            p[col] = pd.to_numeric(p[col], errors="coerce")
+
+    def _merge_col(target_col, source_col):
+        if source_col not in p.columns:
+            return
+        src = p[["_Date", source_col]].dropna().sort_values("_Date")
+        src = src.drop_duplicates("_Date", keep="last")
+        if src.empty:
+            return
+        merged = pd.merge_asof(
+            base[["_Date"]].sort_values("_Date"),
+            src,
+            on="_Date",
+            direction="backward"
+        )
+        base[target_col] = pd.to_numeric(merged[source_col].to_numpy(), errors="coerce")
+
+    _merge_col("PER_ACTUAL", "PER")
+    _merge_col("PER_PROXY_VIEW", "PER_PROXY")
+    base["PER_ACTUAL"] = base["PER_ACTUAL"].where((base["PER_ACTUAL"] > 0) & (base["PER_ACTUAL"] < 500))
+    base["PER_PROXY_VIEW"] = base["PER_PROXY_VIEW"].where((base["PER_PROXY_VIEW"] > 0) & (base["PER_PROXY_VIEW"] < 500))
+    base["PER_DISPLAY"] = base["PER_ACTUAL"].combine_first(base["PER_PROXY_VIEW"])
+
+    has_actual = base["PER_ACTUAL"].dropna().shape[0] > 0
+    has_proxy = base["PER_PROXY_VIEW"].dropna().shape[0] > 0
+
+    if has_actual and has_proxy:
+        label = f"P/E actual {base['PER_ACTUAL'].dropna().shape[0]}pts + proxy {base['PER_PROXY_VIEW'].dropna().shape[0]}pts"
+    elif has_actual:
+        label = f"P/E actual only {base['PER_ACTUAL'].dropna().shape[0]}pts"
+    elif has_proxy:
+        label = f"P/E proxy only {base['PER_PROXY_VIEW'].dropna().shape[0]}pts"
+    else:
+        label = f"PER/PER_PROXY 없음. columns={list(per_df.columns)}"
+
+    return base, label
+
+
+def plot_dedicated_per_chart(price_df, per_df, ticker):
+    """Dedicated Price + P/E chart.
+
+    This chart is intentionally simple for debugging:
+    - Blue = price
+    - Red solid = actual P/E when available
+    - Red dashed = proxy P/E across the full period when available
+    """
+    chart, label = build_per_display_chart_df(price_df, per_df)
+    if chart.empty:
+        st.warning(f"PER 전용 차트 없음: {label}")
+        return
+
+    has_actual = chart["PER_ACTUAL"].dropna().shape[0] > 0
+    has_proxy = chart["PER_PROXY_VIEW"].dropna().shape[0] > 0
+
+    if not has_actual and not has_proxy:
+        st.warning(f"PER 전용 차트 없음: {label}")
+        return
+
+    fig, ax1 = plt.subplots(figsize=(14.5, 5.2))
+    ax1.plot(chart.index, chart["Price"], color="#0057B8", linewidth=2.1, label="Price")
+    ax1.set_ylabel("Price", color="#0057B8")
+    ax1.tick_params(axis="y", labelcolor="#0057B8")
+    ax1.grid(True, linestyle=":", alpha=0.35)
+
+    ax2 = ax1.twinx()
+    per_lines = []
+    if has_proxy:
+        ax2.plot(
+            chart.index,
+            chart["PER_PROXY_VIEW"],
+            color="#D62728",
+            linewidth=1.95,
+            linestyle="--",
+            alpha=0.82,
+            label="P/E proxy(current EPS)"
+        )
+        per_lines.append(chart["PER_PROXY_VIEW"])
+    if has_actual:
+        ax2.plot(
+            chart.index,
+            chart["PER_ACTUAL"],
+            color="#D62728",
+            linewidth=2.65,
+            linestyle="-",
+            alpha=0.98,
+            label="P/E actual"
+        )
+        per_lines.append(chart["PER_ACTUAL"])
+        per_avg = chart["PER_ACTUAL"].dropna().mean()
+        if pd.notna(per_avg):
+            ax2.axhline(per_avg, color="#D62728", linestyle=":", linewidth=1.0, alpha=0.45, label="P/E actual avg")
+    else:
+        proxy_avg = chart["PER_PROXY_VIEW"].dropna().mean()
+        if pd.notna(proxy_avg):
+            ax2.axhline(proxy_avg, color="#D62728", linestyle=":", linewidth=1.0, alpha=0.45, label="P/E proxy avg")
+
+    vals = pd.concat([s.dropna() for s in per_lines if s is not None and not s.dropna().empty]) if per_lines else pd.Series(dtype=float)
+    vals = vals[(vals > 0) & (vals < 500)]
+    if not vals.empty:
+        q03, q97 = vals.quantile([0.03, 0.97])
+        span = max(float(q97 - q03), 1.0)
+        ax2.set_ylim(max(0, q03 - span * 0.25), q97 + span * 0.25)
+
+    ax2.set_ylabel("P/E", color="#D62728")
+    ax2.tick_params(axis="y", labelcolor="#D62728")
+
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left", fontsize=8)
+    ax1.set_title(f"{ticker} Price + P/E display check", fontweight="bold")
+    fig.subplots_adjust(left=0.07, right=0.90, top=0.90, bottom=0.15)
+    render_chart(fig)
+
+    st.caption(
+        f"PER 전용 차트 기준: {label}. "
+        "빨간 실선은 실제 EPS 기반 PER, 빨간 점선은 현재 EPS 기준 proxy입니다. "
+        "실선이 중간부터 시작해도 점선은 전체 선택 기간에 보여야 정상입니다."
+    )
+
 
 def make_comment(df, per_df, risk_label, risk_df):
     latest = df.iloc[-1]
@@ -977,35 +1135,25 @@ def make_comment(df, per_df, risk_label, risk_df):
         else:
             msg.append(f"RSI: {rsi:.1f}. 중립권입니다.")
 
-    # PER 해석: 실제 PER과 proxy PER을 명확히 구분한다.
-    # - PER: pykrx 또는 DART EPS_TTM 기반. 실제 PER 방향 판단에 사용 가능.
-    # - PER_PROXY: 현재 EPS를 고정해 계산한 참고선. 실제 PER 변화 판단에는 사용 금지.
+    per_col = None
     if per_df is not None and not per_df.empty:
-        has_actual = "PER" in per_df.columns and pd.to_numeric(per_df["PER"], errors="coerce").dropna().shape[0] >= 20
-        has_proxy = "PER_PROXY" in per_df.columns and pd.to_numeric(per_df["PER_PROXY"], errors="coerce").dropna().shape[0] >= 20
+        if "PER" in per_df.columns and per_df["PER"].dropna().shape[0] >= 20:
+            per_col = "PER"
+        elif "PER_PROXY" in per_df.columns and per_df["PER_PROXY"].dropna().shape[0] >= 20:
+            per_col = "PER_PROXY"
 
-        if has_actual:
-            p = pd.to_numeric(per_df["PER"], errors="coerce").dropna()
-            n = min(60, len(p) - 1)
-            if n > 0:
-                chg = p.iloc[-1] / p.iloc[-n] - 1
-                if chg < -0.10:
-                    msg.append(f"PER actual: 최근 기준 {chg*100:.1f}% 하락. 실적 개선이 가격 상승을 일부 정당화하는 흐름입니다.")
-                elif chg > 0.10:
-                    msg.append(f"PER actual: 최근 기준 {chg*100:.1f}% 상승. 실제 밸류 부담 확대 구간입니다.")
-                else:
-                    msg.append(f"PER actual: 최근 기준 {chg*100:.1f}% 변화. 실제 밸류 방향성은 크지 않습니다.")
-        elif has_proxy:
-            p = pd.to_numeric(per_df["PER_PROXY"], errors="coerce").dropna()
-            n = min(60, len(p) - 1)
-            if n > 0:
-                chg = p.iloc[-1] / p.iloc[-n] - 1
-                msg.append(
-                    f"PER proxy: 최근 기준 {chg*100:.1f}% 변화. 현재 EPS 고정 기준 참고선입니다. "
-                    "실제 EPS 변화가 반영되지 않으므로 저평가 판단에는 사용하지 마세요."
-                )
-        else:
-            msg.append("PER: 실제 시계열은 제한적입니다. 현재 PER 카드와 가격/MDD를 우선 보세요.")
+    if per_col:
+        p = pd.to_numeric(per_df[per_col], errors="coerce").dropna()
+        n = min(60, len(p)-1)
+        if n > 0:
+            chg = p.iloc[-1] / p.iloc[-n] - 1
+            label = "PER" if per_col == "PER" else "PER proxy"
+            if chg < -0.10:
+                msg.append(f"{label}: 최근 기준 {chg*100:.1f}% 하락. 밸류 부담이 낮아진 흐름입니다.")
+            elif chg > 0.10:
+                msg.append(f"{label}: 최근 기준 {chg*100:.1f}% 상승. 밸류 부담 확대 구간입니다.")
+            else:
+                msg.append(f"{label}: 최근 기준 {chg*100:.1f}% 변화. 큰 방향성은 약합니다.")
     else:
         msg.append("PER: 실제 시계열은 제한적입니다. 현재 PER 카드와 가격/MDD를 우선 보세요.")
 
@@ -1032,14 +1180,258 @@ def make_comment(df, per_df, risk_label, risk_df):
 
     return final, msg
 
+
+# =========================================================
+# Trading helper tables
+# =========================================================
+def _price_at_drawdown_from_peak(peak_price, dd_level):
+    v = safe_float(peak_price)
+    if v is None:
+        return None
+    return v * (1 + dd_level)
+
+
+def build_trading_snapshot(df, per_df=None, risk_df=None, risk_label=""):
+    """Compact trading decision data. This does not change MDD/PER logic."""
+    latest = df.iloc[-1]
+    prev = df.iloc[-2] if len(df) >= 2 else latest
+    close = safe_float(latest.get("Close"))
+    peak = safe_float(latest.get("Peak"))
+    dd = safe_float(latest.get("Current_Drawdown"))
+    rsi = safe_float(latest.get("RSI"))
+    volr = safe_float(latest.get("Volume_Ratio"))
+    ma20 = safe_float(latest.get("MA20"))
+    ma60 = safe_float(latest.get("MA60"))
+    ma200 = safe_float(latest.get("MA200"))
+    day_chg = None
+    if safe_float(prev.get("Close")) not in (None, 0):
+        day_chg = close / safe_float(prev.get("Close")) - 1
+
+    ret_5 = ret_20 = None
+    try:
+        if len(df) >= 6:
+            ret_5 = close / float(df["Close"].iloc[-6]) - 1
+        if len(df) >= 21:
+            ret_20 = close / float(df["Close"].iloc[-21]) - 1
+    except Exception:
+        pass
+
+    actual_per = None
+    proxy_per = None
+    per_basis = "N/A"
+    per_change_60 = None
+    if per_df is not None and not per_df.empty:
+        pwork = per_df.copy()
+        if "PER" in pwork.columns and pd.to_numeric(pwork["PER"], errors="coerce").dropna().shape[0] >= 5:
+            s = pd.to_numeric(pwork["PER"], errors="coerce").dropna()
+            actual_per = safe_float(s.iloc[-1])
+            per_basis = "Actual"
+            n = min(60, len(s)-1)
+            if n > 0 and safe_float(s.iloc[-n]) not in (None, 0):
+                per_change_60 = actual_per / float(s.iloc[-n]) - 1
+        if "PER_PROXY" in pwork.columns and pd.to_numeric(pwork["PER_PROXY"], errors="coerce").dropna().shape[0] >= 5:
+            sp = pd.to_numeric(pwork["PER_PROXY"], errors="coerce").dropna()
+            proxy_per = safe_float(sp.iloc[-1])
+            if per_basis == "N/A":
+                per_basis = "Proxy"
+                n = min(60, len(sp)-1)
+                if n > 0 and safe_float(sp.iloc[-n]) not in (None, 0):
+                    per_change_60 = proxy_per / float(sp.iloc[-n]) - 1
+
+    risk_latest = None
+    if risk_df is not None and not risk_df.empty and "Risk" in risk_df.columns:
+        try:
+            risk_latest = safe_float(pd.to_numeric(risk_df["Risk"], errors="coerce").dropna().iloc[-1])
+        except Exception:
+            risk_latest = None
+
+    # Decision: reference only, not buy recommendation.
+    if close is None:
+        action = "판단 보류"
+        memo = "가격 데이터 없음"
+    elif dd is not None and dd <= -0.12 and rsi is not None and rsi <= 45 and close >= (ma200 or -np.inf):
+        action = "1차 소액 가능"
+        memo = "MDD가 깊고 RSI 과열이 아님. 단, MA20 회복 전에는 분할/소액 기준."
+    elif dd is not None and dd <= -0.12 and close < (ma20 or np.inf):
+        action = "눌림 대기"
+        memo = "낙폭은 있으나 MA20 아래. 반등 확인 전 추격 금지."
+    elif rsi is not None and rsi >= 68 and dd is not None and dd > -0.08:
+        action = "추격 금지"
+        memo = "낙폭은 얕고 RSI 과열권. 신규 진입 손익비 불리."
+    elif close < (ma60 or np.inf) and close < (ma20 or np.inf):
+        action = "대기"
+        memo = "단기·중기 추세가 모두 약함. 가격 안정 확인 필요."
+    else:
+        action = "관찰"
+        memo = "강한 신호는 아님. 가격·PER·MDD 조합 확인 필요."
+
+    return {
+        "close": close,
+        "peak": peak,
+        "dd": dd,
+        "rsi": rsi,
+        "volr": volr,
+        "ma20": ma20,
+        "ma60": ma60,
+        "ma200": ma200,
+        "day_chg": day_chg,
+        "ret_5": ret_5,
+        "ret_20": ret_20,
+        "actual_per": actual_per,
+        "proxy_per": proxy_per,
+        "per_basis": per_basis,
+        "per_change_60": per_change_60,
+        "risk_latest": risk_latest,
+        "risk_label": risk_label,
+        "action": action,
+        "memo": memo,
+    }
+
+
+def build_mdd_level_table(df):
+    latest = df.iloc[-1]
+    peak = safe_float(latest.get("Peak"))
+    close = safe_float(latest.get("Close"))
+    rows = []
+    for name, dd_level, meaning in [
+        ("관찰 -8%", -0.08, "급락 전 초기 관심선"),
+        ("1차 -12%", -0.12, "저점매수 후보 시작선"),
+        ("깊은 눌림 -15%", -0.15, "분할매수 후보선"),
+        ("위험 -20%", -0.20, "추세 훼손 확인선"),
+    ]:
+        price = _price_at_drawdown_from_peak(peak, dd_level)
+        gap = None if close in (None, 0) or price is None else price / close - 1
+        rows.append({
+            "구분": name,
+            "가격": price,
+            "현재가 대비": gap,
+            "의미": meaning,
+        })
+    return pd.DataFrame(rows)
+
+
+def build_trade_level_table(df):
+    latest = df.iloc[-1]
+    close = safe_float(latest.get("Close"))
+    ma20 = safe_float(latest.get("MA20"))
+    ma60 = safe_float(latest.get("MA60"))
+    ma200 = safe_float(latest.get("MA200"))
+    peak = safe_float(latest.get("Peak"))
+    dd12 = _price_at_drawdown_from_peak(peak, -0.12)
+    dd15 = _price_at_drawdown_from_peak(peak, -0.15)
+    rows = [
+        {"항목": "현재가", "가격": close, "판단": "기준 가격"},
+        {"항목": "MA20", "가격": ma20, "판단": "단기 반등/추세 확인선"},
+        {"항목": "MA60", "가격": ma60, "판단": "중기 추세 확인선"},
+        {"항목": "MA200", "가격": ma200, "판단": "장기 추세 훼손 여부"},
+        {"항목": "MDD -12%", "가격": dd12, "판단": "1차 눌림 후보"},
+        {"항목": "MDD -15%", "가격": dd15, "판단": "깊은 눌림 후보"},
+    ]
+    out = pd.DataFrame(rows)
+    if close not in (None, 0):
+        out["현재가 대비"] = out["가격"].apply(lambda x: None if safe_float(x) is None else safe_float(x) / close - 1)
+    else:
+        out["현재가 대비"] = None
+    return out
+
+
+def build_per_reference_table(df, per_df):
+    """PER reference table for quick trading context. No chart/band logic."""
+    rows = []
+    latest_price = safe_float(df["Close"].iloc[-1]) if df is not None and not df.empty else None
+    if per_df is None or per_df.empty:
+        return pd.DataFrame()
+    p = per_df.copy()
+    for col, label in [("PER", "Actual PER"), ("PER_PROXY", "Proxy PER")]:
+        if col not in p.columns:
+            continue
+        s = pd.to_numeric(p[col], errors="coerce").dropna()
+        s = s[(s > 0) & (s < 500)]
+        if s.empty:
+            continue
+        latest = safe_float(s.iloc[-1])
+        avg = safe_float(s.tail(min(252, len(s))).mean())
+        low = safe_float(s.tail(min(252, len(s))).quantile(0.2))
+        high = safe_float(s.tail(min(252, len(s))).quantile(0.8))
+        change60 = None
+        n = min(60, len(s)-1)
+        if n > 0 and safe_float(s.iloc[-n]) not in (None, 0):
+            change60 = latest / float(s.iloc[-n]) - 1
+        rows.append({
+            "구분": label,
+            "현재": latest,
+            "최근 1년 평균": avg,
+            "하위 20%": low,
+            "상위 20%": high,
+            "60거래일 변화": change60,
+            "판단": "실제 판단용" if col == "PER" else "참고용",
+        })
+    return pd.DataFrame(rows)
+
+
+def format_trade_tables(df):
+    out = df.copy()
+    for col in ["가격"]:
+        if col in out.columns:
+            out[col] = out[col].apply(lambda x: fmt_num(x, 0))
+    for col in ["현재가 대비", "60거래일 변화"]:
+        if col in out.columns:
+            out[col] = out[col].apply(lambda x: fmt_pct_ratio(x, 1))
+    for col in ["현재", "최근 1년 평균", "하위 20%", "상위 20%"]:
+        if col in out.columns:
+            out[col] = out[col].apply(lambda x: fmt_num(x, 2))
+    return out
+
+
+def render_trading_dashboard(df, per_df, risk_df, risk_label):
+    snap = build_trading_snapshot(df, per_df, risk_df, risk_label)
+    st.markdown("## 4. 매매 체크포인트")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("행동 판단", snap["action"])
+    c2.metric("현재 MDD", fmt_pct_ratio(snap["dd"]))
+    c3.metric("RSI", fmt_num(snap["rsi"]))
+    c4.metric("거래량비율", fmt_num(snap["volr"]))
+    st.info(snap["memo"])
+
+    st.markdown("### 가격 기준선")
+    st.dataframe(format_trade_tables(build_trade_level_table(df)), use_container_width=True, hide_index=True)
+
+    st.markdown("### MDD 기준 매수·관망 레벨")
+    st.dataframe(format_trade_tables(build_mdd_level_table(df)), use_container_width=True, hide_index=True)
+
+    per_ref = build_per_reference_table(df, per_df)
+    if not per_ref.empty:
+        st.markdown("### PER 참고표")
+        st.dataframe(format_trade_tables(per_ref), use_container_width=True, hide_index=True)
+        if snap["per_basis"] == "Proxy":
+            st.caption("주의: Proxy PER은 현재 EPS 고정 기준입니다. 실제 이익 변화가 반영된 PER 판단은 Actual PER을 우선하세요.")
+
+    with st.expander("매매 기준 해석"):
+        st.write("- MA20 회복 전에는 추격보다 대기/소액이 기본입니다.")
+        st.write("- MDD -12% 이하는 1차 관심, -15% 이하는 깊은 눌림 후보입니다. 단, MA200 이탈 시 손절·관망 기준을 우선합니다.")
+        st.write("- PER actual 하락 + 주가 상승은 실적/EPS 개선이 가격 상승을 정당화하는 구간일 수 있습니다.")
+        st.write("- PER proxy는 전체 흐름 참고용입니다. 실제 저평가 판단에는 단독 사용하지 않습니다.")
+
 # =========================================================
 # Inputs
 # =========================================================
+if "ticker_input" not in st.session_state:
+    st.session_state["ticker_input"] = ""
+
+def _clear_ticker_input():
+    st.session_state["ticker_input"] = ""
+
 c1, c2, c3 = st.columns(3)
 with c1:
-    user_input = st.text_input("종목명 / 종목코드 / 미국 티커", value="삼성전자")
+    user_input = st.text_input(
+        "종목명 / 종목코드 / 미국 티커",
+        key="ticker_input",
+        placeholder="예: NVDA, 005930, 삼성전자",
+        help="기본값은 비워뒀습니다. 입력을 다시 비우려면 아래 초기화 버튼을 누르세요."
+    )
+    st.button("입력 초기화", on_click=_clear_ticker_input)
 with c2:
-    start_date = st.date_input("기준 시작일", pd.to_datetime("2025-01-01"))
+    start_date = st.date_input("기준 시작일", pd.to_datetime("2024-01-01"))
 with c3:
     asset_type = st.selectbox("종목 유형", ["일반 주식/ETF", "나스닥형 ETF", "반도체/메모리 ETF", "전력/인프라 ETF", "우주/소형 테마"])
 
@@ -1054,6 +1446,10 @@ with st.expander("한국 실제 PER 설정", expanded=False):
 run = st.button("분석 실행")
 
 if run:
+    if not str(user_input).strip():
+        st.error("종목명/코드/티커를 입력하세요. 예: NVDA, 005930, 삼성전자")
+        st.stop()
+
     market, ticker, display_name = find_ticker(user_input)
     if ticker is None:
         st.error("종목을 찾지 못했습니다. 예: 삼성전자, 005930, NVDA")
@@ -1133,9 +1529,12 @@ if run:
         st.warning(f"PER 시계열 없음: {per_status}")
 
     st.markdown("## 2. 핵심 차트")
-    st.info("차트는 주가·PER·MDD·시장위험만 봅니다. 한국은 pykrx 실제 PER이 없으면 DART EPS_TTM PER을 우선 사용하고, 그래도 없을 때만 현재 EPS 기반 P/E proxy를 표시합니다.")
+    st.info("차트는 주가·PER·MDD·시장위험만 봅니다. 빨간 실선은 actual P/E, 빨간 점선은 proxy P/E입니다. 실제 판단은 actual P/E를 우선합니다.")
     fig, chart_df = plot_core_chart(df, per_df, risk_df, risk_label, ticker)
-    st.pyplot(fig)
+    render_chart(fig)
+
+    st.markdown("### PER 전용 확인 차트")
+    plot_dedicated_per_chart(df, per_df, ticker)
 
     st.markdown("## 3. 자동 해석")
     final, comments = make_comment(df, per_df, risk_label, risk_df)
@@ -1147,6 +1546,8 @@ if run:
         st.info(final)
     for msg in comments:
         st.write(f"- {msg}")
+
+    render_trading_dashboard(df, per_df, risk_df, risk_label)
 
     with st.expander("PER 원자료 / 상태"):
         st.write(f"Current valuation status: {val_status}")
