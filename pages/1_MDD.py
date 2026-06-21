@@ -86,7 +86,7 @@ require_login()
 logout_button()
 
 st.title("📈 MDD 저점매수 분석기 | Trading Final")
-st.caption("기본 종목 없음 · 기준 시작일 2024/01/01 · 주가/PER/MDD/시장위험/이평선/매매 체크포인트 중심")
+st.caption("기본 종목 없음 · 기준 시작일 2024/01/01 · 개별주/ETF/시장지수 분석 · 주가/PER/MDD/시장위험/이평선/매매 체크포인트 중심")
 
 # =========================================================
 # Utilities
@@ -171,6 +171,35 @@ KR_FALLBACK_MAP = {
     "두산에너빌리티": "034020",
 }
 
+# Market index aliases. These are analyzed as indices, not individual stocks.
+# Valuation/PER is intentionally not calculated unless reliable index PER data is supplied separately.
+INDEX_ALIAS_MAP = {
+    "KOSPI": ("KR_INDEX", "KS11", "KOSPI"),
+    "코스피": ("KR_INDEX", "KS11", "KOSPI"),
+    "KS11": ("KR_INDEX", "KS11", "KOSPI"),
+    "KOSDAQ": ("KR_INDEX", "KQ11", "KOSDAQ"),
+    "코스닥": ("KR_INDEX", "KQ11", "KOSDAQ"),
+    "KQ11": ("KR_INDEX", "KQ11", "KOSDAQ"),
+    "NASDAQ": ("US_INDEX", "^IXIC", "NASDAQ Composite"),
+    "나스닥": ("US_INDEX", "^IXIC", "NASDAQ Composite"),
+    "^IXIC": ("US_INDEX", "^IXIC", "NASDAQ Composite"),
+    "S&P500": ("US_INDEX", "^GSPC", "S&P 500"),
+    "SP500": ("US_INDEX", "^GSPC", "S&P 500"),
+    "SNP500": ("US_INDEX", "^GSPC", "S&P 500"),
+    "에스앤피": ("US_INDEX", "^GSPC", "S&P 500"),
+    "^GSPC": ("US_INDEX", "^GSPC", "S&P 500"),
+    "DOW": ("US_INDEX", "^DJI", "Dow Jones"),
+    "다우": ("US_INDEX", "^DJI", "Dow Jones"),
+    "^DJI": ("US_INDEX", "^DJI", "Dow Jones"),
+    "RUSSELL2000": ("US_INDEX", "^RUT", "Russell 2000"),
+    "러셀2000": ("US_INDEX", "^RUT", "Russell 2000"),
+    "^RUT": ("US_INDEX", "^RUT", "Russell 2000"),
+    "SOX": ("US_INDEX", "^SOX", "PHLX Semiconductor Index"),
+    "필라델피아반도체": ("US_INDEX", "^SOX", "PHLX Semiconductor Index"),
+    "반도체지수": ("US_INDEX", "^SOX", "PHLX Semiconductor Index"),
+    "^SOX": ("US_INDEX", "^SOX", "PHLX Semiconductor Index"),
+}
+
 # =========================================================
 # Ticker lookup
 # =========================================================
@@ -192,10 +221,25 @@ def kr_stock_list():
         return pd.DataFrame()
 
 
+def normalize_index_alias(q):
+    raw = str(q).strip()
+    compact = raw.upper().replace(" ", "").replace("-", "")
+    candidates = [raw, raw.upper(), compact]
+    for key in candidates:
+        if key in INDEX_ALIAS_MAP:
+            return INDEX_ALIAS_MAP[key]
+    return None
+
+
 def find_ticker(q):
     q = str(q).strip()
     if not q:
         return None, None, None
+
+    idx = normalize_index_alias(q)
+    if idx is not None:
+        return idx
+
     if q.isdigit() and len(q) == 6:
         return "KR", q, q
     if q in KR_FALLBACK_MAP:
@@ -212,6 +256,10 @@ def find_ticker(q):
 
     if is_korean(q):
         return None, None, None
+
+    idx = normalize_index_alias(q.upper())
+    if idx is not None:
+        return idx
     return "US", q.upper(), q.upper()
 
 # =========================================================
@@ -225,6 +273,10 @@ def load_price_data(market, ticker, start_date):
             if not FDR_OK:
                 return pd.DataFrame(), f"FinanceDataReader import 실패: {FDR_ERR}"
             df = fdr.DataReader(str(ticker).zfill(6), start)
+        elif market == "KR_INDEX":
+            if not FDR_OK:
+                return pd.DataFrame(), f"FinanceDataReader import 실패: {FDR_ERR}"
+            df = fdr.DataReader(str(ticker), start)
         else:
             if not YF_OK:
                 return pd.DataFrame(), f"yfinance import 실패: {YF_ERR}"
@@ -762,19 +814,21 @@ def dart_kr_ttm_pe_series(code, price_df, start_date, end_date, api_key):
 # Market risk
 # =========================================================
 def market_risk_series(market, ticker, start_date):
-    if market == "US":
+    if market in ["US", "US_INDEX"]:
         vix = load_us_close("^VIX", start_date)
         if not vix.empty:
             return vix.rename(columns={"^VIX": "Risk"}), "VIX"
         return pd.DataFrame(), "VIX 없음"
 
-    # KR: use KOSPI drawdown as default market risk
-    kospi = load_fdr_close("KS11", start_date)
-    if kospi.empty:
-        return pd.DataFrame(), "KOSPI 위험지표 없음"
-    s = kospi.iloc[:, 0]
+    # KR stock: use KOSPI drawdown. KR index: use its own drawdown when possible.
+    symbol = "KQ11" if str(ticker).upper() == "KQ11" else "KS11"
+    label = "KOSDAQ DD" if symbol == "KQ11" else "KOSPI DD"
+    idx = load_fdr_close(symbol, start_date)
+    if idx.empty:
+        return pd.DataFrame(), f"{label} 위험지표 없음"
+    s = idx.iloc[:, 0]
     dd = s / s.cummax() - 1
-    return pd.DataFrame({"Risk": dd}, index=kospi.index), "KOSPI DD"
+    return pd.DataFrame({"Risk": dd}, index=idx.index), label
 
 # =========================================================
 # Chart and comment
@@ -1181,6 +1235,123 @@ def make_comment(df, per_df, risk_label, risk_df):
     return final, msg
 
 
+
+
+def classify_valuation_metric(kind, value):
+    """Return compact valuation interpretation.
+    This is a reference filter only; it does not affect MDD/Buy Score logic.
+    """
+    v = safe_float(value)
+    if v is None:
+        return "N/A", "데이터 없음", "판단 불가"
+
+    kind = str(kind).upper()
+    if kind in ["FORWARD_PE", "FWD_PE"]:
+        if v <= 0:
+            return "해석 제외", "예상PER 0 이하", "이익 추정치 확인 필요"
+        if v <= 15:
+            return "낮음", "15배 이하", "밸류 부담 낮음"
+        if v <= 30:
+            return "보통", "15~30배", "성장주 기준 무난"
+        if v <= 50:
+            return "부담", "30~50배", "성장 기대 반영, 추격 주의"
+        return "고평가", "50배 초과", "고평가·추격 주의"
+
+    if kind in ["TTM_PE", "KRX_PE", "ACTUAL_PE", "PER", "PROXY_PE"]:
+        if v <= 0:
+            return "해석 제외", "PER 0 이하", "적자·일회성 이익 가능성 확인"
+        if v <= 10:
+            return "낮음", "10배 이하", "저평가 가능. 단, 경기민감주는 이익 피크 여부 확인"
+        if v <= 20:
+            return "양호~보통", "10~20배", "일반주 기준 부담 제한적"
+        if v <= 35:
+            return "성장 반영", "20~35배", "성장 기대 반영. 실적 상향 필요"
+        if v <= 50:
+            return "부담", "35~50배", "밸류 부담 확대, 눌림 확인 우선"
+        return "고평가", "50배 초과", "고평가·추격 주의"
+
+    if kind in ["PS", "P/S"]:
+        if v <= 0:
+            return "해석 제외", "P/S 0 이하", "매출 데이터 확인 필요"
+        if v <= 3:
+            return "낮음", "3배 이하", "매출 대비 부담 낮음"
+        if v <= 10:
+            return "보통~성장", "3~10배", "성장주 일반 구간"
+        if v <= 30:
+            return "고성장 반영", "10~30배", "고성장 기대 반영, 실적 확인 필요"
+        return "과열 가능", "30배 초과", "매출 대비 과열 가능성, 추격 주의"
+
+    if kind in ["PEG"]:
+        if v <= 0:
+            return "해석 제외", "PEG 0 이하", "성장률 추정치 확인 필요"
+        if v <= 1:
+            return "양호", "1 이하", "성장 대비 밸류 양호"
+        if v <= 2:
+            return "보통", "1~2", "성장 대비 보통"
+        return "부담", "2 초과", "성장 대비 밸류 부담"
+
+    return "N/A", "기준 없음", "해석 기준 없음"
+
+
+def latest_per_from_series(per_df, col):
+    if per_df is None or per_df.empty or col not in per_df.columns:
+        return None
+    try:
+        s = pd.to_numeric(per_df[col], errors="coerce").dropna()
+        s = s[(s > 0) & (s < 500)]
+        if s.empty:
+            return None
+        return safe_float(s.iloc[-1])
+    except Exception:
+        return None
+
+
+def build_valuation_guide_table(val, per_df=None, market=""):
+    """Readable guide: what level is cheap/normal/expensive.
+    Does not change calculations; display only.
+    """
+    if market in ["US_INDEX", "KR_INDEX"]:
+        return pd.DataFrame()
+
+    rows = []
+    metrics = [
+        ("Forward P/E", "FORWARD_PE", val.get("fwd_pe"), "미국 개별주 예상 이익 기준. 한국 종목은 없을 수 있음"),
+        ("TTM / KRX P/E", "TTM_PE", val.get("ttm_pe"), "현재 이익 기준. 경기민감주는 낮아도 이익 피크면 함정 가능"),
+        ("P/S", "PS", val.get("ps"), "매출 대비 가격. 성장주 비교에 보조 사용"),
+        ("PEG", "PEG", val.get("peg"), "성장률 대비 PER. 1 이하가 가장 양호한 편"),
+    ]
+
+    actual_latest = latest_per_from_series(per_df, "PER")
+    proxy_latest = latest_per_from_series(per_df, "PER_PROXY")
+    if actual_latest is not None:
+        metrics.append(("Actual PER 최신", "ACTUAL_PE", actual_latest, "실제 EPS 변화가 반영된 시계열 PER. 가장 우선"))
+    if proxy_latest is not None:
+        metrics.append(("Proxy PER 최신", "PROXY_PE", proxy_latest, "현재 EPS 고정 기준. 저평가 판단에는 단독 사용 금지"))
+
+    seen = set()
+    for name, kind, value, note in metrics:
+        key = (name, fmt_num(value, 4))
+        if key in seen:
+            continue
+        seen.add(key)
+        grade, good_range, comment = classify_valuation_metric(kind, value)
+        rows.append({
+            "항목": name,
+            "현재값": value,
+            "판정": grade,
+            "좋은 기준/해석 구간": good_range,
+            "해석": comment,
+            "주의": note,
+        })
+    return pd.DataFrame(rows)
+
+
+def format_valuation_guide_table(df):
+    out = df.copy()
+    if "현재값" in out.columns:
+        out["현재값"] = out["현재값"].apply(lambda x: fmt_num(x, 2))
+    return out
+
 # =========================================================
 # Trading helper tables
 # =========================================================
@@ -1357,6 +1528,8 @@ def build_per_reference_table(df, per_df):
         n = min(60, len(s)-1)
         if n > 0 and safe_float(s.iloc[-n]) not in (None, 0):
             change60 = latest / float(s.iloc[-n]) - 1
+        kind = "ACTUAL_PE" if col == "PER" else "PROXY_PE"
+        grade, good_range, comment = classify_valuation_metric(kind, latest)
         rows.append({
             "구분": label,
             "현재": latest,
@@ -1364,6 +1537,9 @@ def build_per_reference_table(df, per_df):
             "하위 20%": low,
             "상위 20%": high,
             "60거래일 변화": change60,
+            "현재 위치": grade,
+            "좋은 기준": good_range,
+            "해석": comment,
             "판단": "실제 판단용" if col == "PER" else "참고용",
         })
     return pd.DataFrame(rows)
@@ -1426,14 +1602,14 @@ with c1:
     user_input = st.text_input(
         "종목명 / 종목코드 / 미국 티커",
         key="ticker_input",
-        placeholder="예: NVDA, 005930, 삼성전자",
-        help="기본값은 비워뒀습니다. 입력을 다시 비우려면 아래 초기화 버튼을 누르세요."
+        placeholder="예: NVDA, 005930, 삼성전자, KOSPI, KOSDAQ, NASDAQ, S&P500, SOX",
+        help="개별주/ETF는 물론 KOSPI·KOSDAQ·NASDAQ·S&P500·SOX 같은 지수도 입력 가능합니다."
     )
     st.button("입력 초기화", on_click=_clear_ticker_input)
 with c2:
     start_date = st.date_input("기준 시작일", pd.to_datetime("2024-01-01"))
 with c3:
-    asset_type = st.selectbox("종목 유형", ["일반 주식/ETF", "나스닥형 ETF", "반도체/메모리 ETF", "전력/인프라 ETF", "우주/소형 테마"])
+    asset_type = st.selectbox("종목 유형", ["일반 주식/ETF", "시장지수", "나스닥형 ETF", "반도체/메모리 ETF", "전력/인프라 ETF", "우주/소형 테마"])
 
 try:
     dart_secret = st.secrets.get("DART_API_KEY", "")
@@ -1442,6 +1618,10 @@ except Exception:
 with st.expander("한국 실제 PER 설정", expanded=False):
     st.caption("한국 종목에서 pykrx PER 시계열이 안 잡힐 때, DART 분기 EPS로 TTM P/E를 계산합니다. Naver 현재 EPS proxy와 달리 EPS가 분기별로 변합니다.")
     dart_key_input = st.text_input("DART API Key", value=dart_secret, type="password")
+
+with st.expander("지원하는 시장지수 입력 예시", expanded=False):
+    st.write("- 한국: KOSPI / 코스피 / KS11, KOSDAQ / 코스닥 / KQ11")
+    st.write("- 미국: NASDAQ / 나스닥 / ^IXIC, S&P500 / SP500 / ^GSPC, SOX / 필라델피아반도체 / ^SOX, DOW / ^DJI, Russell2000 / ^RUT")
 
 run = st.button("분석 실행")
 
@@ -1465,7 +1645,12 @@ if run:
     last_price_date = df.index.max()
 
     # Valuation and P/E series
-    if market == "US":
+    if market in ["US_INDEX", "KR_INDEX"]:
+        val = {"ttm_pe": None, "fwd_pe": None, "ps": None, "peg": None, "market_cap": None, "ev_ebitda": None}
+        val_status = "시장지수: 개별주식 PER/EPS가 아니므로 현재 Valuation 카드는 N/A로 표시합니다. 지수는 가격·MDD·이평선·RSI·시장위험 중심으로 판단하세요."
+        per_df = pd.DataFrame()
+        per_status = "시장지수 PER 시계열은 미사용. KOSPI/NASDAQ/S&P500 지수 자체는 가격·MDD·MA·RSI 기준으로 분석합니다."
+    elif market == "US":
         val, val_status = us_current_valuation(ticker)
         actual_per_df, actual_per_status = us_ttm_pe_series(ticker, df)
         proxy_pe = val.get("fwd_pe") or val.get("ttm_pe")
@@ -1503,6 +1688,8 @@ if run:
     risk_df, risk_label = market_risk_series(market, ticker, start_date)
 
     st.subheader(f"분석 대상: {display_name} / {ticker} / {market}")
+    if market in ["US_INDEX", "KR_INDEX"]:
+        st.info("시장지수 분석 모드입니다. 개별 종목처럼 PER·EPS·DART 밸류에이션을 보지 않고, 지수 가격 위치·MDD·이평선·RSI·VIX/KOSPI DD로 시장 진입 위험을 판단합니다.")
 
     m1, m2, m3, m4, m5, m6 = st.columns(6)
     m1.metric("현재가", fmt_num(latest["Close"]))
@@ -1518,10 +1705,25 @@ if run:
     v2.metric("Forward P/E", fmt_num(val.get("fwd_pe")))
     v3.metric("P/S", fmt_num(val.get("ps")))
     v4.metric("PEG", fmt_num(val.get("peg")))
+    if market in ["US_INDEX", "KR_INDEX"]:
+        st.caption("지수 Valuation은 별도 데이터가 필요합니다. 이 앱에서는 지수 자체의 저점매수 여부를 가격/MDD/MA/RSI/시장위험으로 판단합니다.")
+    else:
+        guide_df = build_valuation_guide_table(val, per_df, market)
+        if not guide_df.empty:
+            st.markdown("### 밸류 기준 판단")
+            st.dataframe(format_valuation_guide_table(guide_df), use_container_width=True, hide_index=True)
+            with st.expander("PER은 얼마가 좋은가? 기준표"):
+                st.write("- **Forward P/E**: 15배 이하 낮음, 15~30배 보통, 30~50배 부담, 50배 초과 고평가·추격 주의")
+                st.write("- **TTM/KRX/Actual P/E**: 10배 이하 낮음, 10~20배 양호~보통, 20~35배 성장 반영, 35~50배 부담, 50배 초과 고평가")
+                st.write("- **P/S**: 3배 이하 낮음, 3~10배 보통~성장주, 10~30배 고성장 기대 반영, 30배 초과 과열 가능성")
+                st.write("- **PEG**: 1 이하 양호, 1~2 보통, 2 초과 성장 대비 밸류 부담")
+                st.warning("낮은 PER이 항상 매수 신호는 아닙니다. 경기민감주·반도체·화학·조선은 이익 피크 구간에서 PER이 낮게 보일 수 있습니다. MDD, EPS 방향, 가격 추세와 함께 보세요.")
 
     has_actual_per = per_df is not None and not per_df.empty and "PER" in per_df.columns and not per_df["PER"].dropna().empty
     has_proxy_per = per_df is not None and not per_df.empty and "PER_PROXY" in per_df.columns and not per_df["PER_PROXY"].dropna().empty
-    if has_actual_per:
+    if market in ["US_INDEX", "KR_INDEX"]:
+        st.info(per_status)
+    elif has_actual_per:
         st.success(f"PER 시계열: {per_status}")
     elif has_proxy_per:
         st.warning(f"실제 PER 시계열은 제한적입니다. 전체 기간은 P/E proxy로 표시합니다. {per_status}")
@@ -1529,12 +1731,16 @@ if run:
         st.warning(f"PER 시계열 없음: {per_status}")
 
     st.markdown("## 2. 핵심 차트")
-    st.info("차트는 주가·PER·MDD·시장위험만 봅니다. 빨간 실선은 actual P/E, 빨간 점선은 proxy P/E입니다. 실제 판단은 actual P/E를 우선합니다.")
+    if market in ["US_INDEX", "KR_INDEX"]:
+        st.info("지수 차트는 가격·MDD·시장위험·이평선을 봅니다. PER선은 지수 분석에서 제외합니다.")
+    else:
+        st.info("차트는 주가·PER·MDD·시장위험만 봅니다. 빨간 실선은 actual P/E, 빨간 점선은 proxy P/E입니다. 실제 판단은 actual P/E를 우선합니다.")
     fig, chart_df = plot_core_chart(df, per_df, risk_df, risk_label, ticker)
     render_chart(fig)
 
-    st.markdown("### PER 전용 확인 차트")
-    plot_dedicated_per_chart(df, per_df, ticker)
+    if market not in ["US_INDEX", "KR_INDEX"]:
+        st.markdown("### PER 전용 확인 차트")
+        plot_dedicated_per_chart(df, per_df, ticker)
 
     st.markdown("## 3. 자동 해석")
     final, comments = make_comment(df, per_df, risk_label, risk_df)
